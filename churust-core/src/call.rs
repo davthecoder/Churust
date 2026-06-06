@@ -146,6 +146,13 @@ impl Call {
         self.state = state;
     }
 
+    /// Merge externally-built extensions into this call (used by the engine to
+    /// inject per-connection data such as a pending WebSocket upgrade). Existing
+    /// entries of the same type are overwritten.
+    pub(crate) fn seed_extensions(&mut self, ext: http::Extensions) {
+        self.extensions.extend(ext);
+    }
+
     /// A shared handle to application state of type `T`, or `None` if no value
     /// of that type was registered with
     /// [`AppBuilder::state`](crate::AppBuilder::state). For handler arguments,

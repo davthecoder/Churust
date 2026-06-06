@@ -119,6 +119,33 @@ $ curl -X POST localhost:8080/notes -H 'authorization: Bearer admin-token' \
 {"id":1,"text":"hi"}
 ```
 
+## WebSockets (feature `ws`)
+
+Opt in with `features = ["ws"]`. A handler takes the `WebSocketUpgrade`
+extractor and calls `on_upgrade` to switch the request into a bidirectional
+socket (a plain GET to the route is rejected with `426 Upgrade Required`):
+
+```rust
+use churust::prelude::*;
+use churust::ws::{Message, WebSocketUpgrade};
+
+r.get("/echo", |ws: WebSocketUpgrade| async move {
+    ws.on_upgrade(|mut sock| async move {
+        while let Some(Ok(msg)) = sock.recv().await {
+            if matches!(msg, Message::Close) || sock.send(msg).await.is_err() {
+                break;
+            }
+        }
+    })
+});
+```
+
+```toml
+churust = { version = "0.1", features = ["ws"] }
+```
+
+See [`examples/chat`](examples/chat) for an echo endpoint plus a broadcast room.
+
 ## Core concepts
 
 ### Handlers & extractors
@@ -177,8 +204,9 @@ cargo run -p api
 
 Churust **v1** is feature-complete: routing, hybrid extractors, the four core
 plugins, named phases, config, state, timeouts, TLS, and the `#[churust::main]`
-macro. Deferred to v2 (YAGNI): WebSockets, sessions, response compression,
-HTTP/3, route-scoped middleware sugar.
+macro. **v2** adds WebSockets behind the opt-in `ws` feature (see above).
+Still deferred (YAGNI): sessions, response compression, HTTP/3, route-scoped
+middleware sugar.
 
 Design docs and build plans live in [`docs/`](docs/).
 

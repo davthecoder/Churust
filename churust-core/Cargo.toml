@@ -24,7 +24,12 @@ toml = "0.8"
 rustls = { version = "0.23", optional = true }
 tokio-rustls = { version = "0.26", optional = true }
 rustls-pemfile = { version = "2", optional = true }
+tokio-tungstenite = { version = "0.26", optional = true }
+
+[dev-dependencies]
+tokio-tungstenite = "0.26"
 
 [features]
 default = []
 tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile"]
+ws = ["dep:tokio-tungstenite"]

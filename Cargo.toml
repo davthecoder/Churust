@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["churust-core", "churust-macros", "churust", "examples/hello", "churust-json", "churust-logging", "churust-cors", "churust-auth", "examples/api"]
+members = ["churust-core", "churust-macros", "churust", "examples/hello", "churust-json", "churust-logging", "churust-cors", "churust-auth", "examples/api", "examples/chat"]
 
 [workspace.package]
 edition = "2021"

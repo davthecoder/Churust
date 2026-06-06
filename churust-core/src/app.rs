@@ -339,6 +339,8 @@ impl App {
     /// assert_eq!(res.status.as_u16(), 200);
     /// # });
     /// ```
+    /// THE single request entry point used by the engine and `TestClient`.
+    /// Panic-isolated: a panicking handler yields 500.
     pub async fn process(
         &self,
         method: Method,
@@ -346,9 +348,24 @@ impl App {
         headers: HeaderMap,
         body: Bytes,
     ) -> Response {
+        self.process_with_extensions(method, uri, headers, body, http::Extensions::new())
+            .await
+    }
+
+    /// Like [`App::process`], but seeds the `Call` with pre-built extensions
+    /// (e.g. a captured WebSocket upgrade handle). Advanced/engine use.
+    pub async fn process_with_extensions(
+        &self,
+        method: Method,
+        uri: Uri,
+        headers: HeaderMap,
+        body: Bytes,
+        extensions: http::Extensions,
+    ) -> Response {
         let app = self.clone();
         let fut = async move {
             let mut call = Call::new(method, uri, headers, body);
+            call.seed_extensions(extensions);
             call.set_state(app.inner.state.clone());
             app.run_pipeline(call).await
         };
@@ -592,6 +609,31 @@ mod tests {
     async fn panicking_handler_yields_500_not_crash() {
         let res = get(&app(), "/boom").await;
         assert_eq!(res.status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn process_with_extensions_seeds_call() {
+        #[derive(Clone)]
+        struct Marker(u32);
+        let app = Churust::server()
+            .routing(|r| {
+                r.get("/", |c: Call| async move {
+                    format!("{}", c.get::<Marker>().map(|m| m.0).unwrap_or(0))
+                });
+            })
+            .build();
+        let mut ext = http::Extensions::new();
+        ext.insert(Marker(7));
+        let res = app
+            .process_with_extensions(
+                Method::GET,
+                "/".parse().unwrap(),
+                HeaderMap::new(),
+                Bytes::new(),
+                ext,
+            )
+            .await;
+        assert_eq!(res.body, Bytes::from("7"));
     }
 
     #[tokio::test]

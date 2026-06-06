@@ -117,10 +117,27 @@ async fn serve_stream<I>(
         async move { handle(app, req, max_body, timeout_ms).await }
     });
     let conn = hyper::server::conn::http1::Builder::new().serve_connection(io, svc);
-    let fut = watcher.watch(conn);
-    tokio::spawn(async move {
-        let _ = fut.await;
-    });
+    // Under the `ws` feature the connection is made upgradeable. The
+    // resolved `hyper-util` (0.1.x) does not implement `GracefulConnection`
+    // for `http1::UpgradeableConnection`, so `watcher.watch(conn)` rejects it.
+    // Per the plan's implementer note we fall back to awaiting the connection
+    // directly for the ws build (dropping graceful drain only for WS
+    // connections) while keeping the non-ws path exactly as-is.
+    #[cfg(feature = "ws")]
+    {
+        let _ = &watcher;
+        let conn = conn.with_upgrades();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+    }
+    #[cfg(not(feature = "ws"))]
+    {
+        let fut = watcher.watch(conn);
+        tokio::spawn(async move {
+            let _ = fut.await;
+        });
+    }
 }
 
 async fn handle(
@@ -129,6 +146,15 @@ async fn handle(
     max_body: usize,
     timeout_ms: u64,
 ) -> Result<HyperResponse<Full<Bytes>>, Infallible> {
+    #[cfg(feature = "ws")]
+    let mut req = req;
+    #[cfg(feature = "ws")]
+    let on_upgrade = if crate::ws::is_upgrade_request(req.headers()) {
+        Some(hyper::upgrade::on(&mut req))
+    } else {
+        None
+    };
+
     let (parts, body) = req.into_parts();
 
     // Enforce max body size before buffering.
@@ -142,7 +168,23 @@ async fn handle(
         }
     };
 
+    #[cfg(feature = "ws")]
+    let process = {
+        let mut extensions = http::Extensions::new();
+        if let Some(on_upgrade) = on_upgrade {
+            extensions.insert(crate::ws::OnUpgradeHandle::new(on_upgrade));
+        }
+        app.process_with_extensions(
+            parts.method,
+            parts.uri,
+            parts.headers,
+            body_bytes,
+            extensions,
+        )
+    };
+    #[cfg(not(feature = "ws"))]
     let process = app.process(parts.method, parts.uri, parts.headers, body_bytes);
+
     let res = if timeout_ms == 0 {
         process.await
     } else {

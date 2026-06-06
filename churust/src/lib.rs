@@ -97,6 +97,11 @@ pub use churust_core::*;
 /// `async fn main` in a tokio runtime.
 pub use churust_macros::main;
 
+/// WebSocket types (`WebSocket`, `WebSocketUpgrade`, `ws::Message`). Enabled by
+/// the `ws` feature.
+#[cfg(feature = "ws")]
+pub use churust_core::ws;
+
 /// Authentication plugin crate (`Auth`, `Principal<P>`). Enabled by the `auth`
 /// feature.
 #[cfg(feature = "auth")]
@@ -130,6 +135,8 @@ pub mod prelude {
 
     #[cfg(feature = "auth")]
     pub use churust_auth::{Auth, Principal};
+    #[cfg(feature = "ws")]
+    pub use churust_core::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
     #[cfg(feature = "cors")]
     pub use churust_cors::Cors;
     #[cfg(feature = "json")]

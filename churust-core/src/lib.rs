@@ -80,6 +80,11 @@ pub mod engine;
 #[cfg(feature = "tls")]
 pub mod tls;
 
+#[cfg(feature = "ws")]
+pub mod ws;
+#[cfg(feature = "ws")]
+pub use ws::{WebSocket, WebSocketUpgrade};
+
 pub mod test;
 pub use test::{TestClient, TestRequest, TestResponse};
 
