@@ -7,10 +7,13 @@
 //! shutdown signal.
 
 use crate::app::App;
+use crate::body::Body;
 #[cfg(feature = "tls")]
 use crate::tls::acceptor_from_pem;
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, Limited};
+use futures_util::StreamExt;
+use http_body_util::{combinators::UnsyncBoxBody, BodyExt, Full, Limited, StreamBody};
+use hyper::body::Frame;
 use hyper::body::Incoming;
 use hyper::service::service_fn;
 use hyper::{Request as HyperRequest, Response as HyperResponse, StatusCode};
@@ -19,6 +22,30 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
 use tokio::net::TcpListener;
+
+/// Convert a [`Body`] into the boxed hyper body the engine writes to the wire:
+/// `Full` for a buffered payload, `StreamBody` for a lazy stream.
+///
+/// The boxed body is the `!Sync` [`UnsyncBoxBody`] rather than the plan's
+/// `BoxBody`: `Body::Stream` wraps a `Pin<Box<dyn Stream + Send>>` (intentionally
+/// `Send` but not `Sync`), and the resolved `http-body-util` 0.1.3 `BodyExt::boxed`
+/// requires `Self: Send + Sync`. `boxed_unsync` only requires `Send`, and hyper
+/// accepts any `http_body::Body` response body, so behavior is unchanged.
+fn into_boxed_body(body: Body) -> UnsyncBoxBody<Bytes, std::io::Error> {
+    match body {
+        Body::Bytes(bytes) => Full::new(bytes)
+            .map_err(|never| match never {})
+            .boxed_unsync(),
+        Body::Stream(stream) => {
+            let frames = stream.map(|chunk| {
+                chunk
+                    .map(Frame::data)
+                    .map_err(|e| std::io::Error::other(e.to_string()))
+            });
+            StreamBody::new(frames).boxed_unsync()
+        }
+    }
+}
 
 /// Serve `app` on `addr` until `shutdown` resolves (graceful drain).
 ///
@@ -145,7 +172,7 @@ async fn handle(
     req: HyperRequest<Incoming>,
     max_body: usize,
     timeout_ms: u64,
-) -> Result<HyperResponse<Full<Bytes>>, Infallible> {
+) -> Result<HyperResponse<UnsyncBoxBody<Bytes, std::io::Error>>, Infallible> {
     #[cfg(feature = "ws")]
     let mut req = req;
     #[cfg(feature = "ws")]
@@ -162,7 +189,11 @@ async fn handle(
     let body_bytes = match collected {
         Ok(buf) => buf.to_bytes(),
         Err(_) => {
-            let mut resp = HyperResponse::new(Full::new(Bytes::from("Payload Too Large")));
+            let mut resp = HyperResponse::new(
+                Full::new(Bytes::from("Payload Too Large"))
+                    .map_err(|never| match never {})
+                    .boxed_unsync(),
+            );
             *resp.status_mut() = StatusCode::PAYLOAD_TOO_LARGE;
             return Ok(resp);
         }
@@ -200,6 +231,6 @@ async fn handle(
         *headers = res.headers;
     }
     Ok(builder
-        .body(Full::new(res.body))
-        .expect("response build is infallible for buffered body"))
+        .body(into_boxed_body(res.body))
+        .expect("response build is infallible"))
 }

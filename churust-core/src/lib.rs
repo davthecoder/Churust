@@ -44,6 +44,12 @@
 //! until Ctrl-C) or [`AppBuilder::start`].
 
 #![deny(missing_docs)]
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/davthecoder/Churust/main/img/churust_logo.png"
+)]
+
+pub mod body;
+pub use body::Body;
 
 pub mod error;
 pub use error::{Error, Result};
@@ -84,6 +90,11 @@ pub mod tls;
 pub mod ws;
 #[cfg(feature = "ws")]
 pub use ws::{WebSocket, WebSocketUpgrade};
+
+#[cfg(feature = "fs")]
+pub mod fs;
+#[cfg(feature = "fs")]
+pub use fs::StaticFiles;
 
 pub mod test;
 pub use test::{TestClient, TestRequest, TestResponse};

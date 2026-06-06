@@ -1,7 +1,13 @@
-# Churust 🌀
+<p align="center">
+  <img src="img/churust_logo.png" alt="Churust logo — a churro spiral inside a gear" width="180" />
+</p>
 
-> **Churro + Rust** — a backend web framework inspired by Kotlin's [Ktor](https://ktor.io).
-> Simple, secure, robust, easy to learn.
+<h1 align="center">Churust 🌀</h1>
+
+<p align="center">
+  <strong>Churro + Rust</strong> — a backend web framework inspired by Kotlin's <a href="https://ktor.io">Ktor</a>.<br />
+  Simple, secure, robust, easy to learn.
+</p>
 
 Churust gives you Ktor's developer experience in Rust: an application engine, a
 routing DSL, an `install(plugin)` system, and a phased interceptor pipeline —
@@ -146,6 +152,37 @@ churust = { version = "0.1", features = ["ws"] }
 
 See [`examples/chat`](examples/chat) for an echo endpoint plus a broadcast room.
 
+## Static files & streaming (feature `fs`)
+
+Response bodies are a `Body` — either buffered bytes or a lazy stream — so large
+or dynamic payloads never have to be fully materialized in memory. `Body` is
+always available; `StaticFiles` is behind the opt-in `fs` feature.
+
+```rust
+use churust::prelude::*;        // brings StaticFiles into scope under `fs`
+use churust::Body;
+
+r.get(
+    "/{path...}",
+    StaticFiles::dir("./public").index("index.html").handler(),
+);
+r.get("/numbers", |_c: Call| async {
+    let chunks = futures_util::stream::iter(
+        (1..=5).map(|i| Ok::<_, std::io::Error>(bytes::Bytes::from(format!("{i}\n")))),
+    );
+    Response::stream("text/plain", Body::from_stream(chunks))
+});
+```
+
+`StaticFiles` detects the `Content-Type` from the file extension, serves an
+optional `index` file for directories, rejects path traversal (`..`, absolute
+paths, symlink escapes) with `404`, and streams the file in chunks. See
+[`examples/static`](examples/static).
+
+```toml
+churust = { version = "0.1", features = ["fs"] }
+```
+
 ## Core concepts
 
 ### Handlers & extractors
@@ -204,9 +241,10 @@ cargo run -p api
 
 Churust **v1** is feature-complete: routing, hybrid extractors, the four core
 plugins, named phases, config, state, timeouts, TLS, and the `#[churust::main]`
-macro. **v2** adds WebSockets behind the opt-in `ws` feature (see above).
-Still deferred (YAGNI): sessions, response compression, HTTP/3, route-scoped
-middleware sugar.
+macro. **v2.0** adds WebSockets behind the opt-in `ws` feature (see above).
+**v2.1** adds streaming response bodies (the always-on `Body` type) and static
+file serving (`StaticFiles`, behind the opt-in `fs` feature). Still deferred
+(YAGNI): sessions, response compression, HTTP/3, route-scoped middleware sugar.
 
 Design docs and build plans live in [`docs/`](docs/).
 

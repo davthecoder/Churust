@@ -90,6 +90,9 @@
 //! }
 //! ```
 #![deny(missing_docs)]
+#![doc(
+    html_logo_url = "https://raw.githubusercontent.com/davthecoder/Churust/main/img/churust_logo.png"
+)]
 
 pub use churust_core::*;
 
@@ -101,6 +104,10 @@ pub use churust_macros::main;
 /// the `ws` feature.
 #[cfg(feature = "ws")]
 pub use churust_core::ws;
+
+/// Static file serving (`StaticFiles`). Enabled by the `fs` feature.
+#[cfg(feature = "fs")]
+pub use churust_core::fs;
 
 /// Authentication plugin crate (`Auth`, `Principal<P>`). Enabled by the `auth`
 /// feature.
@@ -135,6 +142,8 @@ pub mod prelude {
 
     #[cfg(feature = "auth")]
     pub use churust_auth::{Auth, Principal};
+    #[cfg(feature = "fs")]
+    pub use churust_core::fs::StaticFiles;
     #[cfg(feature = "ws")]
     pub use churust_core::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
     #[cfg(feature = "cors")]

@@ -1,7 +1,6 @@
 //! In-process test harness. Drives `App::process` directly — no socket bind.
 
 use crate::app::App;
-use crate::response::Response;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, Uri};
 
@@ -47,8 +46,13 @@ pub struct TestRequest<'c> {
 /// Returned by [`TestRequest::send`]. Inspect it with [`status`](TestResponse::status),
 /// [`header`](TestResponse::header), [`text`](TestResponse::text), and
 /// [`body_bytes`](TestResponse::body_bytes).
+///
+/// The body is fully collected (streamed bodies are drained), so the accessors
+/// are synchronous.
 pub struct TestResponse {
-    inner: Response,
+    status: StatusCode,
+    headers: HeaderMap,
+    body: Bytes,
 }
 
 impl TestClient {
@@ -164,27 +168,34 @@ impl<'c> TestRequest<'c> {
             .app
             .process(self.method, uri, self.headers, self.body)
             .await;
-        TestResponse { inner: res }
+        let status = res.status;
+        let headers = res.headers;
+        let body = res.body.into_bytes().await.unwrap_or_default();
+        TestResponse {
+            status,
+            headers,
+            body,
+        }
     }
 }
 
 impl TestResponse {
     /// The response status code.
     pub fn status(&self) -> StatusCode {
-        self.inner.status
+        self.status
     }
     /// The value of response header `name` as a string, or `None` if absent or
     /// not valid UTF-8. Matching is case-insensitive.
     pub fn header(&self, name: &str) -> Option<&str> {
-        self.inner.headers.get(name).and_then(|v| v.to_str().ok())
+        self.headers.get(name).and_then(|v| v.to_str().ok())
     }
     /// The raw response body bytes.
     pub fn body_bytes(&self) -> &Bytes {
-        &self.inner.body
+        &self.body
     }
     /// The response body decoded as UTF-8 (lossily, so this never fails).
     pub fn text(&self) -> String {
-        String::from_utf8_lossy(&self.inner.body).into_owned()
+        String::from_utf8_lossy(&self.body).into_owned()
     }
 }
 
@@ -225,5 +236,27 @@ mod tests {
         let client = TestClient::new(app());
         let res = client.get("/nope").send().await;
         assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn collects_streamed_body() {
+        use crate::body::Body;
+        use crate::{Call, Churust};
+        use bytes::Bytes;
+
+        let app = Churust::server()
+            .routing(|r| {
+                r.get("/stream", |_c: Call| async {
+                    let chunks = futures_util::stream::iter(vec![
+                        Ok::<_, std::io::Error>(Bytes::from("foo")),
+                        Ok(Bytes::from("bar")),
+                    ]);
+                    crate::Response::stream("text/plain", Body::from_stream(chunks))
+                });
+            })
+            .build();
+        let res = TestClient::new(app).get("/stream").send().await;
+        assert_eq!(res.status(), http::StatusCode::OK);
+        assert_eq!(res.text(), "foobar");
     }
 }

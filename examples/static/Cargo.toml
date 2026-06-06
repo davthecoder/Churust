@@ -1,0 +1,11 @@
+[package]
+name = "static-example"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+churust = { path = "../../churust", features = ["fs"] }
+tokio = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }

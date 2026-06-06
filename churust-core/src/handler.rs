@@ -41,7 +41,7 @@ pub type HandlerFuture = Pin<Box<dyn Future<Output = Response> + Send + 'static>
 /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
 /// let call = Call::new(Method::GET, "/".parse().unwrap(), HeaderMap::new(), Bytes::new());
 /// let res = Greeter.handle(call).await;
-/// assert_eq!(&res.body[..], b"hi");
+/// assert_eq!(res.body.as_slice(), Some(&b"hi"[..]));
 /// # });
 /// ```
 pub trait Handler: Send + Sync + 'static {
@@ -240,7 +240,7 @@ impl Handler for BoxHandler {
 /// let handler = boxed((|_c: Call| async { "hi" }).into_handler());
 /// let call = Call::new(Method::GET, "/".parse().unwrap(), HeaderMap::new(), Bytes::new());
 /// let res = handler.handle(call).await;
-/// assert_eq!(&res.body[..], b"hi");
+/// assert_eq!(res.body.as_slice(), Some(&b"hi"[..]));
 /// # });
 /// ```
 pub fn boxed<H: Handler>(h: H) -> BoxHandler {

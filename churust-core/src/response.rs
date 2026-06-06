@@ -7,6 +7,7 @@
 //! [`Error`], or a [`Result`](crate::error::Result)) and the framework
 //! converts it for you.
 
+use crate::body::Body;
 use crate::error::Error;
 use bytes::Bytes;
 use http::header::{HeaderName, CONTENT_TYPE};
@@ -28,16 +29,16 @@ use http::{HeaderMap, HeaderValue, StatusCode};
 ///
 /// let res = Response::text("created").with_status(StatusCode::CREATED);
 /// assert_eq!(res.status, StatusCode::CREATED);
-/// assert_eq!(&res.body[..], b"created");
+/// assert_eq!(res.body.as_slice(), Some(&b"created"[..]));
 /// ```
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Response {
     /// The HTTP status code of the response.
     pub status: StatusCode,
     /// The response headers.
     pub headers: HeaderMap,
-    /// The fully-buffered response body.
-    pub body: Bytes,
+    /// The response body — buffered bytes or a lazy stream.
+    pub body: Body,
 }
 
 impl Response {
@@ -55,7 +56,7 @@ impl Response {
         Self {
             status,
             headers: HeaderMap::new(),
-            body: Bytes::new(),
+            body: Body::empty(),
         }
     }
 
@@ -78,7 +79,7 @@ impl Response {
             CONTENT_TYPE,
             HeaderValue::from_static("text/plain; charset=utf-8"),
         );
-        r.body = Bytes::from(body.into());
+        r.body = Body::from(body.into());
         r
     }
 
@@ -90,7 +91,7 @@ impl Response {
     /// use churust_core::Response;
     ///
     /// let res = Response::bytes("application/octet-stream", vec![1u8, 2, 3]);
-    /// assert_eq!(&res.body[..], &[1, 2, 3]);
+    /// assert_eq!(res.body.as_slice(), Some(&[1u8, 2, 3][..]));
     /// assert_eq!(
     ///     res.headers.get(http::header::CONTENT_TYPE).unwrap(),
     ///     "application/octet-stream"
@@ -100,7 +101,26 @@ impl Response {
         let mut r = Self::new(StatusCode::OK);
         r.headers
             .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
-        r.body = body.into();
+        r.body = Body::from(body.into());
+        r
+    }
+
+    /// Create a `200 OK` response whose body is produced lazily from `stream`,
+    /// with an explicit `Content-Type`. Use for large or dynamic payloads.
+    ///
+    /// ```
+    /// use churust_core::{Body, Response};
+    /// use bytes::Bytes;
+    ///
+    /// let chunks = futures_util::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from("hi"))]);
+    /// let res = Response::stream("text/plain", Body::from_stream(chunks));
+    /// assert!(res.body.as_bytes().is_none());
+    /// ```
+    pub fn stream(content_type: &'static str, body: Body) -> Self {
+        let mut r = Self::new(StatusCode::OK);
+        r.headers
+            .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+        r.body = body;
         r
     }
 
@@ -159,7 +179,7 @@ impl Response {
 /// // The `(StatusCode, &str)` tuple impl in action:
 /// let res = (StatusCode::CREATED, "made").into_response();
 /// assert_eq!(res.status, StatusCode::CREATED);
-/// assert_eq!(&res.body[..], b"made");
+/// assert_eq!(res.body.as_slice(), Some(&b"made"[..]));
 /// ```
 pub trait IntoResponse {
     /// Consume `self` and produce the [`Response`] to send.

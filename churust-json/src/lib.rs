@@ -325,17 +325,19 @@ impl Middleware for JsonErrors {
             .map(|s| s.starts_with("text/plain"))
             .unwrap_or(false);
         if is_error && is_text {
-            let msg = String::from_utf8_lossy(&res.body).into_owned();
-            let body = serde_json::json!({ "error": msg, "status": res.status.as_u16() });
-            let bytes = if self.pretty {
-                serde_json::to_vec_pretty(&body)
-            } else {
-                serde_json::to_vec(&body)
+            if let Some(buffered) = res.body.as_bytes() {
+                let msg = String::from_utf8_lossy(buffered).into_owned();
+                let body = serde_json::json!({ "error": msg, "status": res.status.as_u16() });
+                let bytes = if self.pretty {
+                    serde_json::to_vec_pretty(&body)
+                } else {
+                    serde_json::to_vec(&body)
+                }
+                .unwrap_or_default();
+                res.body = churust_core::Body::from(bytes);
+                res.headers
+                    .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
             }
-            .unwrap_or_default();
-            res.body = Bytes::from(bytes);
-            res.headers
-                .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         }
         res
     }

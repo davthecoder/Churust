@@ -10,6 +10,11 @@
       <sourceFolder url="file://$MODULE_DIR$/churust-macros/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/churust/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/examples/hello/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/churust-auth/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/churust-cors/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/examples/api/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/examples/chat/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/examples/static/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
     <orderEntry type="inheritedJdk" />

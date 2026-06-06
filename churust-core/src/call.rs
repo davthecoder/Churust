@@ -313,7 +313,7 @@ impl Call {
     ///
     /// let call = Call::new(Method::GET, "/".parse().unwrap(), HeaderMap::new(), Bytes::new());
     /// let res = call.respond_text("ok");
-    /// assert_eq!(&res.body[..], b"ok");
+    /// assert_eq!(res.body.as_slice(), Some(&b"ok"[..]));
     /// ```
     pub fn respond_text(&self, body: impl Into<String>) -> Response {
         Response::text(body)
