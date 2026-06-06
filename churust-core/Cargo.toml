@@ -1,0 +1,30 @@
+[package]
+name = "churust-core"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+description = "Core engine, routing, pipeline, and extractors for the Churust web framework."
+
+[dependencies]
+tokio.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
+http-body-util.workspace = true
+http.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_urlencoded.workspace = true
+toml = "0.8"
+rustls = { version = "0.23", optional = true }
+tokio-rustls = { version = "0.26", optional = true }
+rustls-pemfile = { version = "2", optional = true }
+
+[features]
+default = []
+tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile"]
