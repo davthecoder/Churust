@@ -10,6 +10,8 @@ released together, so every entry below applies to the whole set.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-25
+
 ### Added
 
 - **`churust::tokio`.** The runtime is re-exported, so `churust = "0.2"` is a
@@ -108,6 +110,7 @@ First public release.
   panicking handler returns 500 rather than killing the server), and no version
   banner.
 
-[Unreleased]: https://github.com/davthecoder/Churust/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/davthecoder/Churust/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/davthecoder/Churust/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/davthecoder/Churust/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/davthecoder/Churust/releases/tag/v0.1.0
