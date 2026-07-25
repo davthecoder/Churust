@@ -30,6 +30,11 @@ use std::collections::HashMap;
 /// assert!(matches!(router.route(&Method::GET, "/nope"), Match::NotFound));
 /// assert!(matches!(router.route(&Method::POST, "/users/7"), Match::MethodNotAllowed { .. }));
 /// ```
+///
+/// Marked `#[non_exhaustive]`: a `match` on this enum outside `churust-core`
+/// must carry a `_` arm, so that a future routing outcome is not a breaking
+/// change.
+#[non_exhaustive]
 pub enum Match {
     /// A handler matched the path and method. Carries the matched handler and
     /// the captured path parameters (`{name}` -> value).
@@ -47,6 +52,10 @@ pub enum Match {
     },
     /// No route matched the path at all.
     NotFound,
+    /// A path segment could not be percent-decoded — a malformed escape or
+    /// bytes that are not valid UTF-8. The dispatcher turns this into
+    /// `400 Bad Request`.
+    BadPath,
 }
 
 #[derive(Default)]
@@ -166,7 +175,13 @@ impl Router {
     /// assert!(matches!(router.route(&Method::GET, "/missing"), Match::NotFound));
     /// ```
     pub fn route(&self, method: &Method, path: &str) -> Match {
-        let segments = split_segments(path);
+        // Split first, decode second. Decoding before splitting would let %2F
+        // manufacture separators and forge extra path segments.
+        let decoded = match decode_segments(path) {
+            Some(d) => d,
+            None => return Match::BadPath,
+        };
+        let segments: Vec<&str> = decoded.iter().map(String::as_str).collect();
         let mut params = HashMap::new();
 
         // 1. Exact walk. Static beats param, unchanged.
@@ -224,7 +239,11 @@ impl Router {
     /// assert!(router.methods_for("/nope").is_empty());
     /// ```
     pub fn methods_for(&self, path: &str) -> Vec<Method> {
-        let segments = split_segments(path);
+        let decoded = match decode_segments(path) {
+            Some(d) => d,
+            None => return Vec::new(),
+        };
+        let segments: Vec<&str> = decoded.iter().map(String::as_str).collect();
         let mut params = HashMap::new();
         let mut out: Vec<Method> = Self::walk(&self.root, &segments, 0, &mut params)
             .map(|n| n.handlers.0.keys().cloned().collect())
@@ -310,6 +329,18 @@ impl Router {
 
 fn split_segments(path: &str) -> Vec<&str> {
     path.split('/').filter(|s| !s.is_empty()).collect()
+}
+
+/// Split `path` on `/` and percent-decode each segment individually.
+///
+/// The order is the point. Decoding the whole path first would turn `%2F` into
+/// a separator and let a request forge segments it was never routed through.
+/// Returns `None` if any segment is undecodable, which becomes `400`.
+fn decode_segments(path: &str) -> Option<Vec<String>> {
+    split_segments(path)
+        .into_iter()
+        .map(crate::path::decode_path_segment)
+        .collect()
 }
 
 /// The route-definition DSL handed to the closure in
@@ -475,6 +506,71 @@ mod tests {
             b.post("/files/only-post", |_c: Call| async { "posted" });
         }
         r
+    }
+
+    #[test]
+    fn path_params_are_percent_decoded() {
+        let mut r = Router::new();
+        {
+            let mut b = RouteBuilder::new(&mut r);
+            b.get("/u/{name}", |_c: Call| async { "" });
+        }
+        match r.route(&Method::GET, "/u/John%20Doe") {
+            Match::Found { params, .. } => assert_eq!(params.get("name").unwrap(), "John Doe"),
+            _ => panic!("expected a match"),
+        }
+    }
+
+    #[test]
+    fn encoded_slash_does_not_create_a_segment() {
+        let mut r = Router::new();
+        {
+            let mut b = RouteBuilder::new(&mut r);
+            b.get("/u/{name}", |_c: Call| async { "" });
+        }
+        // Matching at all proves %2F stayed inside one segment. Had it been
+        // decoded before splitting, this would be two segments and miss.
+        match r.route(&Method::GET, "/u/a%2Fb") {
+            Match::Found { params, .. } => assert_eq!(params.get("name").unwrap(), "a/b"),
+            _ => panic!("%2F must not manufacture a separator"),
+        }
+    }
+
+    #[test]
+    fn a_route_with_a_literal_space_is_reachable_encoded() {
+        let mut r = Router::new();
+        {
+            let mut b = RouteBuilder::new(&mut r);
+            b.get("/a b", |_c: Call| async { "" });
+        }
+        assert!(matches!(
+            r.route(&Method::GET, "/a%20b"),
+            Match::Found { .. }
+        ));
+    }
+
+    #[test]
+    fn malformed_encoding_is_a_bad_path() {
+        let mut r = Router::new();
+        {
+            let mut b = RouteBuilder::new(&mut r);
+            b.get("/u/{name}", |_c: Call| async { "" });
+        }
+        assert!(matches!(r.route(&Method::GET, "/u/%zz"), Match::BadPath));
+        assert!(matches!(r.route(&Method::GET, "/u/%FF"), Match::BadPath));
+    }
+
+    #[test]
+    fn wildcard_captures_decoded_segments() {
+        let mut r = Router::new();
+        {
+            let mut b = RouteBuilder::new(&mut r);
+            b.get("/f/{rest...}", |_c: Call| async { "" });
+        }
+        match r.route(&Method::GET, "/f/a%20b/c") {
+            Match::Found { params, .. } => assert_eq!(params.get("rest").unwrap(), "a b/c"),
+            _ => panic!("expected the wildcard to match"),
+        }
     }
 
     #[test]

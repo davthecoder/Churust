@@ -500,6 +500,12 @@ impl App {
                     Match::NotFound => {
                         Response::text("Not Found").with_status(StatusCode::NOT_FOUND)
                     }
+                    // A malformed escape or non-UTF-8 bytes in the path. The
+                    // request is unintelligible rather than merely unmatched,
+                    // so it is a 400 and not a 404.
+                    Match::BadPath => {
+                        Response::text("Bad Request").with_status(StatusCode::BAD_REQUEST)
+                    }
                 }
             }) as _
         });
