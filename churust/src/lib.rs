@@ -70,9 +70,11 @@
 //!
 //! ```toml
 //! [dependencies]
-//! churust = { version = "0.1", features = ["full"] }
-//! tokio = { version = "1", features = ["full"] }
+//! churust = { version = "0.2", features = ["full"] }
 //! ```
+//!
+//! No separate `tokio` entry is needed: the runtime is re-exported as
+//! [`tokio`], and `#[churust::main]` uses that re-export.
 //!
 //! Bring the common items into scope with [`prelude`].
 //!

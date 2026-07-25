@@ -44,16 +44,20 @@ async fn main() -> std::io::Result<()> {
 
 ```toml
 [dependencies]
-churust = "0.1"
-tokio = { version = "1", features = ["full"] }
+churust = "0.2"
 ```
+
+That is the whole dependency list. Churust re-exports the runtime it is built
+on as `churust::tokio`, and `#[churust::main]` uses that re-export, so no
+separate `tokio` entry is needed. Add one only if you want a tokio feature
+Churust does not enable — Cargo unifies the two.
 
 Plugins and transports are opt-in features on the umbrella crate — depend on
 `churust` and enable what you need rather than pulling in the plugin crates
 directly:
 
 ```toml
-churust = { version = "0.1", features = ["full", "ws", "fs", "tls"] }
+churust = { version = "0.2", features = ["full", "ws", "fs", "tls"] }
 ```
 
 | Feature | Pulls in | Gives you |
@@ -67,7 +71,7 @@ churust = { version = "0.1", features = ["full", "ws", "fs", "tls"] }
 | `fs` | `churust-core/fs` | `StaticFiles` directory handler |
 | `tls` | `churust-core/tls` | rustls-backed HTTPS |
 
-Default features are empty, so a plain `churust = "0.1"` compiles the core
+Default features are empty, so a plain `churust = "0.2"` compiles the core
 engine and nothing else.
 
 Every Churust crate is released in lockstep on one version number, so
@@ -187,7 +191,7 @@ r.get("/echo", |ws: WebSocketUpgrade| async move {
 ```
 
 ```toml
-churust = { version = "0.1", features = ["ws"] }
+churust = { version = "0.2", features = ["ws"] }
 ```
 
 See [`examples/chat`](https://github.com/davthecoder/Churust/tree/main/examples/chat) for an echo endpoint plus a broadcast room.
@@ -220,7 +224,7 @@ paths, symlink escapes) with `404`, and streams the file in chunks. See
 [`examples/static`](https://github.com/davthecoder/Churust/tree/main/examples/static).
 
 ```toml
-churust = { version = "0.1", features = ["fs"] }
+churust = { version = "0.2", features = ["fs"] }
 ```
 
 ## Core concepts
