@@ -27,6 +27,10 @@ new segment-scoped function applied after splitting, never before.
 - **No git commits.** Every task ends with a Checkpoint — run the tests, confirm
   green, stop. Staging and committing are the user's.
 - No new dependencies without an explicit note in the task.
+- Clippy applies to test code too. In particular it rejects
+  `map.get(k).is_none()` — write `!map.contains_key(k)`. Run
+  `cargo clippy --workspace --all-targets` before every checkpoint, not just
+  `cargo test`; `--all-targets` is what reaches tests.
 - Path decoding order is normative: split → decode → reject separator →
   sanitize → canonicalize. Never decode before splitting.
 
@@ -40,6 +44,7 @@ churust/Cargo.toml                    tokio features, fs gating
 churust-core/Cargo.toml               tokio features
 Cargo.toml                            workspace tokio features
 examples/*/Cargo.toml                 drop tokio dependency
+examples/chat/src/main.rs             broadcast + select! via churust::tokio
 churust-core/src/router.rs            wildcard fallback in route()
 churust-core/src/app.rs               HEAD fallback + auto-OPTIONS at dispatch
 churust-core/src/path.rs              NEW — decode_path_segment
@@ -206,6 +211,8 @@ Expected: all green. Do not commit.
 - Modify: `churust-core/Cargo.toml`
 - Modify: `churust/Cargo.toml`
 - Modify: `examples/api/Cargo.toml`, `examples/chat/Cargo.toml`, `examples/static/Cargo.toml`
+- Modify: `examples/chat/src/main.rs` — uses tokio APIs directly, so it needs
+  the re-export, not just a manifest edit
 
 **Interfaces:**
 - Consumes: `churust::tokio` from Task 1.
@@ -259,6 +266,33 @@ test.
 Remove the `tokio` line from `examples/api/Cargo.toml`,
 `examples/chat/Cargo.toml`, and `examples/static/Cargo.toml`, exactly as Task 1
 did for `hello`.
+
+`api` and `static` touch no tokio API, so the manifest edit is the whole change.
+**`chat` does** — `tokio::sync::broadcast` and `tokio::select!` — so removing its
+dependency without fixing the source breaks the build. Route it through the
+re-export instead of giving the dependency back; an example that uses real tokio
+APIs with no tokio dependency is the strongest demonstration that the re-export
+works.
+
+In `examples/chat/src/main.rs`, change the imports:
+
+```rust
+// Note there is no `tokio` dependency in this example's Cargo.toml. Churust
+// re-exports the runtime it is built on, so `churust::tokio` is all you need.
+use churust::prelude::*;
+use churust::tokio::sync::broadcast;
+use churust::ws::{Message, WebSocketUpgrade};
+use std::sync::Arc;
+```
+
+and the macro call inside the broadcast loop:
+
+```rust
+                            churust::tokio::select! {
+```
+
+`select!` resolves through a re-export because tokio exports it at the crate
+root; no extra import is needed.
 
 - [ ] **Step 5: Verify the whole feature matrix**
 
@@ -331,7 +365,10 @@ Add to `mod tests` in `churust-core/src/router.rs`:
         let r = build_shadowed();
         match run(&r, Method::GET, "/files/special/x") {
             Match::Found { params, .. } => {
-                assert!(params.get("path").is_none(), "static route captured a wildcard param");
+                assert!(
+                    !params.contains_key("path"),
+                    "the static route captured a wildcard param"
+                );
             }
             _ => panic!("expected the static route"),
         }
@@ -365,7 +402,10 @@ Add to `mod tests` in `churust-core/src/router.rs`:
         match r.route(&Method::GET, "/u/7/edit") {
             Match::Found { params, .. } => {
                 assert_eq!(params.get("rest").unwrap(), "7/edit");
-                assert!(params.get("id").is_none(), "stale `id` leaked from the abandoned walk");
+                assert!(
+                    !params.contains_key("id"),
+                    "stale `id` leaked from the abandoned walk"
+                );
             }
             _ => panic!("wildcard should have matched"),
         }
@@ -1032,12 +1072,27 @@ Expected: FAIL to compile — no `Match::BadPath`; then assertion failures.
 
 - [ ] **Step 3: Add the variant**
 
-In the `Match` enum in `router.rs`, add:
+`Match` is re-exported as `churust_core::Match`, so adding a variant breaks any
+downstream `match` that was exhaustive. That is acceptable pre-1.0 but it must
+be stated: the spec's §10 claim of "not API-breaking" is wrong on this point.
+Mark the enum `#[non_exhaustive]` at the same time so the next variant is not
+another breaking change, and record both in the changelog in Task 9.
+
+In `router.rs`, add the attribute to the enum and the new variant:
 
 ```rust
+/// The outcome of routing a `(method, path)` pair against the [`Router`].
+///
+/// Marked `#[non_exhaustive]`: matches on this enum must carry a `_` arm, so
+/// that future routing outcomes are not a breaking change.
+#[non_exhaustive]
+pub enum Match {
+    // ... existing variants unchanged ...
+
     /// A path segment could not be percent-decoded — malformed escape or
     /// invalid UTF-8. The dispatcher turns this into `400 Bad Request`.
     BadPath,
+}
 ```
 
 - [ ] **Step 4: Decode after splitting, inside `route`**
@@ -1307,6 +1362,12 @@ In `CHANGELOG.md`, under `## [Unreleased]`:
 - `#[churust::main]` expands to `::churust::__private::tokio` rather than
   `::tokio`. Invoking the macro from `churust-macros` directly is no longer
   supported; depend on `churust`.
+
+### Breaking
+
+- `Match` gained a `BadPath` variant and is now `#[non_exhaustive]`. Code
+  matching on `churust_core::Match` needs a `_` arm. Only affects callers using
+  `Router` directly; applications built on the routing DSL are unaffected.
 ```
 
 - [ ] **Step 3: Update the crate-level docs**

@@ -291,10 +291,19 @@ failing test that reproduces §2's output before any fix.
 
 `0.2.0`, lockstep across all seven crates via `cargo release minor --execute`.
 
-Not API-breaking, but HEAD, OPTIONS, and path decoding all change observable
-behaviour, and the tokio feature reduction can require a user who relied on
+**Amended during implementation planning:** this release *is* API-breaking, in
+one narrow place. §7.3 requires a way to signal an undecodable path, which means
+a new `Match::BadPath` variant — and `Match` is re-exported as
+`churust_core::Match`, so any downstream exhaustive match on it stops compiling.
+`Match` becomes `#[non_exhaustive]` at the same time so that the next variant is
+not another break. Only callers using `Router` directly are affected;
+applications built on the routing DSL are not.
+
+Beyond that, HEAD, OPTIONS, and path decoding change observable behaviour, and
+the tokio feature reduction can require a user who relied on
 transitively-enabled tokio features to declare them. A minor bump pre-1.0 is
-correct, and `CHANGELOG.md` calls out the feature-set change explicitly.
+correct, and `CHANGELOG.md` calls out the breaking change and the feature-set
+change explicitly.
 
 ## 11. Decisions taken
 
