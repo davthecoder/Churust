@@ -70,7 +70,7 @@ README.md, CHANGELOG.md               docs
   (hidden; the path the macro expands to). Task 2 depends on the feature set
   behind these.
 
-- [ ] **Step 1: Write the failing test by removing the crutch**
+- [x] **Step 1: Write the failing test by removing the crutch**
 
 The defect only reproduces in a crate that does *not* depend on tokio. Inside
 `churust`'s own tests `::tokio` resolves, so the guard has to be a downstream
@@ -84,7 +84,7 @@ churust = { workspace = true }
 serde = { workspace = true }
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `cargo build -p hello`
 Expected: FAIL with
@@ -94,7 +94,7 @@ error[E0433]: cannot find `tokio` in the crate root
  --> examples/hello/src/main.rs:3:1
 ```
 
-- [ ] **Step 3: Re-export tokio from the umbrella**
+- [x] **Step 3: Re-export tokio from the umbrella**
 
 In `churust/src/lib.rs`, immediately after the `pub use churust_macros::main;`
 block (line 101), add:
@@ -120,7 +120,7 @@ pub mod __private {
 }
 ```
 
-- [ ] **Step 4: Point the macro at the re-export**
+- [x] **Step 4: Point the macro at the re-export**
 
 In `churust-macros/src/lib.rs`, change the expansion (line 149) from
 `::tokio::runtime::Builder` to:
@@ -138,7 +138,7 @@ In `churust-macros/src/lib.rs`, change the expansion (line 149) from
     };
 ```
 
-- [ ] **Step 5: Convert the macro crate's doctests to illustrations**
+- [x] **Step 5: Convert the macro crate's doctests to illustrations**
 
 `churust-macros` cannot compile the new expansion — `::churust` does not resolve
 from inside it, because the dependency runs the other way. Change every fenced
@@ -160,7 +160,7 @@ fn main() -> std::io::Result<()> {
 }
 ```
 
-- [ ] **Step 6: Restore the lost coverage in the umbrella**
+- [x] **Step 6: Restore the lost coverage in the umbrella**
 
 Create `churust/tests/macro_main.rs`:
 
@@ -186,7 +186,7 @@ fn macro_builds_a_runtime_and_runs_the_body() {
 }
 ```
 
-- [ ] **Step 7: Run the tests to verify they pass**
+- [x] **Step 7: Run the tests to verify they pass**
 
 Run: `cargo build -p hello`
 Expected: PASS — this is the E0433 regression guard.
@@ -197,7 +197,7 @@ Expected: PASS, 1 test.
 Run: `cargo test -p churust-macros`
 Expected: PASS. Doctest count drops as blocks became `text`.
 
-- [ ] **Step 8: Checkpoint**
+- [x] **Step 8: Checkpoint**
 
 Run: `cargo test --workspace`
 Expected: all green. Do not commit.
@@ -218,7 +218,7 @@ Expected: all green. Do not commit.
 - Consumes: `churust::tokio` from Task 1.
 - Produces: nothing new; narrows what `churust::tokio` exposes.
 
-- [ ] **Step 1: Narrow the workspace default**
+- [x] **Step 1: Narrow the workspace default**
 
 In the root `Cargo.toml`, replace the tokio line in `[workspace.dependencies]`:
 
@@ -238,7 +238,7 @@ Every feature is used: `rt-multi-thread` by the `main` macro and `Runtime`,
 `net` by `TcpListener`, `io-util` by `AsyncReadExt`, `time` by request timeouts,
 `sync` by the shutdown `oneshot`, `signal` by `ctrl_c`, `macros` by `select!`.
 
-- [ ] **Step 2: Gate tokio's fs feature behind Churust's**
+- [x] **Step 2: Gate tokio's fs feature behind Churust's**
 
 `StaticFiles` uses `tokio::fs`. In `churust-core/Cargo.toml`, keep the
 workspace tokio dependency and add the feature only under `fs`:
@@ -254,14 +254,14 @@ fs = ["tokio/fs"]
 In `churust/Cargo.toml` the `fs` feature already forwards to
 `churust-core/fs`, so no change is needed there.
 
-- [ ] **Step 3: Restore what dev-dependencies need**
+- [x] **Step 3: Restore what dev-dependencies need**
 
 `#[tokio::test]` needs `macros` and `rt`, already in the narrowed set. If
 `cargo test` reports a missing tokio feature in a dev context, add it to that
 crate's `[dev-dependencies]` only — never widen the main dependency to satisfy a
 test.
 
-- [ ] **Step 4: Drop tokio from the remaining examples**
+- [x] **Step 4: Drop tokio from the remaining examples**
 
 Remove the `tokio` line from `examples/api/Cargo.toml`,
 `examples/chat/Cargo.toml`, and `examples/static/Cargo.toml`, exactly as Task 1
@@ -294,7 +294,7 @@ and the macro call inside the broadcast loop:
 `select!` resolves through a re-export because tokio exports it at the crate
 root; no extra import is needed.
 
-- [ ] **Step 5: Verify the whole feature matrix**
+- [x] **Step 5: Verify the whole feature matrix**
 
 Each of these must pass — a missing feature usually shows up in only one:
 
@@ -313,7 +313,7 @@ cargo clippy --workspace --all-targets -- -D warnings
 Expected: all PASS. A failure naming a tokio item means that item's feature is
 missing from Step 1's list — add it and note why in the task.
 
-- [ ] **Step 6: Checkpoint**
+- [x] **Step 6: Checkpoint**
 
 Run: `cargo test --workspace`
 Expected: green. Do not commit.
@@ -331,7 +331,7 @@ Expected: green. Do not commit.
 - Produces: `Router::route` with the precedence exact → wildcard → 405(union) →
   404. Signature unchanged: `pub fn route(&self, method: &Method, path: &str) -> Match`.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add to `mod tests` in `churust-core/src/router.rs`:
 
@@ -412,13 +412,13 @@ Add to `mod tests` in `churust-core/src/router.rs`:
     }
 ```
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 Run: `cargo test -p churust-core --lib router::tests`
 Expected: FAIL. `wildcard_is_reachable_through_a_static_sibling` panics with
 "wildcard should serve /files/special".
 
-- [ ] **Step 3: Rewrite `Router::route`**
+- [x] **Step 3: Rewrite `Router::route`**
 
 Replace the body of `route` (lines 168-192) with:
 
@@ -462,12 +462,12 @@ Replace the body of `route` (lines 168-192) with:
     }
 ```
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p churust-core --lib router::tests`
 Expected: PASS, including the four pre-existing router tests.
 
-- [ ] **Step 5: Checkpoint**
+- [x] **Step 5: Checkpoint**
 
 Run: `cargo test --workspace`
 Expected: green. Do not commit.
@@ -488,7 +488,7 @@ Expected: green. Do not commit.
 body it is handed. `TestClient` bypasses hyper entirely, so a `TestClient`
 assertion cannot tell you what goes on the wire. Step 5 verifies at the socket.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Create `churust-core/tests/head_options.rs`:
 
@@ -537,12 +537,12 @@ async fn head_on_a_post_only_route_is_still_405() {
 }
 ```
 
-- [ ] **Step 2: Run it to verify it fails**
+- [x] **Step 2: Run it to verify it fails**
 
 Run: `cargo test -p churust-core --test head_options`
 Expected: FAIL — `head_falls_back_to_get` gets `405`, not `200`.
 
-- [ ] **Step 3: Implement the fallback**
+- [x] **Step 3: Implement the fallback**
 
 In `churust-core/src/app.rs`, replace the endpoint closure body (lines 441-460):
 
@@ -604,12 +604,12 @@ fn strip_body(mut res: Response) -> Response {
 
 Add `use http::Method;` to the imports at the top of `app.rs` if not present.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p churust-core --test head_options`
 Expected: PASS, 3 tests.
 
-- [ ] **Step 5: Verify on the wire, not just through TestClient**
+- [x] **Step 5: Verify on the wire, not just through TestClient**
 
 Add to `churust-core/tests/head_options.rs`:
 
@@ -682,7 +682,7 @@ notes. Three outcomes:
 Whatever the outcome, record it in `CHANGELOG.md` in Task 9 — clients that size
 a resource with `HEAD` care about this.
 
-- [ ] **Step 6: Checkpoint**
+- [x] **Step 6: Checkpoint**
 
 Run: `cargo test --workspace`
 Expected: green. Do not commit.
@@ -701,7 +701,7 @@ Expected: green. Do not commit.
 - Produces: `Router::methods_for(&self, path: &str) -> Vec<Method>` — the
   registered methods for a path, empty if the path matches nothing.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Append to `churust-core/tests/head_options.rs`:
 
@@ -729,12 +729,12 @@ async fn options_on_an_unknown_path_is_404() {
 }
 ```
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 Run: `cargo test -p churust-core --test head_options`
 Expected: FAIL — `options_reports_allowed_methods` gets `405`.
 
-- [ ] **Step 3: Expose the registered methods from the router**
+- [x] **Step 3: Expose the registered methods from the router**
 
 Add to `impl Router` in `churust-core/src/router.rs`:
 
@@ -768,7 +768,7 @@ Add to `impl Router` in `churust-core/src/router.rs`:
 `Method::TRACE` is a probe: no route registers it, so `walk_wildcard` always
 returns `MethodNotAllowed` carrying the wildcard's full method list.
 
-- [ ] **Step 4: Synthesize the response at dispatch**
+- [x] **Step 4: Synthesize the response at dispatch**
 
 In `app.rs`, immediately after the HEAD block added in Task 4 Step 3:
 
@@ -799,7 +799,7 @@ In `app.rs`, immediately after the HEAD block added in Task 4 Step 3:
 
 The closure returns `Response`, so `return` exits the closure only.
 
-- [ ] **Step 5: Prove CORS preflight still wins**
+- [x] **Step 5: Prove CORS preflight still wins**
 
 Add to `churust-cors/src/lib.rs` `mod tests`:
 
@@ -827,7 +827,7 @@ Add to `churust-cors/src/lib.rs` `mod tests`:
     }
 ```
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [x] **Step 6: Run the tests to verify they pass**
 
 Run: `cargo test -p churust-core --test head_options`
 Expected: PASS, 6 tests.
@@ -835,7 +835,7 @@ Expected: PASS, 6 tests.
 Run: `cargo test -p churust-cors`
 Expected: PASS including the new preflight test.
 
-- [ ] **Step 7: Checkpoint**
+- [x] **Step 7: Checkpoint**
 
 Run: `cargo test --workspace && cargo test -p churust --features full`
 Expected: green. Do not commit.
@@ -852,7 +852,7 @@ Expected: green. Do not commit.
 - Produces: `pub(crate) fn decode_path_segment(raw: &str) -> Option<String>` —
   `None` on malformed encoding or invalid UTF-8. Tasks 7 and 8 consume it.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Create `churust-core/src/path.rs`:
 
@@ -934,7 +934,7 @@ mod tests {
 }
 ```
 
-- [ ] **Step 2: Register the module and run to verify failure**
+- [x] **Step 2: Register the module and run to verify failure**
 
 In `churust-core/src/lib.rs`, add alongside the other module declarations:
 
@@ -945,7 +945,7 @@ mod path;
 Run: `cargo test -p churust-core --lib path::tests`
 Expected: FAIL to compile — `cannot find function decode_path_segment`.
 
-- [ ] **Step 3: Implement the decoder**
+- [x] **Step 3: Implement the decoder**
 
 Add above `mod tests` in `churust-core/src/path.rs`:
 
@@ -988,12 +988,12 @@ pub(crate) fn decode_path_segment(raw: &str) -> Option<String> {
 
 Note the guard is `i + 2 >= bytes.len()`, so `bytes[i + 2]` is always in range.
 
-- [ ] **Step 4: Run the tests to verify they pass**
+- [x] **Step 4: Run the tests to verify they pass**
 
 Run: `cargo test -p churust-core --lib path::tests`
 Expected: PASS, 8 tests.
 
-- [ ] **Step 5: Checkpoint**
+- [x] **Step 5: Checkpoint**
 
 Run: `cargo test --workspace`
 Expected: green. Do not commit.
@@ -1012,7 +1012,7 @@ Expected: green. Do not commit.
 - Produces: `Router::route` returns `Match::BadPath` for undecodable input.
   `Match` gains a variant — update every `match` over it.
 
-- [ ] **Step 1: Write the failing tests**
+- [x] **Step 1: Write the failing tests**
 
 Add to `mod tests` in `churust-core/src/router.rs`:
 
@@ -1065,12 +1065,12 @@ Add to `mod tests` in `churust-core/src/router.rs`:
     }
 ```
 
-- [ ] **Step 2: Run them to verify they fail**
+- [x] **Step 2: Run them to verify they fail**
 
 Run: `cargo test -p churust-core --lib router::tests`
 Expected: FAIL to compile — no `Match::BadPath`; then assertion failures.
 
-- [ ] **Step 3: Add the variant**
+- [x] **Step 3: Add the variant**
 
 `Match` is re-exported as `churust_core::Match`, so adding a variant breaks any
 downstream `match` that was exhaustive. That is acceptable pre-1.0 but it must
@@ -1095,7 +1095,7 @@ pub enum Match {
 }
 ```
 
-- [ ] **Step 4: Decode after splitting, inside `route`**
+- [x] **Step 4: Decode after splitting, inside `route`**
 
 At the top of `Router::route`, replace `let segments = split_segments(path);`:
 
@@ -1118,7 +1118,7 @@ The rest of `route` is unchanged — it already operates on `&[&str]`.
 Apply the same decode loop at the top of `methods_for` from Task 5, returning an
 empty `Vec` instead of `Match::BadPath` when a segment fails.
 
-- [ ] **Step 5: Handle the variant at dispatch**
+- [x] **Step 5: Handle the variant at dispatch**
 
 In `app.rs`, add an arm to the `match lookup` block:
 
@@ -1130,7 +1130,7 @@ In `app.rs`, add an arm to the `match lookup` block:
 Compile and fix every other `match` over `Match` the compiler flags — the
 exhaustiveness check is what finds them.
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [x] **Step 6: Run the tests to verify they pass**
 
 Run: `cargo test -p churust-core --lib router::tests`
 Expected: PASS.
@@ -1139,7 +1139,7 @@ Run: `cargo test --workspace`
 Expected: PASS. If a test asserted a raw-encoded param value, it was asserting
 the bug — update it and note which.
 
-- [ ] **Step 7: Checkpoint**
+- [x] **Step 7: Checkpoint**
 
 Run: `cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`
 Expected: green. Do not commit.
@@ -1156,7 +1156,7 @@ Expected: green. Do not commit.
 - Consumes: decoded params from Task 7.
 - Produces: no new public API. `StaticFiles::serve` gains a rejection step.
 
-- [ ] **Step 1: Write the failing traversal suite**
+- [x] **Step 1: Write the failing traversal suite**
 
 Create `churust-core/tests/traversal.rs`:
 
@@ -1235,7 +1235,7 @@ async fn every_traversal_shape_is_refused() {
 }
 ```
 
-- [ ] **Step 2: Run it to verify the current state**
+- [x] **Step 2: Run it to verify the current state**
 
 Run: `cargo test -p churust-core --features fs --test traversal`
 Expected: `serves_a_normal_file` PASSES. `every_traversal_shape_is_refused` may
@@ -1243,7 +1243,7 @@ already pass — Task 7 introduced decoding, so record which attempts now reach
 `sanitize` with a decoded `..`. Either way the suite must be green before Step 3
 is considered done, and it is the regression guard for the change below.
 
-- [ ] **Step 3: Reject encoded separators before sanitizing**
+- [x] **Step 3: Reject encoded separators before sanitizing**
 
 In `churust-core/src/fs.rs`, inside `serve`, between reading `rel` and calling
 `sanitize` (currently line 71):
@@ -1265,12 +1265,12 @@ In `churust-core/src/fs.rs`, inside `serve`, between reading `rel` and calling
 `404` and not `400`: a static file server should not reveal whether a rejected
 path would have resolved.
 
-- [ ] **Step 4: Run the suite to verify it passes**
+- [x] **Step 4: Run the suite to verify it passes**
 
 Run: `cargo test -p churust-core --features fs --test traversal`
 Expected: PASS, 2 tests, no canary in any response.
 
-- [ ] **Step 5: Confirm ordering with a targeted unit test**
+- [x] **Step 5: Confirm ordering with a targeted unit test**
 
 Add to `mod tests` in `churust-core/src/fs.rs`:
 
@@ -1287,7 +1287,7 @@ Add to `mod tests` in `churust-core/src/fs.rs`:
 Run: `cargo test -p churust-core --features fs --lib fs::tests`
 Expected: PASS.
 
-- [ ] **Step 6: Checkpoint**
+- [x] **Step 6: Checkpoint**
 
 Run: `cargo test --workspace && cargo test -p churust --features full && cargo test -p churust-core --features fs`
 Expected: green. Do not commit.
@@ -1301,7 +1301,7 @@ Expected: green. Do not commit.
 - Modify: `CHANGELOG.md`
 - Modify: `churust/src/lib.rs` (crate docs)
 
-- [ ] **Step 1: Drop tokio from the install instructions**
+- [x] **Step 1: Drop tokio from the install instructions**
 
 In `README.md`, the Install section becomes:
 
@@ -1325,7 +1325,7 @@ Add below the feature table:
 Update the three per-feature snippets in the WebSockets and Static-files
 sections from `version = "0.1"` to `version = "0.2"`.
 
-- [ ] **Step 2: Write the changelog entry**
+- [x] **Step 2: Write the changelog entry**
 
 In `CHANGELOG.md`, under `## [Unreleased]`:
 
@@ -1370,12 +1370,12 @@ In `CHANGELOG.md`, under `## [Unreleased]`:
   `Router` directly; applications built on the routing DSL are unaffected.
 ```
 
-- [ ] **Step 3: Update the crate-level docs**
+- [x] **Step 3: Update the crate-level docs**
 
 In `churust/src/lib.rs`, find the quickstart in the module docs and remove any
 `tokio = ...` line from the shown `Cargo.toml`.
 
-- [ ] **Step 4: Verify the docs build and the examples still run**
+- [x] **Step 4: Verify the docs build and the examples still run**
 
 ```bash
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
@@ -1388,7 +1388,7 @@ kill %1
 Expected: docs build clean; `GET /` returns `200`; `HEAD /` returns `200` and no
 body.
 
-- [ ] **Step 5: Full gate**
+- [x] **Step 5: Full gate**
 
 ```bash
 cargo fmt --all --check
@@ -1405,7 +1405,7 @@ cargo package --workspace
 
 Expected: all PASS. This is exactly what CI runs plus the packaging check.
 
-- [ ] **Step 6: Checkpoint**
+- [x] **Step 6: Checkpoint**
 
 Report the final test count against the 189 baseline and stop. The release
 itself (`cargo release minor --execute`) is the user's call, not part of this
