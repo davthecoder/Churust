@@ -144,12 +144,57 @@ jobs:
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
+
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
             echo "::notice::release $GITHUB_REF_NAME already exists"
-          else
-            gh release create "$GITHUB_REF_NAME" \
-              --generate-notes \
-              --title "Churust $GITHUB_REF_NAME"
+            exit 0
           fi
+
+          # The hand-written section for this version, if CHANGELOG.md has one.
+          # Everything between this version's heading and the next one.
+          changelog=$(awk -v v="$VERSION" '
+            $0 ~ "^## \\[" v "\\]" { grab = 1; next }
+            grab && /^## \[/       { exit }
+            grab                   { print }
+          ' CHANGELOG.md 2>/dev/null || true)
+
+          # GitHub's own commit/PR summary, which carries the compare link.
+          auto=$(gh api "repos/$GITHUB_REPOSITORY/releases/generate-notes" \
+            -f tag_name="$GITHUB_REF_NAME" --jq '.body' 2>/dev/null || true)
+
+          {
+            echo "All seven Churust crates release together on \`$VERSION\`."
+            echo
+            echo '```toml'
+            echo '[dependencies]'
+            echo "churust = \"$VERSION\""
+            echo '```'
+            echo
+
+            if [ -n "$(printf '%s' "$changelog" | tr -d '[:space:]')" ]; then
+              printf '%s\n\n' "$changelog"
+            fi
+
+            echo '### Crates'
+            echo
+            for c in churust churust-core churust-macros churust-json \
+                     churust-logging churust-cors churust-auth; do
+              echo "- [\`$c\`](https://crates.io/crates/$c/$VERSION) · [docs](https://docs.rs/$c/$VERSION)"
+            done
+            echo
+
+            if [ -n "$(printf '%s' "$auto" | tr -d '[:space:]')" ]; then
+              printf '%s\n' "$auto"
+            fi
+          } > "$RUNNER_TEMP/notes.md"
+
+          # --latest is what puts the "Latest" badge on the release; --verify-tag
+          # refuses to invent a tag that is not already pushed.
+          gh release create "$GITHUB_REF_NAME" \
+            --title "Churust $GITHUB_REF_NAME" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            --latest \
+            --verify-tag
