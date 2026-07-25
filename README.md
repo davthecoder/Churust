@@ -325,7 +325,7 @@ Everyone taking part is held to the [Code of Conduct](CODE_OF_CONDUCT.md).
 ## Sponsor
 
 Churust is built and maintained in spare time. If it saves you some, you can
-support the work through [GitHub Sponsors](https://github.com/sponsors/davthecoder).
+support the work through [GitHub Sponsors](https://github.com/sponsors/davthecodercom).
 
 Sponsorship funds maintenance — issue triage, security response, keeping up with
 tokio/hyper/rustls releases — not feature bounties. Features are decided on
