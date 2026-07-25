@@ -168,26 +168,43 @@ impl Router {
     pub fn route(&self, method: &Method, path: &str) -> Match {
         let segments = split_segments(path);
         let mut params = HashMap::new();
-        match Self::walk(&self.root, &segments, 0, &mut params) {
-            Some(node) => match node.handlers.0.get(method) {
-                Some(h) => Match::Found {
+
+        // 1. Exact walk. Static beats param, unchanged.
+        let exact = Self::walk(&self.root, &segments, 0, &mut params);
+        if let Some(node) = exact {
+            if let Some(h) = node.handlers.0.get(method) {
+                return Match::Found {
                     handler: h.clone(),
                     params,
-                },
-                None if node.handlers.0.is_empty() => Match::NotFound,
-                None => Match::MethodNotAllowed {
-                    allow: node.handlers.0.keys().cloned().collect(),
-                },
-            },
-            None => {
-                // try wildcard at the deepest matchable ancestor
-                if let Some(m) = Self::walk_wildcard(&self.root, &segments, 0, method, &mut params)
-                {
-                    m
-                } else {
-                    Match::NotFound
-                }
+                };
             }
+        }
+        let exact_allow: Vec<Method> = exact
+            .map(|n| n.handlers.0.keys().cloned().collect())
+            .unwrap_or_default();
+
+        // 2. Wildcard fallback. Reaching a node that has no handler for this
+        //    method is not the end of the search — a trailing `{name...}` at a
+        //    shallower depth may still serve the request. Without this, any
+        //    static route sharing a wildcard's prefix hides it entirely.
+        //
+        //    The walk above may have written captures into `params`. They
+        //    belong to the branch just abandoned and must not reach the
+        //    wildcard handler.
+        params.clear();
+        match Self::walk_wildcard(&self.root, &segments, 0, method, &mut params) {
+            Some(found @ Match::Found { .. }) => found,
+            Some(Match::MethodNotAllowed { allow: wild_allow }) => {
+                let mut allow = exact_allow;
+                for m in wild_allow {
+                    if !allow.contains(&m) {
+                        allow.push(m);
+                    }
+                }
+                Match::MethodNotAllowed { allow }
+            }
+            _ if !exact_allow.is_empty() => Match::MethodNotAllowed { allow: exact_allow },
+            _ => Match::NotFound,
         }
     }
 
@@ -407,6 +424,77 @@ mod tests {
                 assert_eq!(res.body, Bytes::from("user 7"));
             }
             _ => panic!("expected Found"),
+        }
+    }
+
+    fn build_shadowed() -> Router {
+        let mut r = Router::new();
+        {
+            let mut b = RouteBuilder::new(&mut r);
+            b.get("/files/{path...}", |c: Call| async move {
+                format!("wild:{}", c.param_raw("path").unwrap_or(""))
+            });
+            b.get("/files/special/x", |_c: Call| async { "static" });
+            b.post("/files/only-post", |_c: Call| async { "posted" });
+        }
+        r
+    }
+
+    #[test]
+    fn wildcard_is_reachable_through_a_static_sibling() {
+        let r = build_shadowed();
+        match run(&r, Method::GET, "/files/special") {
+            Match::Found { params, .. } => {
+                assert_eq!(params.get("path").unwrap(), "special");
+            }
+            _ => panic!("wildcard should serve /files/special"),
+        }
+    }
+
+    #[test]
+    fn exact_match_still_wins_over_wildcard() {
+        let r = build_shadowed();
+        match run(&r, Method::GET, "/files/special/x") {
+            Match::Found { params, .. } => {
+                assert!(
+                    !params.contains_key("path"),
+                    "the static route captured a wildcard param"
+                );
+            }
+            _ => panic!("expected the static route"),
+        }
+    }
+
+    #[test]
+    fn allow_header_unions_exact_and_wildcard_methods() {
+        let r = build_shadowed();
+        match run(&r, Method::DELETE, "/files/only-post") {
+            Match::MethodNotAllowed { allow } => {
+                assert!(allow.contains(&Method::POST), "missing the exact method");
+                assert!(allow.contains(&Method::GET), "missing the wildcard method");
+            }
+            _ => panic!("expected 405"),
+        }
+    }
+
+    #[test]
+    fn abandoned_branch_params_do_not_leak_into_the_wildcard() {
+        let mut r = Router::new();
+        {
+            let mut b = RouteBuilder::new(&mut r);
+            // Matches /u/7/edit structurally, but has no GET handler.
+            b.post("/u/{id}/edit", |_c: Call| async { "edit" });
+            b.get("/u/{rest...}", |_c: Call| async { "wild" });
+        }
+        match r.route(&Method::GET, "/u/7/edit") {
+            Match::Found { params, .. } => {
+                assert_eq!(params.get("rest").unwrap(), "7/edit");
+                assert!(
+                    !params.contains_key("id"),
+                    "stale `id` leaked from the abandoned walk"
+                );
+            }
+            _ => panic!("the wildcard should have matched"),
         }
     }
 
