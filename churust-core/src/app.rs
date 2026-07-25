@@ -438,10 +438,30 @@ impl App {
         let endpoint: Endpoint = Arc::new(move |mut call: Call| {
             let inner = inner.clone();
             Box::pin(async move {
-                match inner.router.route(call.method(), call.path()) {
+                let path = call.path().to_string();
+                let method = call.method().clone();
+                let mut lookup = inner.router.route(&method, &path);
+
+                // RFC 9110 §9.3.2: HEAD must be available wherever GET is.
+                // Only synthesized when no HEAD route was registered, so an
+                // explicit HEAD handler always wins.
+                let mut synthesized_head = false;
+                if method == Method::HEAD && !matches!(lookup, Match::Found { .. }) {
+                    if let m @ Match::Found { .. } = inner.router.route(&Method::GET, &path) {
+                        lookup = m;
+                        synthesized_head = true;
+                    }
+                }
+
+                match lookup {
                     Match::Found { handler, params } => {
                         call.set_params(params);
-                        handler.handle(call).await
+                        let res = handler.handle(call).await;
+                        if synthesized_head {
+                            strip_body(res)
+                        } else {
+                            res
+                        }
                     }
                     Match::MethodNotAllowed { allow } => {
                         let value = allow
@@ -464,6 +484,27 @@ impl App {
         let chain: VecDeque<Arc<dyn Middleware>> = self.inner.middleware.iter().cloned().collect();
         Next::new(chain, endpoint).run(call).await
     }
+}
+
+/// Drop a response body for a synthesized `HEAD` reply, keeping status and
+/// headers.
+///
+/// RFC 9110 §9.3.2 says a `HEAD` response should carry the same header fields a
+/// `GET` would, so a buffered body's length is preserved as `Content-Length`
+/// before the bytes are discarded — clients do use `HEAD` to size a resource.
+///
+/// A streamed body has no known length and is dropped rather than drained:
+/// draining it would do exactly the work the client declined to ask for. The
+/// same section permits omitting fields that are only determined while
+/// generating the content, which is precisely this case.
+fn strip_body(mut res: Response) -> Response {
+    if let Some(bytes) = res.body.as_bytes() {
+        if let Ok(value) = HeaderValue::from_str(&bytes.len().to_string()) {
+            res.headers.insert(http::header::CONTENT_LENGTH, value);
+        }
+    }
+    res.body = crate::body::Body::empty();
+    res
 }
 
 /// The framework entry point — a zero-sized namespace for starting an
