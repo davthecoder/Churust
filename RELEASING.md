@@ -12,6 +12,19 @@ Never edit a crate's `Cargo.toml` version by hand.
 
 ## Cutting a release
 
+**First, move the changelog entry.** In `CHANGELOG.md`, change `## [Unreleased]`
+into `## [Unreleased]` followed by `## [X.Y.Z] - YYYY-MM-DD`, and add the
+compare links at the bottom. The release workflow pulls the section matching the
+tag's version into the GitHub release, so an entry still sitting under
+`Unreleased` produces a release with no notes.
+
+This is deliberately manual. `cargo release` can rewrite files, but with
+`shared-version` across seven crates a replacement rule marked `exactly = 1`
+runs once per crate and aborts on the second — so the automation would break
+the release rather than save a step.
+
+Then:
+
 ```sh
 cargo release patch          # dry run: prints the plan, changes nothing
 cargo release patch --execute
