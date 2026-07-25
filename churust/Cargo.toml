@@ -24,6 +24,12 @@ churust-json = { workspace = true, optional = true }
 churust-logging = { workspace = true, optional = true }
 churust-cors = { workspace = true, optional = true }
 churust-auth = { workspace = true, optional = true }
+churust-ratelimit = { workspace = true, optional = true }
+churust-compression = { workspace = true, optional = true }
+churust-templates = { workspace = true, optional = true }
+churust-redis = { workspace = true, optional = true }
+churust-client = { workspace = true, optional = true }
+churust-openapi = { workspace = true, optional = true }
 
 [features]
 default = []
@@ -31,8 +37,19 @@ json = ["dep:churust-json"]
 logging = ["dep:churust-logging"]
 cors = ["dep:churust-cors"]
 auth = ["dep:churust-auth"]
+ratelimit = ["dep:churust-ratelimit"]
+compression = ["dep:churust-compression"]
+templates = ["dep:churust-templates"]
+redis = ["dep:churust-redis"]
+client = ["dep:churust-client"]
+client-tls = ["client", "churust-client/tls"]
+# The document is emitted as JSON, so the JSON plugin comes with it.
+openapi = ["dep:churust-openapi", "json"]
 tls = ["churust-core/tls"]
 ws = ["churust-core/ws"]
 fs = ["churust-core/fs"]
 multipart = ["churust-core/multipart"]
-full = ["json", "logging", "cors", "auth"]
+http3 = ["churust-core/http3"]
+# The plugin set. Transports (ws, fs, tls) stay opt-in individually, since each
+# one is a protocol surface rather than an ergonomic addition.
+full = ["json", "logging", "cors", "auth", "ratelimit", "compression", "templates"]

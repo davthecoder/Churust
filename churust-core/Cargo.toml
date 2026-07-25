@@ -36,8 +36,22 @@ toml = "0.8"
 tracing.workspace = true
 hmac.workspace = true
 sha2.workspace = true
-rustls = { version = "0.23", optional = true }
-tokio-rustls = { version = "0.26", optional = true }
+# `ring`, with defaults off. rustls 0.23 defaults to aws-lc-rs, and quinn's
+# QUIC crypto is ring-backed, so leaving both on makes rustls refuse to pick a
+# provider at runtime rather than at compile time. One provider, chosen here.
+rustls = { version = "0.23", optional = true, default-features = false, features = [
+  "ring",
+  "std",
+  "tls12",
+  "logging",
+] }
+# Defaults off for the same reason as rustls above: tokio-rustls defaults to
+# aws_lc_rs, which would put a second crypto provider in the build.
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = [
+  "ring",
+  "tls12",
+  "logging",
+] }
 rustls-pemfile = { version = "2", optional = true }
 tokio-tungstenite = { version = "0.26", optional = true }
 # IMF-fixdate parsing and formatting for Last-Modified / If-Modified-Since.
@@ -47,6 +61,9 @@ tokio-tungstenite = { version = "0.26", optional = true }
 httpdate = { version = "1", optional = true }
 tower-service = { workspace = true, optional = true }
 tower-layer = { workspace = true, optional = true }
+quinn = { workspace = true, optional = true }
+h3 = { workspace = true, optional = true }
+h3-quinn = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio-tungstenite = "0.26"
@@ -57,6 +74,13 @@ rcgen = "0.13"
 # adapter rather than someone else's middleware.
 tower-layer = "0.3"
 tower-service = "0.3"
+# The client half of the h3 stack, so the HTTP/3 tests speak real QUIC to the
+# real listener rather than asserting on the pieces in isolation.
+quinn = { workspace = true }
+h3 = { workspace = true }
+h3-quinn = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+futures-util = { workspace = true }
 
 [features]
 default = []
@@ -72,3 +96,6 @@ tower = ["dep:tower-service", "dep:tower-layer"]
 # multipart/form-data parsing. No new dependency: the parser is hand-rolled
 # over the already-buffered body.
 multipart = []
+# HTTP/3 over QUIC. Implies `tls`: QUIC has no plaintext mode, so there is no
+# such thing as h3 without a certificate.
+http3 = ["tls", "dep:quinn", "dep:h3", "dep:h3-quinn"]

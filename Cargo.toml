@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["churust-core", "churust-macros", "churust", "examples/hello", "churust-json", "churust-logging", "churust-cors", "churust-auth", "churust-lab", "examples/api", "examples/chat", "examples/static"]
+members = ["churust-core", "churust-macros", "churust", "examples/hello", "churust-json", "churust-logging", "churust-cors", "churust-auth", "churust-ratelimit", "churust-compression", "churust-templates", "churust-redis", "churust-client", "churust-openapi", "churust-lab", "examples/api", "examples/chat", "examples/static"]
 
 [workspace.package]
 # Every Churust crate releases in lockstep on this single version.
@@ -26,6 +26,12 @@ churust-json = { path = "churust-json", version = "0.2.0" }
 churust-logging = { path = "churust-logging", version = "0.2.0" }
 churust-cors = { path = "churust-cors", version = "0.2.0" }
 churust-auth = { path = "churust-auth", version = "0.2.0" }
+churust-ratelimit = { path = "churust-ratelimit", version = "0.2.0" }
+churust-compression = { path = "churust-compression", version = "0.2.0" }
+churust-templates = { path = "churust-templates", version = "0.2.0" }
+churust-redis = { path = "churust-redis", version = "0.2.0" }
+churust-client = { path = "churust-client", version = "0.2.0" }
+churust-openapi = { path = "churust-openapi", version = "0.2.0" }
 # Shares the workspace version despite never promising 1.0 — see the crate docs
 # for why, and for when that must be revisited.
 churust-lab = { path = "churust-lab", version = "0.2.0" }
@@ -45,7 +51,16 @@ tokio = { version = "1", features = [
   "macros",
 ] }
 hyper = { version = "1", features = ["http1", "http2", "server"] }
-hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "server-graceful"] }
+hyper-util = { version = "0.1", features = [
+  "tokio",
+  "server",
+  "server-auto",
+  "server-graceful",
+  # The pooling client behind churust-client. Same crate as the server side, so
+  # this adds code to that build rather than a new dependency to the tree.
+  "client",
+  "client-legacy",
+] }
 http-body-util = "0.1"
 # The `http_body::Body` trait itself, so Churust's `Body` can implement it and
 # be handed to anything written against the http/http-body crates.
@@ -74,6 +89,48 @@ base64 = "0.22"
 # rather than a documented weakness.
 hmac = "0.12"
 sha2 = "0.10"
+# Response compression. `async-compression` wraps the gzip/deflate/brotli
+# encoders in an `AsyncRead`, which is what lets a streamed body stay streamed
+# while being compressed instead of being collected first.
+# `zlib`, not `deflate`: RFC 9110 §8.4.1.2 defines the `deflate` content coding
+# as the zlib format of RFC 1950, and async-compression's `DeflateEncoder`
+# emits raw RFC 1951 instead, which several clients reject.
+async-compression = { version = "0.4", features = ["tokio", "gzip", "zlib", "brotli"] }
+# Bridges a `Stream` of chunks and an `AsyncRead`, in both directions. Only the
+# `io` feature; the rest of tokio-util is not used.
+tokio-util = { version = "0.7", features = ["io"] }
+# Template rendering. Jinja2 syntax, one crate, no build script, and it does
+# not pull a second async runtime the way the larger engines do.
+minijinja = "2"
+# Redis-backed session storage. Default features off: the crate otherwise
+# brings a synchronous connection stack Churust never uses.
+# Default features off: the crate otherwise brings a synchronous connection
+# stack Churust never uses. `connection-manager` is deliberately not enabled --
+# as of redis 1.4.1 it requires an arc-swap version that is not published, and
+# the reconnect it provides is a few lines to do over a multiplexed connection.
+redis = { version = "1", default-features = false, features = ["tokio-comp"] }
+# rustls for the client side, sharing the TLS stack the server already uses.
+# `ring` rather than aws-lc-rs: it is what churust-core's server TLS pulls, and
+# two providers in one binary is a runtime error waiting to happen.
+hyper-rustls = { version = "0.27", default-features = false, features = [
+  "http1",
+  "http2",
+  "ring",
+  "tls12",
+  "webpki-tokio",
+] }
+# HTTP/3. quinn is the QUIC transport, h3 the protocol, h3-quinn the glue.
+# Default features off on quinn so it takes the same ring-backed rustls the
+# server TLS already uses rather than pulling a second crypto provider.
+quinn = { version = "0.11", default-features = false, features = [
+  "runtime-tokio",
+  "rustls-ring",
+] }
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+# OS entropy for session identifiers. Chosen over `rand` because a session
+# id needs the operating system CSPRNG and nothing else that crate offers.
+getrandom = "0.4"
 syn = { version = "2", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"

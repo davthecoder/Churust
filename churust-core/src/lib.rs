@@ -109,11 +109,15 @@ pub use cookie::{Cookie, SameSite};
 #[cfg(feature = "multipart")]
 pub mod multipart;
 #[cfg(feature = "multipart")]
-pub use multipart::{Multipart, Part};
+pub use multipart::{Field, Multipart, MultipartStream, Part};
 
 /// Sessions carried by a cookie.
 pub mod session;
-pub use session::{CookieStore, Session, SessionStore, Sessions};
+pub use session::{CookieStore, Session, SessionStore, Sessions, SESSION_ID_KEY};
+
+/// Login, logout, and the two deadlines that end a login.
+pub mod identity;
+pub use identity::{Authenticated, Identities, Identity};
 
 /// Route guards — predicates that select among routes sharing a method and path.
 pub mod guard;
@@ -182,6 +186,10 @@ pub fn secure_compare(a: impl AsRef<[u8]>, b: impl AsRef<[u8]>) -> bool {
 
 #[cfg(feature = "tls")]
 pub mod tls;
+
+/// HTTP/3 over QUIC (feature `http3`).
+#[cfg(feature = "http3")]
+pub mod http3;
 
 #[cfg(feature = "ws")]
 pub mod ws;

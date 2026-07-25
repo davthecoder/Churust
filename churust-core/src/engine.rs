@@ -80,7 +80,8 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let listener = bind_tcp(addr, app.config().backlog)?;
-    serve_listener(app, listener, shutdown).await
+    let limits = std::sync::Arc::new(AcceptLimits::from(app.config()));
+    serve_listener(app, listener, limits, shutdown).await
 }
 
 /// Bind one address, with the backlog and socket options Churust wants.
@@ -105,6 +106,7 @@ fn bind_tcp(addr: SocketAddr, backlog: u32) -> std::io::Result<tokio::net::TcpLi
 async fn serve_listener<F>(
     app: App,
     listener: tokio::net::TcpListener,
+    limits: std::sync::Arc<AcceptLimits>,
     shutdown: F,
 ) -> std::io::Result<()>
 where
@@ -113,7 +115,6 @@ where
     let conn_cfg = ConnSettings::from(app.config());
     let shutdown_timeout_ms = app.config().shutdown_timeout_ms;
     let drain = Drain::new();
-    let limits = AcceptLimits::from(app.config());
     let mut backoff = AcceptBackoff::default();
     tokio::pin!(shutdown);
 
@@ -314,6 +315,32 @@ const GOAWAY_LINGER: std::time::Duration = std::time::Duration::from_millis(250)
 /// connection is served. `None` when the budget is unlimited.
 type ConnSlot = Option<tokio::sync::OwnedSemaphorePermit>;
 
+/// A connection's share of *both* budgets, in a form that can outlive the
+/// connection future.
+///
+/// hyper resolves an upgraded connection the moment it dispatches the `101`,
+/// while the socket itself lives on in a detached task. Without handing that
+/// task a share, a live WebSocket held no permit and no drain token at all, so
+/// `max_connections` bounded nothing for WebSocket traffic and the drain could
+/// not see them. Cloning is what lets both the connection loop and the upgraded
+/// task hold it; the budget is returned when the last clone drops.
+#[derive(Clone)]
+pub(crate) struct ConnGuard(#[allow(dead_code)] std::sync::Arc<ConnGuardInner>);
+
+pub(crate) struct ConnGuardInner {
+    _slot: ConnSlot,
+    _token: DrainToken,
+}
+
+impl ConnGuard {
+    fn new(slot: ConnSlot, token: DrainToken) -> Self {
+        Self(std::sync::Arc::new(ConnGuardInner {
+            _slot: slot,
+            _token: token,
+        }))
+    }
+}
+
 /// How many connections, and how many TLS handshakes, may be in progress.
 ///
 /// The listen backlog bounds what the kernel queues before the accept loop
@@ -402,6 +429,53 @@ struct ConnActivity {
     origin: tokio::time::Instant,
 }
 
+/// Holds a connection's "a request is in flight" count for as long as it lives.
+///
+/// Dropping it records the activity timestamp and decrements. Being a guard
+/// rather than a pair of calls is the point: the future it lives in can be
+/// cancelled, and a leaked increment silently exempts the connection from every
+/// idle and shutdown bound there is.
+struct InFlight(std::sync::Arc<ConnActivity>);
+
+impl InFlight {
+    fn new(activity: std::sync::Arc<ConnActivity>) -> Self {
+        activity
+            .in_flight
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(activity)
+    }
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.last_ms.store(
+            self.0.origin.elapsed().as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.0
+            .in_flight
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Keep `guard` alive until the body has been fully written.
+fn attach_guard(
+    body: UnsyncBoxBody<Bytes, std::io::Error>,
+    guard: InFlight,
+) -> UnsyncBoxBody<Bytes, std::io::Error> {
+    // The guard is moved into the stream's closure, so it is dropped when the
+    // stream is — whether that is after the last frame or because the client
+    // went away mid-transfer.
+    let mut guard = Some(guard);
+    let stream = BodyDataStream::new(body).map(move |chunk| {
+        if chunk.is_err() {
+            guard.take();
+        }
+        chunk.map(Frame::data)
+    });
+    StreamBody::new(stream).boxed_unsync()
+}
+
 impl ConnActivity {
     fn new() -> Self {
         Self {
@@ -414,20 +488,6 @@ impl ConnActivity {
     /// Whether a request is being served right now.
     fn busy(&self) -> bool {
         self.in_flight.load(std::sync::atomic::Ordering::Relaxed) > 0
-    }
-
-    fn begin(&self) {
-        self.in_flight
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    fn end(&self) {
-        self.last_ms.store(
-            self.origin.elapsed().as_millis() as u64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        self.in_flight
-            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// `None` if the connection has been idle for at least `keep_alive_ms`,
@@ -514,11 +574,18 @@ where
     let (tx, _) = tokio::sync::broadcast::channel::<()>(1);
     let mut tasks = Vec::with_capacity(listeners.len());
 
+    // One budget for the process, not one per listener. Constructing it inside
+    // each accept loop multiplied `max_connections` and `max_tls_handshakes` by
+    // the number of bound addresses — binding v4 and v6 quietly doubled a cap
+    // documented as bounding "what the process serves at once".
+    let limits = std::sync::Arc::new(AcceptLimits::from(app.config()));
+
     for listener in listeners {
         let app = app.clone();
+        let limits = limits.clone();
         let mut rx = tx.subscribe();
         tasks.push(tokio::spawn(async move {
-            serve_listener(app, listener, async move {
+            serve_listener(app, listener, limits, async move {
                 let _ = rx.recv().await;
             })
             .await
@@ -571,7 +638,7 @@ where
     let shutdown_timeout_ms = app.config().shutdown_timeout_ms;
 
     let drain = Drain::new();
-    let limits = AcceptLimits::from(app.config());
+    let limits = std::sync::Arc::new(AcceptLimits::from(app.config()));
     let mut backoff = AcceptBackoff::default();
     let mut shutdown = std::pin::pin!(shutdown);
 
@@ -628,19 +695,36 @@ async fn serve_stream<I>(
     // hyper exposes no per-request hook, but the service *is* the per-request
     // hook: every request on this connection passes through the closure below.
     let activity = std::sync::Arc::new(ConnActivity::new());
+    // Subscribe before the token is moved into the guard: the connection loop
+    // watches the shutdown signal, the guard owns the drain's release side.
+    let mut signal = token.signal.clone();
+    // One share of the budget for this connection, cloned into any upgraded
+    // socket so the permit outlives the HTTP connection future.
+    let guard = ConnGuard::new(slot, token);
 
     let svc = {
         let activity = activity.clone();
+        let guard = guard.clone();
         service_fn(move |req: HyperRequest<Incoming>| {
             let app = app.clone();
             let activity = activity.clone();
+            let conn_guard = guard.clone();
             async move {
                 // Busy, not idle: a handler slower than the keep-alive period
                 // must not have its own connection closed underneath it.
-                activity.begin();
-                let res = handle(app, req, cfg.max_body, cfg.timeout_ms, peer).await;
-                activity.end();
-                res
+                //
+                // An RAII guard rather than paired begin/end calls, because a
+                // request future can be *dropped* mid-await — an HTTP/2 client
+                // sending RST_STREAM makes hyper do exactly that — and a missed
+                // decrement pinned the connection as busy forever, exempt from
+                // the idle watchdog and from the shutdown linger.
+                let in_flight = InFlight::new(activity);
+                let res = handle(app, req, cfg.max_body, cfg.timeout_ms, peer, conn_guard).await;
+                // The guard rides on the response body: the connection is still
+                // working while bytes are being written, and releasing it when
+                // the handler returned meant a large download or an SSE stream
+                // counted as idle and was dropped during shutdown.
+                res.map(|r| r.map(|body| attach_guard(body, in_flight)))
             }
         })
     };
@@ -688,7 +772,6 @@ async fn serve_stream<I>(
         // HTTP/2 connection never carries an HTTP/1 upgrade.
         let conn = builder.serve_connection_with_upgrades(io, svc);
         let mut conn = std::pin::pin!(conn);
-        let mut signal = token.signal.clone();
         let mut winding_down = false;
 
         // The idle deadline. Re-armed on every wake that finds the connection
@@ -765,12 +848,10 @@ async fn serve_stream<I>(
                 }
             }
         }
-        // Both drop here: `token` releases the drain, `slot` returns this
-        // connection's permit to the budget. Holding the slot in this task
-        // rather than in the accept loop is what makes the cap a limit on
-        // connections *being served* rather than on connections accepted.
-        drop(token);
-        drop(slot);
+        // The guard drops here — but only *this* clone. An upgraded WebSocket
+        // holds its own, so the permit and the drain token are returned when
+        // the socket task ends rather than when the 101 was dispatched.
+        drop(guard);
     });
 }
 
@@ -790,6 +871,7 @@ async fn handle(
     max_body: usize,
     timeout_ms: u64,
     peer: std::net::SocketAddr,
+    conn_guard: ConnGuard,
 ) -> Result<HyperResponse<UnsyncBoxBody<Bytes, std::io::Error>>, Infallible> {
     // RFC 9112 §6.3 rule 3: a request carrying both `Transfer-Encoding` and
     // `Content-Length` is framed by the transfer coding, and "ought to be
@@ -864,6 +946,8 @@ async fn handle(
         extensions.insert(crate::call::PeerAddr(peer));
         if let Some(on_upgrade) = on_upgrade {
             extensions.insert(crate::ws::OnUpgradeHandle::new(on_upgrade));
+            // So the upgraded socket keeps this connection's budget share.
+            extensions.insert(conn_guard.clone());
             extensions.insert(crate::ws::WsLimits {
                 max_frame_bytes: ws_max_frame_bytes,
                 max_message_bytes: ws_max_message_bytes,

@@ -148,14 +148,45 @@ Unchanged, and listed so the absence is not mistaken for an oversight.
 
 | | Why |
 | --- | --- |
-| Response compression | Belongs behind a reverse proxy for most deployments. Reconsider on a concrete case. |
-| HTTP/3 | Not shipped in stable by the Rust server frameworks Churust competes with. |
-| HTTP client | Churust owns the server-side ergonomic layer; use `reqwest` or hyper directly. |
 | Actor integration | Not a framework requirement. |
-| Built-in templating | Application choice. |
-| OpenAPI generation | Third-party across the ecosystem. |
-| Rate limiting | Third-party. Now *buildable* here, since §1.2 gave the framework a peer address. |
 | `multipart/byteranges` | RFC-permitted to omit. See §2.4. |
+| WebSockets over HTTP/3 | Extended CONNECT (RFC 9220) is a different handshake from the HTTP/1.1 upgrade the `ws` feature implements. Claiming support would produce a connection that fails at the first frame. |
+
+## 3a. Former non-goals, now built
+
+**Reversed 2026-07-25.** Everything below was listed in §3 as a deliberate
+absence. All of it is implemented, each piece behind its own opt-in feature, so
+a default build is unchanged and nobody pays for what they do not enable.
+
+The reasoning that put these on the list was not wrong, and it is kept here
+rather than quietly deleted: compression really does belong in a proxy when
+there is a proxy, and an OpenAPI schema really cannot be inferred from erased
+handler types. What changed is the answer to "should Churust have it", not the
+analysis of what it costs.
+
+| | Original objection | How it was resolved |
+| --- | --- | --- |
+| Response compression | Belongs behind a reverse proxy for most deployments. | `churust-compression`, opt-in. The objection stands and the crate documentation says so; it is for deployments with no such proxy, or where a streamed response should be compressed before the hop the proxy sits on. |
+| HTTP/3 | Not shipped in stable by the frameworks Churust sits next to. | `http3` feature on `churust-core`: a separate QUIC listener over the same pipeline, plus the `Alt-Svc` advertisement without which clients would never try it. |
+| HTTP client | Churust owns the server-side ergonomic layer. | `churust-client`, built on the hyper already in the tree, so this is one HTTP implementation used twice rather than a second one. |
+| Built-in templating | Application choice. | `churust-templates`, wrapping minijinja rather than inventing a template language. |
+| OpenAPI generation | Third-party across the ecosystem. | `churust-openapi`. Generates only what the router actually knows, and refuses to pretend about schemas. |
+| Rate limiting | Third-party. | `churust-ratelimit`, using the peer address §1.2 added. |
+| Streaming multipart (§5) | The bounded parser is the safe default; an unbounded one is a memory-exhaustion surface. | `MultipartStream`, alongside `Multipart` rather than replacing it. Memory stops scaling with upload size; the `max_body_bytes` ceiling is unchanged, so the unbounded surface never opens. |
+| Redis session store (§5) | Not written. | `churust-redis`. `SessionStore` became async to allow it, and gained the previous cookie value so logout can actually revoke. |
+| Identity layer (§5) | The pieces are there, the layer is not. | `Identities` / `Identity` / `Authenticated`, with absolute and idle deadlines. |
+
+### What this did to the dependency tree
+
+Nothing, for a default build: every addition is feature-gated and
+`default = []` is unchanged. Enabled, they cost what they cost — brotli and
+flate2 for compression, minijinja for templates, quinn and h3 for HTTP/3, redis
+for the session store.
+
+One change does reach every build with TLS on: `rustls` and `tokio-rustls` are
+now pinned to the `ring` provider with default features off. rustls 0.23 defaults
+to aws-lc-rs, quinn's QUIC crypto is ring-backed, and two providers in one binary
+makes rustls refuse to choose a provider at runtime rather than at compile time.
 
 ## 4. Where age is the remaining difference
 
@@ -167,13 +198,17 @@ in trust.
 
 ## 5. What the fixes did not cover
 
-Recorded so they are not mistaken for oversights:
+All three entries that stood here — a buffering-only multipart parser,
+cookie-only sessions, and no identity layer — were closed on 2026-07-25. See
+§3a.
 
-- **`Multipart` still buffers.** Streaming bodies exist now, so a streaming
-  multipart parser is possible. It was not written, because the bounded parser
-  is the safe default and an unbounded one is a memory-exhaustion surface.
-  Uploads remain capped by `max_body_bytes`, which is now a deliberate limit
-  rather than an inherited one.
-- **Sessions are cookie-only.** See §2.2.
-- **No identity layer.** A login/logout convenience layer with visit and login
-  deadlines sits on top of sessions; the pieces are there, the layer is not.
+What remains uncovered is narrower:
+
+- **`Multipart` still buffers**, deliberately. It is the default for form fields
+  and small attachments because it cannot surprise anyone; `MultipartStream` is
+  the answer when an upload is large enough that buffering it is the problem.
+- **`max_body_bytes` still bounds every request**, streamed or not. Streaming
+  changed what an upload costs in memory, not what it is allowed to weigh.
+- **A session cannot be revoked from a client-side store.** `CookieStore` has no
+  record to withdraw; that is what `churust-redis` is for, and both crates say
+  so.

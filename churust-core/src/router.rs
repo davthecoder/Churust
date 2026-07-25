@@ -212,6 +212,13 @@ impl std::fmt::Debug for Node {
 #[derive(Debug, Default)]
 pub struct Router {
     root: Node,
+    /// Every `(method, pattern)` registered, in registration order.
+    ///
+    /// Kept alongside the trie rather than recovered from it: the trie stores
+    /// segments, so rebuilding a pattern would have to guess at how a parameter
+    /// was spelled, and anything reading this wants the spelling the
+    /// application actually wrote.
+    inventory: Vec<(Method, String)>,
 }
 
 impl Router {
@@ -245,6 +252,10 @@ impl Router {
     /// assert!(matches!(router.route(&Method::GET, "/ping", &probe("/ping")), Match::Found { .. }));
     /// ```
     pub fn add(&mut self, method: Method, pattern: &str, handler: BoxHandler) {
+        // Recorded before the trie insert, which may panic on a duplicate or a
+        // misplaced wildcard. A router that panicked is not going to be read.
+        self.inventory.push((method.clone(), pattern.to_string()));
+
         let mut node = &mut self.root;
         let segments: Vec<&str> = split_segments(pattern);
         for (i, seg) in segments.iter().enumerate() {
@@ -505,6 +516,26 @@ impl Router {
         let mut out = Vec::new();
         Self::collect_methods(&self.root, &mut out);
         out
+    }
+
+    /// Every registered route as `(method, pattern)`, in registration order.
+    ///
+    /// The patterns are exactly what was registered, `{id}` and `{path...}`
+    /// included, which is what makes this usable as the inventory an API
+    /// description is generated from. Routes that share a `(method, path)`
+    /// behind different guards appear once per registration, because each is a
+    /// separate route even though a client sees one URL.
+    ///
+    /// ```
+    /// use churust_core::{boxed, Call, IntoHandler, Router};
+    /// use http::Method;
+    ///
+    /// let mut router = Router::new();
+    /// router.add(Method::GET, "/users/{id}", boxed((|_c: Call| async { "" }).into_handler()));
+    /// assert_eq!(router.routes(), &[(Method::GET, "/users/{id}".to_string())]);
+    /// ```
+    pub fn routes(&self) -> &[(Method, String)] {
+        &self.inventory
     }
 
     fn collect_methods(node: &Node, out: &mut Vec<Method>) {
@@ -927,6 +958,12 @@ impl<'r> RouteBuilder<'r> {
             last: None,
         };
         f(&mut child);
+        // Forget which route was registered *before* the scope. `guard()` and
+        // `max_body_bytes()` resolve against `last`, so leaving it set meant a
+        // `.guard(...)` chained after `route(...)` silently attached to the
+        // previous sibling — arming the wrong route and leaving the scoped one
+        // open. With `last` cleared, that chain panics at build instead.
+        self.last = None;
         self
     }
 }

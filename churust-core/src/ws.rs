@@ -193,6 +193,9 @@ pub struct WebSocketUpgrade {
     accept_key: HeaderValue,
     protocol: Option<HeaderValue>,
     limits: WsLimits,
+    /// This connection's share of the accept budget, moved into the socket
+    /// task so the permit is held for as long as the WebSocket is open.
+    conn_guard: Option<crate::engine::ConnGuard>,
 }
 
 #[async_trait]
@@ -239,11 +242,19 @@ impl FromCallParts for WebSocketUpgrade {
             max_message_bytes: 4 << 20,
         });
 
+        // The connection's share of `max_connections` and of the drain. hyper
+        // resolves an upgraded connection as soon as it dispatches the `101`,
+        // so without carrying this into the socket task a live WebSocket held
+        // no permit at all and the cap bounded nothing for WebSocket traffic.
+        // Absent when a call was built without the engine (unit tests).
+        let conn_guard = call.get::<crate::engine::ConnGuard>();
+
         Ok(WebSocketUpgrade {
             on_upgrade,
             limits,
             accept_key,
             protocol,
+            conn_guard,
         })
     }
 }
@@ -262,9 +273,13 @@ impl WebSocketUpgrade {
             accept_key,
             protocol,
             limits,
+            conn_guard,
         } = self;
 
         tokio::spawn(async move {
+            // Held for the socket's lifetime, so the budget is returned when
+            // the WebSocket ends rather than when the handshake finished.
+            let _conn_guard = conn_guard;
             if let Ok(upgraded) = on_upgrade.await {
                 // Bound both a single frame and a reassembled message: a peer
                 // respecting the frame cap can still stream unbounded

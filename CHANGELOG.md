@@ -12,6 +12,16 @@ released together, so every entry below applies to the whole set.
 
 ### Changed — breaking
 
+- **`SessionStore` is an async trait, and `store` takes the previous cookie
+  value.** Both operations may now await, because a store backed by server state
+  has to talk to it and a synchronous trait method cannot. `store` also receives
+  the cookie the request arrived with, which is what lets a server-side store
+  delete the record it is replacing: without it, logging out left the old record
+  readable until its own TTL elapsed, which is precisely the revocation such a
+  store exists to provide. `CookieStore` ignores the new argument, since it keeps
+  no server-side record. Implementors add `#[async_trait]`, mark both methods
+  `async`, and take `previous: Option<&str>` on `store`.
+
 - **`//a` and `/a//b` no longer serve `/a/b`.** Interior empty segments were
   collapsed silently, so one resource had several URLs. Two things follow from
   that: any middleware, guard or proxy rule keyed on a literal prefix
@@ -151,6 +161,94 @@ released together, so every entry below applies to the whole set.
   GOAWAY and is then dropped. Connections with work in flight are unaffected.
 
 ### Added
+
+- **HTTP/3 over QUIC** (`http3` feature, implies `tls`). `churust_core::http3`
+  binds its own UDP socket and runs h3 requests through the same pipeline every
+  other transport uses, so a handler cannot tell which one answered it: routing,
+  extractors, plugins, streamed response bodies and the server-wide body cap all
+  behave identically. `Http3Server::bind` separates binding from serving so the
+  port can be read back before anything is accepted, and
+  `AppBuilder::advertise_http3` emits the `Alt-Svc` header without which almost
+  no client would ever try QUIC at all. WebSockets are deliberately not carried:
+  h3 upgrades through Extended CONNECT (RFC 9220), a different handshake from the
+  HTTP/1.1 one the `ws` feature implements.
+
+- **`churust-compression`: response compression** (brotli, gzip, and `deflate`
+  as the zlib format RFC 9110 §8.4.1.2 actually names, which is not what a raw
+  deflate encoder emits). Negotiated from `Accept-Encoding` with client `q`
+  values deciding and the server's order breaking ties. A streamed body stays
+  streamed through the encoder rather than being collected to compress it.
+  `Vary: Accept-Encoding` goes on every response the plugin sees, not only the
+  compressed ones, because a cache that stored one variant without it would
+  serve brotli to a client that never asked. `206`, `Content-Range`,
+  already-encoded and body-less responses are skipped, and a strong `ETag` is
+  weakened, since a compressed body is equivalent to the original rather than
+  identical to it.
+
+- **`churust-ratelimit`: rate limiting.** GCRA rather than a fixed window, so
+  requests are smoothed instead of admitted in a stampede at the top of each
+  window, and `Retry-After` falls out of the arithmetic as an exact figure. Keyed
+  on the peer IP by default, on anything else through `RateLimit::by`, which can
+  also return `None` to exempt a request. Usable as a plugin or as scoped
+  middleware. The key table is bounded and pruned.
+
+- **`churust-templates`: server-rendered HTML** on minijinja, with auto-escaping
+  driven by the template's extension. `Templates::from_dir` reads and parses
+  every template at startup, so a syntax error is a boot failure naming the file
+  rather than a `500` on the one route nobody visits until Friday. A render
+  failure tells the client only that rendering failed; the template name, line
+  and offending variable go to the error's source, not the response body.
+
+- **`churust-redis`: server-side sessions.** The cookie carries an opaque
+  identifier, 256 bits from the OS CSPRNG, and the contents live in Redis, which
+  buys the one thing `CookieStore` cannot offer: logging out deletes the record,
+  so a cookie copied beforehand stops working. Sliding or absolute expiry,
+  key prefixing, and identifiers validated for shape before they are ever
+  interpolated into a key.
+
+- **`churust-client`: an HTTP client**, on the same hyper the server runs on, so
+  a Churust binary carries one HTTP implementation rather than two. Pooled
+  connections, an enforced timeout covering the whole request including
+  redirects, a bounded response body, JSON and form helpers, and a redirect
+  follower that re-checks the scheme at every hop so a redirect cannot walk an
+  `https` request down to `http`. HTTPS behind the `tls` feature.
+
+- **`churust-openapi`: OpenAPI 3.1 descriptions.** Paths, methods and path
+  parameters come from the router, so they cannot drift from the application;
+  prose, schemas and responses are written explicitly, because handler extractor
+  types are erased by the time a router exists and anything claiming to infer
+  them would be inferring them from an annotation you wrote anyway. `undescribed`
+  and `stale` report drift in both directions so a test can fail the build when
+  the document and the router disagree.
+
+- **Streaming `multipart/form-data`.** `MultipartStream` yields fields one at a
+  time and each field's content in chunks, so memory stops scaling with upload
+  size: the buffered parser holds the whole body, this one holds a chunk. The
+  ceiling itself is unchanged — `max_body_bytes` still bounds the request — but
+  raising it for an upload route is now affordable. `Multipart` is unchanged and
+  remains the right answer for form fields and small attachments.
+
+- **A login and logout layer over sessions** (`Identities`, `Identity`,
+  `Authenticated`). Two deadlines, because they answer different questions: an
+  absolute `login_deadline` bounds a session stolen and then used continuously,
+  which an idle timeout never expires, and an idle `visit_deadline` protects an
+  unattended machine. The last-seen timestamp is refreshed at most once per tenth
+  of the deadline rather than on every request, so the session plugin's
+  "only re-issue when something changed" rule survives. `Identity::login` rotates
+  the session identifier while keeping the rest of the session, so a pre-login
+  cart survives a privilege change but a planted session id does not.
+
+- **`Session::rotate` and `SESSION_ID_KEY`**, the mechanism the above rests on: a
+  server-side store records its record id under a reserved key, and rotating
+  removes it so the next write mints a new one.
+
+- **`Router::routes` and `AppBuilder::routes`**, the registered `(method,
+  pattern)` inventory, kept alongside the trie rather than reconstructed from it
+  so the patterns are spelled exactly as the application wrote them.
+
+- **`AppBuilder::insert_state`**, the `&mut self` counterpart to `state`, so a
+  plugin can publish something for its own extractor to find. `install` hands a
+  plugin `&mut AppBuilder` and the chainable setter was unreachable from there.
 
 - **`tower` feature: run a `tower::Service` as Churust middleware.** The
   ecosystem's `Layer`s — compression, tracing, request ids, header manipulation,

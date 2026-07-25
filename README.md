@@ -66,11 +66,18 @@ churust = { version = "0.2", features = ["full", "ws", "fs", "tls"] }
 | `logging` | `churust-logging` | `CallLogging` via `tracing` |
 | `cors` | `churust-cors` | preflight + CORS headers |
 | `auth` | `churust-auth` | Bearer/Basic/JWT, `Principal<P>` |
-| `full` | all four above | the whole plugin set |
+| `ratelimit` | `churust-ratelimit` | `RateLimit`, GCRA, keyed on the peer address |
+| `compression` | `churust-compression` | brotli / gzip / deflate response bodies |
+| `templates` | `churust-templates` | `Templates` + `Renderer`, minijinja, escaping by extension |
+| `full` | the seven above | the whole plugin set |
+| `redis` | `churust-redis` | `RedisStore`: server-side sessions, revocable |
+| `client` | `churust-client` | an outbound HTTP client (`client-tls` for HTTPS) |
+| `openapi` | `churust-openapi` | an OpenAPI 3.1 document from the router |
 | `ws` | `churust-core/ws` | WebSocket upgrade + `WebSocket`/`Message` |
 | `fs` | `churust-core/fs` | `StaticFiles`, conditional GET, byte ranges |
-| `multipart` | `churust-core/multipart` | `multipart/form-data` uploads |
+| `multipart` | `churust-core/multipart` | `multipart/form-data`, buffered or streamed |
 | `tls` | `churust-core/tls` | rustls-backed HTTPS |
+| `http3` | `churust-core/http3` | HTTP/3 over QUIC (implies `tls`) |
 
 Default features are empty, so a plain `churust = "0.2"` compiles the core
 engine and nothing else.
@@ -106,15 +113,33 @@ Every Churust crate is released in lockstep on one version number, so
   handshake cap and deadline, HTTP/2 stream and header limits, a bounded
   shutdown grace period that actually drains, several bind addresses, and Unix
   domain sockets.
-- **File uploads** — `Multipart` behind the `multipart` feature.
+- **File uploads** — `Multipart` buffers the whole body; `MultipartStream` reads
+  fields and their content incrementally, so memory stops scaling with upload
+  size. Both behind the `multipart` feature.
 - **Typed app state / DI** — `.state(T)` then extract `State<T>`.
 - **Layered config** — defaults < `churust.toml` < env (`CHURUST_*`) < code DSL.
 - **Secure by default** — security headers on every response, body-size limits,
   request and header-read timeouts (slow-loris), header and path-depth caps,
   WebSocket frame and message caps, panic isolation (a panicking handler
   returns 500, never crashes the server), no version banner, opt-in rustls TLS.
-- **HTTP/1.1 and HTTP/2** — h2 over TLS via ALPN, h2c by prior knowledge in
-  plaintext, negotiated per connection.
+- **HTTP/1.1, HTTP/2 and HTTP/3** — h2 over TLS via ALPN, h2c by prior knowledge
+  in plaintext, negotiated per connection; h3 over QUIC on its own listener
+  behind the `http3` feature, with `advertise_http3` emitting the `Alt-Svc`
+  header clients need in order to try it.
+- **Response compression** — brotli, gzip and deflate, negotiated from
+  `Accept-Encoding`, streaming bodies included (feature `compression`).
+- **Rate limiting** — GCRA, so bursts are smoothed and `Retry-After` is exact
+  rather than estimated (feature `ratelimit`).
+- **Templating** — minijinja, parsed at startup, auto-escaped by file extension
+  (feature `templates`).
+- **Server-side sessions** — Redis-backed, so logging out actually revokes
+  (feature `redis`).
+- **An HTTP client** — pooled, bounded, on the same hyper the server runs on
+  (feature `client`).
+- **OpenAPI 3.1** — paths and parameters from the router, prose and schemas from
+  you, with drift reported in both directions (feature `openapi`).
+- **Login and logout** — an identity layer over sessions with both an absolute
+  and an idle deadline.
 - **Correct HTTP** — automatic `HEAD` and `OPTIONS` (including `OPTIONS *`),
   one `Allow` header that both `405` and `OPTIONS` agree on, conditional GET
   (`ETag`/`Last-Modified`/`304`) and byte ranges (`206`/`416`) for static files.
@@ -147,6 +172,12 @@ Every Churust crate is released in lockstep on one version number, so
 | `churust-logging` | [docs.rs](https://docs.rs/churust-logging) | `CallLogging` plugin via `tracing` (feature `logging`). |
 | `churust-cors` | [docs.rs](https://docs.rs/churust-cors) | `Cors` plugin — preflight + headers (feature `cors`). |
 | `churust-auth` | [docs.rs](https://docs.rs/churust-auth) | `Auth` (Bearer/Basic/JWT) + `Principal<P>` (feature `auth`). |
+| `churust-ratelimit` | [docs.rs](https://docs.rs/churust-ratelimit) | `RateLimit` plugin, GCRA (feature `ratelimit`). |
+| `churust-compression` | [docs.rs](https://docs.rs/churust-compression) | `Compression` plugin — brotli/gzip/deflate (feature `compression`). |
+| `churust-templates` | [docs.rs](https://docs.rs/churust-templates) | `Templates` + `Renderer` over minijinja (feature `templates`). |
+| `churust-redis` | [docs.rs](https://docs.rs/churust-redis) | `RedisStore`, a revocable server-side `SessionStore` (feature `redis`). |
+| `churust-client` | [docs.rs](https://docs.rs/churust-client) | Outbound HTTP client (feature `client`, HTTPS via `client-tls`). |
+| `churust-openapi` | [docs.rs](https://docs.rs/churust-openapi) | OpenAPI 3.1 document generation (feature `openapi`). |
 | `churust-lab` | [docs.rs](https://docs.rs/churust-lab) | Incubator. **Never reaches 1.0**; expect breaking changes on most releases. |
 
 Runnable examples:
@@ -357,11 +388,23 @@ Everything documented above works today:
 - **Streaming bodies** — the always-on `Body` type
 - **Static files** — `StaticFiles`, opt-in `fs` feature
 
-**Not yet supported.** Response compression and HTTP/3, both deliberate. A
-Redis-backed session store, and a login/logout convenience layer over sessions.
-Multipart parsing runs over the buffered body rather than streaming, so a
-multipart upload is bounded by `max_body_bytes` — a plain body is not, via
-`Payload`.
+Also working, each behind its own feature: response compression, rate limiting,
+templating, HTTP/3 over QUIC, Redis-backed sessions, a login/logout layer, an
+outbound HTTP client, OpenAPI generation, and a streaming multipart parser.
+Several of those were listed as deliberate non-goals until 2026-07-25; the
+[production-readiness audit](https://github.com/davthecoder/Churust/blob/main/docs/design/2026-07-25-production-readiness-audit.md)
+records what the original objection was and what the implementation does about
+it, because "we changed our mind" is more useful to a reader than a silently
+edited list.
+
+**Still not supported, on purpose.** Actor integration.
+`multipart/byteranges` for multi-range requests, which RFC 9110 permits omitting.
+WebSockets over HTTP/3, which upgrade through Extended CONNECT (RFC 9220) rather
+than the HTTP/1.1 handshake the `ws` feature implements. Revocation from a
+client-side session store, which has no server-side record to withdraw — that is
+what `churust-redis` is for. And `max_body_bytes` still bounds every request:
+streaming changed what an upload costs in memory, not what it is allowed to
+weigh.
 
 Those are tracked and ordered in
 [`docs/design/2026-07-25-roadmap-to-parity.md`](https://github.com/davthecoder/Churust/blob/main/docs/design/2026-07-25-roadmap-to-parity.md),

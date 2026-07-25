@@ -82,6 +82,27 @@ impl Session {
         }
     }
 
+    /// Keep the contents but ask the store for a new identifier.
+    ///
+    /// This is the session fixation defence for a **server-side** store: an
+    /// attacker who plants a known session id must not still hold a valid one
+    /// after the victim's privileges change. Call it on login, and on any other
+    /// privilege change, when you want to keep what is already in the session
+    /// (a cart, a locale) rather than dropping it the way [`clear`](Self::clear)
+    /// does.
+    ///
+    /// It works by removing [`SESSION_ID_KEY`], which a server-side store uses
+    /// to remember which record this session is, so the next write mints a new
+    /// one. [`CookieStore`] keeps no identifier and is unaffected: its payload
+    /// is re-signed on every change already, so a planted cookie never carries
+    /// the post-login contents.
+    pub fn rotate(&self) {
+        if let Ok(mut g) = self.0.lock() {
+            g.data.remove(SESSION_ID_KEY);
+            g.dirty = true;
+        }
+    }
+
     fn changed(&self) -> bool {
         self.0.lock().map(|g| g.dirty).unwrap_or(false)
     }
@@ -104,12 +125,52 @@ impl FromCallParts for Session {
     }
 }
 
+/// The reserved key under which a server-side [`SessionStore`] records which
+/// row, document or Redis key this session is.
+///
+/// Stores that keep everything client-side, [`CookieStore`] among them, have no
+/// identifier and ignore it. It is named in the public API only so that
+/// [`Session::rotate`] has something well-defined to remove, and so a store
+/// implementor knows which key is spoken for.
+pub const SESSION_ID_KEY: &str = "__churust_sid";
+
 /// Where session contents live between requests.
+///
+/// Both operations are `async` because a store backed by server state has to
+/// talk to it. A client-side store such as [`CookieStore`] never awaits
+/// anything and simply returns.
+#[async_trait]
 pub trait SessionStore: Send + Sync + 'static {
     /// Recover a session from the cookie value, if it is intact.
-    fn load(&self, raw: &str) -> Option<BTreeMap<String, String>>;
-    /// Render the session into a cookie value.
-    fn store(&self, data: &BTreeMap<String, String>) -> Option<String>;
+    async fn load(&self, raw: &str) -> Option<BTreeMap<String, String>>;
+
+    /// Persist the session and return the new cookie value, or `None` to leave
+    /// the visitor's cookie untouched.
+    ///
+    /// `previous` is the cookie value this request arrived with, if any. A
+    /// server-side store needs it to delete the record it is replacing: without
+    /// it, logging out would leave the old record readable until its own TTV
+    /// elapsed, which is exactly the revocation a server-side store exists to
+    /// provide. A client-side store ignores it.
+    async fn store(
+        &self,
+        data: &BTreeMap<String, String>,
+        previous: Option<&str>,
+    ) -> Option<String>;
+
+    /// Adopt the session lifetime configured on [`Sessions::max_age`].
+    ///
+    /// Returning a new boxed store opts in; the default returns `None`, which
+    /// means "I manage my own expiry" — the right answer for a store backed by
+    /// server state, which can simply delete the record.
+    ///
+    /// This exists because `Max-Age` on a cookie is only a hint to a
+    /// well-behaved client. A store that keeps its state client-side has to
+    /// enforce the deadline itself, and it can only do that if it is told what
+    /// the deadline is.
+    fn with_session_max_age(&self, _secs: i64) -> Option<Box<dyn SessionStore>> {
+        None
+    }
 }
 
 /// Keeps the whole session in the cookie, signed with HMAC-SHA256 so a client
@@ -185,8 +246,20 @@ impl CookieStore {
     }
 }
 
+#[async_trait]
 impl SessionStore for CookieStore {
-    fn load(&self, raw: &str) -> Option<BTreeMap<String, String>> {
+    fn with_session_max_age(&self, secs: i64) -> Option<Box<dyn SessionStore>> {
+        // Keyed off the store, not off how `Sessions` happened to be built:
+        // wiring this through a key that only `Sessions::cookie` records meant
+        // `Sessions::with_store(CookieStore::new(k)).max_age(n)` signed no
+        // deadline at all, so a captured cookie replayed until the key rotated.
+        Some(Box::new(CookieStore {
+            key: self.key.clone(),
+            max_age: Some(secs),
+        }))
+    }
+
+    async fn load(&self, raw: &str) -> Option<BTreeMap<String, String>> {
         let (sig, payload) = raw.split_once('.')?;
         // Constant-time so a forged signature cannot be refined byte by byte.
         if !crate::secure_compare(sig, self.sign(payload)) {
@@ -213,7 +286,13 @@ impl SessionStore for CookieStore {
         Some(out)
     }
 
-    fn store(&self, data: &BTreeMap<String, String>) -> Option<String> {
+    /// `previous` is unused: the whole session lives in the cookie, so there is
+    /// no server-side record to withdraw.
+    async fn store(
+        &self,
+        data: &BTreeMap<String, String>,
+        _previous: Option<&str>,
+    ) -> Option<String> {
         let mut pairs: Vec<String> = data
             .iter()
             // Never let an application key masquerade as the deadline.
@@ -242,19 +321,12 @@ pub struct Sessions {
     cookie_name: String,
     secure: bool,
     max_age: Option<i64>,
-    /// Kept so [`max_age`](Sessions::max_age) can rebuild the cookie store with
-    /// the deadline signed in. `None` for a custom store, which owns its own
-    /// expiry policy.
-    cookie_key: Option<Vec<u8>>,
 }
 
 impl Sessions {
     /// Sessions kept entirely in a signed cookie.
     pub fn cookie(key: impl Into<Vec<u8>>) -> Self {
-        let key = key.into();
-        let mut s = Self::with_store(CookieStore::new(key.clone()));
-        s.cookie_key = Some(key);
-        s
+        Self::with_store(CookieStore::new(key))
     }
 
     /// Sessions kept wherever `store` puts them.
@@ -264,7 +336,6 @@ impl Sessions {
             cookie_name: "churust_session".into(),
             secure: false,
             max_age: None,
-            cookie_key: None,
         }
     }
 
@@ -290,8 +361,10 @@ impl Sessions {
     /// A custom [`SessionStore`] owns its own expiry policy and is untouched.
     pub fn max_age(mut self, secs: i64) -> Self {
         self.max_age = Some(secs);
-        if let Some(key) = &self.cookie_key {
-            self.store = Arc::new(CookieStore::new(key.clone()).with_max_age(secs));
+        // Ask the store to adopt the deadline. A client-side store must sign it
+        // in to enforce it; a server-side store declines and manages its own.
+        if let Some(updated) = self.store.with_session_max_age(secs) {
+            self.store = Arc::from(updated);
         }
         self
     }
@@ -318,10 +391,11 @@ struct SessionMiddleware {
 #[async_trait]
 impl Middleware for SessionMiddleware {
     async fn handle(&self, mut call: Call, next: Next) -> Response {
-        let loaded = call
-            .cookie(&self.cookie_name)
-            .and_then(|raw| self.store.load(&raw))
-            .unwrap_or_default();
+        let arrived_with = call.cookie(&self.cookie_name);
+        let loaded = match arrived_with.as_deref() {
+            Some(raw) => self.store.load(raw).await.unwrap_or_default(),
+            None => BTreeMap::new(),
+        };
 
         let session = Session::from_map(loaded);
         call.insert(session.clone());
@@ -332,7 +406,11 @@ impl Middleware for SessionMiddleware {
         // on every response is noise, and it would extend the expiry of a
         // session the visitor is not actually using.
         if session.changed() {
-            if let Some(value) = self.store.store(&session.snapshot()) {
+            if let Some(value) = self
+                .store
+                .store(&session.snapshot(), arrived_with.as_deref())
+                .await
+            {
                 let mut c = Cookie::new(self.cookie_name.clone(), value).secure(self.secure);
                 if let Some(age) = self.max_age {
                     c = c.max_age(age);

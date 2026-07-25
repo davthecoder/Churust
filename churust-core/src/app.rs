@@ -387,8 +387,48 @@ impl AppBuilder {
     /// # });
     /// ```
     pub fn state<T: Send + Sync + 'static>(mut self, value: T) -> Self {
-        self.state.insert(value);
+        self.insert_state(value);
         self
+    }
+
+    /// Advertise HTTP/3 on `port` to clients arriving over TCP.
+    ///
+    /// Adds `Alt-Svc: h3=":<port>"; ma=86400` to every response, which is how a
+    /// browser learns that h3 exists at all: it reaches a new origin over TCP,
+    /// reads this header, and uses QUIC for subsequent requests. Serving h3
+    /// without advertising it means almost nothing will ever use it.
+    ///
+    /// Available with or without the `http3` feature, because the process that
+    /// terminates h3 is often a proxy in front rather than this server. Setting
+    /// it when nothing is listening on that UDP port costs a client one failed
+    /// QUIC attempt before it falls back, so only set it when something is.
+    ///
+    /// ```
+    /// use churust_core::{Call, Churust, TestClient};
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// let app = Churust::server()
+    ///     .advertise_http3(8443)
+    ///     .routing(|r| { r.get("/", |_c: Call| async { "ok" }); })
+    ///     .build();
+    /// let res = TestClient::new(app).get("/").send().await;
+    /// assert_eq!(res.header("alt-svc"), Some("h3=\":8443\"; ma=86400"));
+    /// # });
+    /// ```
+    pub fn advertise_http3(mut self, port: u16) -> Self {
+        self.add_middleware_in(Phase::Setup, Arc::new(AltSvc(port)));
+        self
+    }
+
+    /// Register application state through a mutable borrow.
+    ///
+    /// The counterpart to [`state`](Self::state) for callers that hold
+    /// `&mut AppBuilder` rather than owning it, which is every [`Plugin`]: a
+    /// plugin that wants to publish something for its own extractor to find has
+    /// no other way to reach the state map. Same pairing as
+    /// [`add_middleware`](Self::add_middleware) and
+    /// [`install_middleware`](Self::install_middleware).
+    pub fn insert_state<T: Send + Sync + 'static>(&mut self, value: T) {
+        self.state.insert(value);
     }
 
     /// Install a [`Plugin`], letting it register middleware/state. Consumes the
@@ -431,6 +471,25 @@ impl AppBuilder {
         let mut b = RouteBuilder::new(&mut self.router);
         f(&mut b);
         self
+    }
+
+    /// Every route registered so far, as `(method, pattern)`.
+    ///
+    /// Called between two [`routing`](Self::routing) blocks, this is the
+    /// inventory an API description is generated from: describe what is already
+    /// registered, then register the route that serves the description.
+    ///
+    /// ```
+    /// use churust_core::{Call, Churust};
+    /// use http::Method;
+    ///
+    /// let builder = Churust::server().routing(|r| {
+    ///     r.get("/users/{id}", |_c: Call| async { "" });
+    /// });
+    /// assert_eq!(builder.routes(), &[(Method::GET, "/users/{id}".to_string())]);
+    /// ```
+    pub fn routes(&self) -> &[(Method, String)] {
+        self.router.routes()
     }
 
     /// Build the app and serve it until Ctrl-C — a shorthand for
@@ -913,6 +972,28 @@ impl App {
     }
 }
 
+/// Adds the `Alt-Svc` header that points TCP clients at HTTP/3.
+///
+/// In [`Phase::Setup`], the outermost phase, so it is present on error
+/// responses too. A client that only ever gets a `404` from an origin should
+/// still learn that the origin speaks h3.
+struct AltSvc(u16);
+
+#[async_trait::async_trait]
+impl Middleware for AltSvc {
+    async fn handle(&self, call: Call, next: Next) -> Response {
+        let mut res = next.run(call).await;
+        // `ma` is how long the client may remember this, in seconds. A day is
+        // the common choice: long enough to matter, short enough that turning
+        // h3 off does not strand clients for a week.
+        if let Ok(value) = http::HeaderValue::from_str(&format!("h3=\":{}\"; ma=86400", self.0)) {
+            res.headers
+                .insert(http::header::HeaderName::from_static("alt-svc"), value);
+        }
+        res
+    }
+}
+
 /// Runs the application's [`on_error`](AppBuilder::on_error) renderer over any
 /// error response.
 struct ErrorPages {
@@ -935,8 +1016,25 @@ impl Middleware for ErrorPages {
                 // them, so installing `on_error` silently made those responses
                 // non-conforming. The renderer still wins wherever it sets a
                 // header itself.
-                for (name, value) in res.headers.iter() {
-                    if !replacement.headers.contains_key(name) {
+                for name in res.headers.keys() {
+                    if replacement.headers.contains_key(name) {
+                        continue;
+                    }
+                    // Never carry a header that describes the body that was
+                    // just replaced. `Content-Length` in particular is framed
+                    // on by hyper, so grafting the original's length onto a
+                    // different body truncates or hangs the response; with the
+                    // header absent hyper measures the real body.
+                    if name == http::header::CONTENT_LENGTH
+                        || name == http::header::CONTENT_TYPE
+                        || name == http::header::CONTENT_ENCODING
+                    {
+                        continue;
+                    }
+                    // Every value, not just the first: `HeaderMap::iter` yields
+                    // one item per value, so a `contains_key` guard inside that
+                    // loop kept only the first `Set-Cookie` of several.
+                    for value in res.headers.get_all(name) {
                         replacement.headers.append(name.clone(), value.clone());
                     }
                 }

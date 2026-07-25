@@ -185,69 +185,69 @@ mod expiry {
         m
     }
 
-    #[test]
-    fn a_cookie_past_its_signed_deadline_is_refused() {
+    #[tokio::test]
+    async fn a_cookie_past_its_signed_deadline_is_refused() {
         // `Max-Age` on `Set-Cookie` is a hint to a well-behaved client; a copied
         // cookie ignores it. Without a deadline inside the signature, a captured
         // session stayed valid for as long as the signing key did.
         let issuer = CookieStore::new(b"k".to_vec()).with_max_age(-1);
-        let raw = issuer.store(&data()).unwrap();
+        let raw = issuer.store(&data(), None).await.unwrap();
         let reader = CookieStore::new(b"k".to_vec()).with_max_age(3600);
         assert!(
-            reader.load(&raw).is_none(),
+            reader.load(&raw).await.is_none(),
             "an expired session cookie was accepted"
         );
     }
 
-    #[test]
-    fn a_cookie_inside_its_deadline_still_loads() {
+    #[tokio::test]
+    async fn a_cookie_inside_its_deadline_still_loads() {
         let store = CookieStore::new(b"k".to_vec()).with_max_age(3600);
-        let raw = store.store(&data()).unwrap();
-        let back = store.load(&raw).expect("a live session must load");
+        let raw = store.store(&data(), None).await.unwrap();
+        let back = store.load(&raw).await.expect("a live session must load");
         assert_eq!(back.get("user").map(String::as_str), Some("ana"));
     }
 
-    #[test]
-    fn the_deadline_is_not_visible_as_session_data() {
+    #[tokio::test]
+    async fn the_deadline_is_not_visible_as_session_data() {
         // The reserved key is an implementation detail, not something a handler
         // should see in its session map.
         let store = CookieStore::new(b"k".to_vec()).with_max_age(3600);
-        let raw = store.store(&data()).unwrap();
-        let back = store.load(&raw).unwrap();
+        let raw = store.store(&data(), None).await.unwrap();
+        let back = store.load(&raw).await.unwrap();
         assert_eq!(back.len(), 1, "{back:?}");
         assert!(back.keys().all(|k| !k.starts_with("__churust")), "{back:?}");
     }
 
-    #[test]
-    fn an_application_cannot_forge_the_deadline_key() {
+    #[tokio::test]
+    async fn an_application_cannot_forge_the_deadline_key() {
         // Writing the reserved key from application code must not become the
         // signed deadline.
         let store = CookieStore::new(b"k".to_vec()).with_max_age(3600);
         let mut m = data();
         m.insert("__churust_exp".into(), "99999999999".into());
-        let raw = store.store(&m).unwrap();
-        let back = store.load(&raw).unwrap();
+        let raw = store.store(&m, None).await.unwrap();
+        let back = store.load(&raw).await.unwrap();
         assert_eq!(back.len(), 1, "the forged key survived: {back:?}");
     }
 
-    #[test]
-    fn without_a_max_age_a_cookie_does_not_expire() {
+    #[tokio::test]
+    async fn without_a_max_age_a_cookie_does_not_expire() {
         // Unchanged behaviour when no deadline was asked for.
         let store = CookieStore::new(b"k".to_vec());
-        let raw = store.store(&data()).unwrap();
-        assert!(store.load(&raw).is_some());
+        let raw = store.store(&data(), None).await.unwrap();
+        assert!(store.load(&raw).await.is_some());
     }
 
-    #[test]
-    fn the_deadline_is_covered_by_the_signature() {
+    #[tokio::test]
+    async fn the_deadline_is_covered_by_the_signature() {
         // Editing the expiry must invalidate the cookie rather than extend it.
         let store = CookieStore::new(b"k".to_vec()).with_max_age(-1);
-        let raw = store.store(&data()).unwrap();
+        let raw = store.store(&data(), None).await.unwrap();
         let (sig, payload) = raw.split_once('.').unwrap();
         let tampered = format!(
             "{sig}.{}",
             payload.replace("__churust_exp=", "__churust_exp=9")
         );
-        assert!(store.load(&tampered).is_none());
+        assert!(store.load(&tampered).await.is_none());
     }
 }
