@@ -283,8 +283,9 @@ examples, and a docs build.
 
 ## Status
 
-Published at **0.1.0**. Pre-1.0, so the API is settling rather than settled —
-expect breaking changes in minor releases until 1.0.
+Published on crates.io — the badge above carries the current version. Pre-1.0,
+so the API is settling rather than settled: expect breaking changes in minor
+releases until 1.0.
 
 Everything documented above works today:
 

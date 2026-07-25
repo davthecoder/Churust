@@ -48,11 +48,13 @@ The four `examples/*` crates are `publish = false` and are skipped.
 
 ## One-time setup
 
-### Trusted Publishing
+### Trusted Publishing — still outstanding
 
 CI authenticates by OIDC, so no registry token is stored in GitHub. crates.io
-can only be configured this way for a crate that **already exists**, so this is
-done after the first publish, once per crate — all seven.
+only allows this to be configured on a crate that **already exists**, which is
+why it could not cover the first publish. All seven crates exist now, so this
+can and should be done — **until it is, the workflow cannot publish** and
+releases have to go up from a logged-in machine.
 
 For each of `churust`, `churust-core`, `churust-macros`, `churust-json`,
 `churust-logging`, `churust-cors`, `churust-auth`:
@@ -62,15 +64,19 @@ For each of `churust`, `churust-core`, `churust-macros`, `churust-json`,
 3. Workflow filename: `release.yml`
 4. Environment: leave empty
 
-### The first publish
+### Publishing from a machine
 
-Trusted Publishing cannot bootstrap itself, so version `0.1.0` goes up from a
-logged-in machine:
+The fallback while Trusted Publishing is unconfigured, and how `0.1.0` and
+`0.1.1` went up:
 
 ```sh
 cargo login          # paste a crates.io API token
 cargo publish --workspace
 ```
+
+Then push the tag so CI creates the GitHub Release. The workflow checks the
+registry first, finds every crate already published, skips the upload, and goes
+straight to the release — no credentials needed on that path.
 
 ## crates.io rate limits
 

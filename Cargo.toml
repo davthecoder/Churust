@@ -5,7 +5,7 @@ members = ["churust-core", "churust-macros", "churust", "examples/hello", "churu
 [workspace.package]
 # Every Churust crate releases in lockstep on this single version.
 # Bump via `cargo release <level>` — never edit the crate manifests by hand.
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.96"
 license = "MIT"
@@ -19,13 +19,13 @@ readme = "README.md"
 [workspace.dependencies]
 # Internal crates. `version` is what gets published; `path` is what builds
 # locally. cargo-release rewrites these in step with workspace.package.version.
-churust = { path = "churust", version = "0.1.0" }
-churust-core = { path = "churust-core", version = "0.1.0" }
-churust-macros = { path = "churust-macros", version = "0.1.0" }
-churust-json = { path = "churust-json", version = "0.1.0" }
-churust-logging = { path = "churust-logging", version = "0.1.0" }
-churust-cors = { path = "churust-cors", version = "0.1.0" }
-churust-auth = { path = "churust-auth", version = "0.1.0" }
+churust = { path = "churust", version = "0.1.1" }
+churust-core = { path = "churust-core", version = "0.1.1" }
+churust-macros = { path = "churust-macros", version = "0.1.1" }
+churust-json = { path = "churust-json", version = "0.1.1" }
+churust-logging = { path = "churust-logging", version = "0.1.1" }
+churust-cors = { path = "churust-cors", version = "0.1.1" }
+churust-auth = { path = "churust-auth", version = "0.1.1" }
 
 tokio = { version = "1", features = ["full"] }
 hyper = { version = "1", features = ["http1", "server"] }
