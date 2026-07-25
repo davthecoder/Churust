@@ -1,5 +1,66 @@
+# Build output
 /target
 **/target
+
+# Cargo.lock is not committed: this workspace publishes libraries, so consumers
+# resolve their own dependency versions. An application repository should commit
+# it instead.
 Cargo.lock
+
+# rustc / rustfmt leftovers
+**/*.rs.bk
+*.pdb
+
+# Coverage and profiling
+*.profraw
+*.profdata
+/coverage
+tarpaulin-report.*
+cobertura.xml
+flamegraph.svg
+perf.data
+perf.data.old
+
+# TLS material. The `tls` feature reads cert.pem and key.pem from the working
+# directory, so it is easy to leave a private key sitting here.
 *.pem
+*.key
+*.crt
+*.der
+*.p12
+*.pfx
+
+# Local environment and secrets
+.env
+.env.local
+
+# Scratch directory the static-files example asks you to create
+/public
+
+# Editors and IDEs
+.idea/
+*.iml
+.vscode/
+.zed/
+*.swp
+*.swo
+*~
+
+# Patch and merge leftovers
+*.orig
+*.rej
+
+# macOS
 .DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux
+.directory
+.Trash-*
