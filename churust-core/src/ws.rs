@@ -39,7 +39,7 @@ use tokio_tungstenite::tungstenite::protocol::Role;
 use tokio_tungstenite::WebSocketStream;
 
 /// A cloneable, takeable holder for hyper's pending connection upgrade. The
-/// engine inserts one into a [`Call`](crate::Call)'s extensions for WebSocket
+/// engine inserts one into a [`Call`]'s extensions for WebSocket
 /// handshake requests; [`WebSocketUpgrade`] takes it back out.
 #[derive(Clone)]
 pub struct OnUpgradeHandle(Arc<Mutex<Option<OnUpgrade>>>);
