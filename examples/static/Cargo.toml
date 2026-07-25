@@ -4,8 +4,16 @@ version.workspace = true
 edition.workspace = true
 publish = false
 
+# `workspace = true` builds this example against the copy of Churust in this
+# repository. In your own project write the published version instead:
+#
+#     churust      = { version = "0.2", features = ["fs"] }
+#     bytes        = "1"
+#     futures-util = "0.3"
+#
+# bytes and futures-util are only for the hand-built stream in /numbers;
+# serving files needs churust alone.
 [dependencies]
 churust = { workspace = true, features = ["fs"] }
-tokio = { workspace = true }
 bytes = { workspace = true }
 futures-util = { workspace = true }

@@ -1,7 +1,44 @@
+//! # Chat — WebSockets, echo and broadcast
+//!
+//! Shows the `ws` feature: the `WebSocketUpgrade` extractor, `on_upgrade`, and
+//! a broadcast room built on a channel held in application state.
+//!
+//! ## Run it
+//!
+//! ```text
+//! cargo run -p chat
+//! ```
+//!
+//! ## Try it
+//!
+//! Needs a WebSocket client; `websocat` is the easiest.
+//!
+//! ```text
+//! websocat ws://localhost:8080/echo
+//! # type a line, it comes straight back
+//!
+//! # In two terminals, to see the fan-out:
+//! websocat ws://localhost:8080/room
+//! websocat ws://localhost:8080/room
+//! ```
+//!
+//! A plain `GET` to either route is rejected with `426 Upgrade Required`.
+//!
+//! ## In your own project
+//!
+//! ```toml
+//! [dependencies]
+//! churust = { version = "0.2", features = ["ws"] }
+//! ```
+//!
+//! Note there is no `tokio` entry, even though this example uses
+//! `broadcast` and `select!`. Churust re-exports the runtime, so
+//! `churust::tokio` gives you the whole of tokio without a second dependency.
+
 use churust::prelude::*;
+use churust::tokio::sync::broadcast;
 use churust::ws::{Message, WebSocketUpgrade};
 use std::sync::Arc;
-use tokio::sync::broadcast;
 
 #[derive(Clone)]
 struct Room {
@@ -38,7 +75,7 @@ async fn main() -> std::io::Result<()> {
                     let mut rx = tx.subscribe();
                     ws.on_upgrade(move |mut sock| async move {
                         loop {
-                            tokio::select! {
+                            churust::tokio::select! {
                                 incoming = sock.recv() => match incoming {
                                     Some(Ok(Message::Text(t))) => { let _ = tx.send(t); }
                                     Some(Ok(Message::Close)) | None => break,

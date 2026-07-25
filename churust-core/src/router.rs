@@ -30,6 +30,11 @@ use std::collections::HashMap;
 /// assert!(matches!(router.route(&Method::GET, "/nope"), Match::NotFound));
 /// assert!(matches!(router.route(&Method::POST, "/users/7"), Match::MethodNotAllowed { .. }));
 /// ```
+///
+/// Marked `#[non_exhaustive]`: a `match` on this enum outside `churust-core`
+/// must carry a `_` arm, so that a future routing outcome is not a breaking
+/// change.
+#[non_exhaustive]
 pub enum Match {
     /// A handler matched the path and method. Carries the matched handler and
     /// the captured path parameters (`{name}` -> value).
@@ -47,6 +52,10 @@ pub enum Match {
     },
     /// No route matched the path at all.
     NotFound,
+    /// A path segment could not be percent-decoded — a malformed escape or
+    /// bytes that are not valid UTF-8. The dispatcher turns this into
+    /// `400 Bad Request`.
+    BadPath,
 }
 
 #[derive(Default)]
@@ -166,29 +175,93 @@ impl Router {
     /// assert!(matches!(router.route(&Method::GET, "/missing"), Match::NotFound));
     /// ```
     pub fn route(&self, method: &Method, path: &str) -> Match {
-        let segments = split_segments(path);
+        // Split first, decode second. Decoding before splitting would let %2F
+        // manufacture separators and forge extra path segments.
+        let decoded = match decode_segments(path) {
+            Some(d) => d,
+            None => return Match::BadPath,
+        };
+        let segments: Vec<&str> = decoded.iter().map(String::as_str).collect();
         let mut params = HashMap::new();
-        match Self::walk(&self.root, &segments, 0, &mut params) {
-            Some(node) => match node.handlers.0.get(method) {
-                Some(h) => Match::Found {
+
+        // 1. Exact walk. Static beats param, unchanged.
+        let exact = Self::walk(&self.root, &segments, 0, &mut params);
+        if let Some(node) = exact {
+            if let Some(h) = node.handlers.0.get(method) {
+                return Match::Found {
                     handler: h.clone(),
                     params,
-                },
-                None if node.handlers.0.is_empty() => Match::NotFound,
-                None => Match::MethodNotAllowed {
-                    allow: node.handlers.0.keys().cloned().collect(),
-                },
-            },
-            None => {
-                // try wildcard at the deepest matchable ancestor
-                if let Some(m) = Self::walk_wildcard(&self.root, &segments, 0, method, &mut params)
-                {
-                    m
-                } else {
-                    Match::NotFound
+                };
+            }
+        }
+        let exact_allow: Vec<Method> = exact
+            .map(|n| n.handlers.0.keys().cloned().collect())
+            .unwrap_or_default();
+
+        // 2. Wildcard fallback. Reaching a node that has no handler for this
+        //    method is not the end of the search — a trailing `{name...}` at a
+        //    shallower depth may still serve the request. Without this, any
+        //    static route sharing a wildcard's prefix hides it entirely.
+        //
+        //    The walk above may have written captures into `params`. They
+        //    belong to the branch just abandoned and must not reach the
+        //    wildcard handler.
+        params.clear();
+        match Self::walk_wildcard(&self.root, &segments, 0, method, &mut params) {
+            Some(found @ Match::Found { .. }) => found,
+            Some(Match::MethodNotAllowed { allow: wild_allow }) => {
+                let mut allow = exact_allow;
+                for m in wild_allow {
+                    if !allow.contains(&m) {
+                        allow.push(m);
+                    }
+                }
+                Match::MethodNotAllowed { allow }
+            }
+            _ if !exact_allow.is_empty() => Match::MethodNotAllowed { allow: exact_allow },
+            _ => Match::NotFound,
+        }
+    }
+
+    /// The methods registered for `path`, including any a trailing wildcard
+    /// would serve. Empty when the path matches no route at all.
+    ///
+    /// Used by the dispatcher to build the `Allow` header for an `OPTIONS`
+    /// request that has no handler of its own.
+    ///
+    /// ```
+    /// use churust_core::{boxed, Call, IntoHandler, Router};
+    /// use http::Method;
+    ///
+    /// let mut router = Router::new();
+    /// router.add(Method::GET, "/x", boxed((|_c: Call| async { "" }).into_handler()));
+    /// assert_eq!(router.methods_for("/x"), vec![Method::GET]);
+    /// assert!(router.methods_for("/nope").is_empty());
+    /// ```
+    pub fn methods_for(&self, path: &str) -> Vec<Method> {
+        let decoded = match decode_segments(path) {
+            Some(d) => d,
+            None => return Vec::new(),
+        };
+        let segments: Vec<&str> = decoded.iter().map(String::as_str).collect();
+        let mut params = HashMap::new();
+        let mut out: Vec<Method> = Self::walk(&self.root, &segments, 0, &mut params)
+            .map(|n| n.handlers.0.keys().cloned().collect())
+            .unwrap_or_default();
+
+        // TRACE is a probe: nothing registers it, so `walk_wildcard` reports
+        // MethodNotAllowed carrying the wildcard's full method list.
+        params.clear();
+        if let Some(Match::MethodNotAllowed { allow }) =
+            Self::walk_wildcard(&self.root, &segments, 0, &Method::TRACE, &mut params)
+        {
+            for m in allow {
+                if !out.contains(&m) {
+                    out.push(m);
                 }
             }
         }
+        out
     }
 
     fn walk<'a>(
@@ -256,6 +329,18 @@ impl Router {
 
 fn split_segments(path: &str) -> Vec<&str> {
     path.split('/').filter(|s| !s.is_empty()).collect()
+}
+
+/// Split `path` on `/` and percent-decode each segment individually.
+///
+/// The order is the point. Decoding the whole path first would turn `%2F` into
+/// a separator and let a request forge segments it was never routed through.
+/// Returns `None` if any segment is undecodable, which becomes `400`.
+fn decode_segments(path: &str) -> Option<Vec<String>> {
+    split_segments(path)
+        .into_iter()
+        .map(crate::path::decode_path_segment)
+        .collect()
 }
 
 /// The route-definition DSL handed to the closure in
@@ -407,6 +492,142 @@ mod tests {
                 assert_eq!(res.body, Bytes::from("user 7"));
             }
             _ => panic!("expected Found"),
+        }
+    }
+
+    fn build_shadowed() -> Router {
+        let mut r = Router::new();
+        {
+            let mut b = RouteBuilder::new(&mut r);
+            b.get("/files/{path...}", |c: Call| async move {
+                format!("wild:{}", c.param_raw("path").unwrap_or(""))
+            });
+            b.get("/files/special/x", |_c: Call| async { "static" });
+            b.post("/files/only-post", |_c: Call| async { "posted" });
+        }
+        r
+    }
+
+    #[test]
+    fn path_params_are_percent_decoded() {
+        let mut r = Router::new();
+        {
+            let mut b = RouteBuilder::new(&mut r);
+            b.get("/u/{name}", |_c: Call| async { "" });
+        }
+        match r.route(&Method::GET, "/u/John%20Doe") {
+            Match::Found { params, .. } => assert_eq!(params.get("name").unwrap(), "John Doe"),
+            _ => panic!("expected a match"),
+        }
+    }
+
+    #[test]
+    fn encoded_slash_does_not_create_a_segment() {
+        let mut r = Router::new();
+        {
+            let mut b = RouteBuilder::new(&mut r);
+            b.get("/u/{name}", |_c: Call| async { "" });
+        }
+        // Matching at all proves %2F stayed inside one segment. Had it been
+        // decoded before splitting, this would be two segments and miss.
+        match r.route(&Method::GET, "/u/a%2Fb") {
+            Match::Found { params, .. } => assert_eq!(params.get("name").unwrap(), "a/b"),
+            _ => panic!("%2F must not manufacture a separator"),
+        }
+    }
+
+    #[test]
+    fn a_route_with_a_literal_space_is_reachable_encoded() {
+        let mut r = Router::new();
+        {
+            let mut b = RouteBuilder::new(&mut r);
+            b.get("/a b", |_c: Call| async { "" });
+        }
+        assert!(matches!(
+            r.route(&Method::GET, "/a%20b"),
+            Match::Found { .. }
+        ));
+    }
+
+    #[test]
+    fn malformed_encoding_is_a_bad_path() {
+        let mut r = Router::new();
+        {
+            let mut b = RouteBuilder::new(&mut r);
+            b.get("/u/{name}", |_c: Call| async { "" });
+        }
+        assert!(matches!(r.route(&Method::GET, "/u/%zz"), Match::BadPath));
+        assert!(matches!(r.route(&Method::GET, "/u/%FF"), Match::BadPath));
+    }
+
+    #[test]
+    fn wildcard_captures_decoded_segments() {
+        let mut r = Router::new();
+        {
+            let mut b = RouteBuilder::new(&mut r);
+            b.get("/f/{rest...}", |_c: Call| async { "" });
+        }
+        match r.route(&Method::GET, "/f/a%20b/c") {
+            Match::Found { params, .. } => assert_eq!(params.get("rest").unwrap(), "a b/c"),
+            _ => panic!("expected the wildcard to match"),
+        }
+    }
+
+    #[test]
+    fn wildcard_is_reachable_through_a_static_sibling() {
+        let r = build_shadowed();
+        match run(&r, Method::GET, "/files/special") {
+            Match::Found { params, .. } => {
+                assert_eq!(params.get("path").unwrap(), "special");
+            }
+            _ => panic!("wildcard should serve /files/special"),
+        }
+    }
+
+    #[test]
+    fn exact_match_still_wins_over_wildcard() {
+        let r = build_shadowed();
+        match run(&r, Method::GET, "/files/special/x") {
+            Match::Found { params, .. } => {
+                assert!(
+                    !params.contains_key("path"),
+                    "the static route captured a wildcard param"
+                );
+            }
+            _ => panic!("expected the static route"),
+        }
+    }
+
+    #[test]
+    fn allow_header_unions_exact_and_wildcard_methods() {
+        let r = build_shadowed();
+        match run(&r, Method::DELETE, "/files/only-post") {
+            Match::MethodNotAllowed { allow } => {
+                assert!(allow.contains(&Method::POST), "missing the exact method");
+                assert!(allow.contains(&Method::GET), "missing the wildcard method");
+            }
+            _ => panic!("expected 405"),
+        }
+    }
+
+    #[test]
+    fn abandoned_branch_params_do_not_leak_into_the_wildcard() {
+        let mut r = Router::new();
+        {
+            let mut b = RouteBuilder::new(&mut r);
+            // Matches /u/7/edit structurally, but has no GET handler.
+            b.post("/u/{id}/edit", |_c: Call| async { "edit" });
+            b.get("/u/{rest...}", |_c: Call| async { "wild" });
+        }
+        match r.route(&Method::GET, "/u/7/edit") {
+            Match::Found { params, .. } => {
+                assert_eq!(params.get("rest").unwrap(), "7/edit");
+                assert!(
+                    !params.contains_key("id"),
+                    "stale `id` leaked from the abandoned walk"
+                );
+            }
+            _ => panic!("the wildcard should have matched"),
         }
     }
 

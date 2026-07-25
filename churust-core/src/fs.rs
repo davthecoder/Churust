@@ -68,6 +68,25 @@ impl StaticFiles {
             .next()
             .unwrap_or_default();
 
+        // Refuse an encoded separator before anything interprets the path.
+        //
+        // Path parameters arrive percent-decoded, so `%2F` would otherwise
+        // reappear as a real separator once the wildcard's segments are
+        // rejoined, and `%5C` is a separator on Windows. `sanitize` still
+        // rejects the `..` that makes traversal work, so this is not the thing
+        // standing between a request and the filesystem — it is what makes the
+        // rejoined value unambiguous by construction, so the safety argument
+        // does not depend on reasoning about how segments were rejoined.
+        //
+        // Deliberately stricter than necessary: a file whose name contains a
+        // literal encoded slash is not servable. That is an accepted
+        // limitation, and 404 rather than 400 so the response does not reveal
+        // whether the path would have resolved.
+        let raw = call.path().to_ascii_lowercase();
+        if raw.contains("%2f") || raw.contains("%5c") {
+            return Err(Error::not_found("not found"));
+        }
+
         let safe = sanitize(&rel).ok_or_else(|| Error::not_found("not found"))?;
         let mut path = self.root.join(safe);
 
@@ -176,6 +195,17 @@ mod tests {
     use super::*;
     use crate::{Churust, TestClient};
     use http::StatusCode;
+
+    #[test]
+    fn sanitize_rejects_decoded_parent_segments() {
+        // Path parameters now arrive decoded, so `..` reaches sanitize as a
+        // literal parent component rather than as `%2e%2e`.
+        assert!(sanitize("../secret").is_none());
+        assert!(sanitize("a/../../secret").is_none());
+        assert!(sanitize("/etc/passwd").is_none(), "absolute paths rejected");
+        assert!(sanitize("ok/file.txt").is_some());
+        assert!(sanitize("./ok.txt").is_some(), "a bare `.` is harmless");
+    }
 
     fn temp_dir_with_files() -> PathBuf {
         // Unique-enough dir under the OS temp dir (no extra deps).

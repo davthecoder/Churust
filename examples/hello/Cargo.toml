@@ -4,7 +4,13 @@ version.workspace = true
 edition.workspace = true
 publish = false
 
+# `workspace = true` builds this example against the copy of Churust in this
+# repository. In your own project write the published version instead:
+#
+#     churust = "0.2"
+#     serde   = { version = "1", features = ["derive"] }
+#
+# There is deliberately no `tokio` entry — see the note at the top of main.rs.
 [dependencies]
 churust = { workspace = true }
-tokio = { workspace = true }
 serde = { workspace = true }

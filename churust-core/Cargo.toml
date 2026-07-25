@@ -39,4 +39,6 @@ tokio-tungstenite = "0.26"
 default = []
 tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile"]
 ws = ["dep:tokio-tungstenite"]
-fs = []
+# StaticFiles is the only thing that needs tokio's filesystem support, so it is
+# pulled in here rather than enabled for every build.
+fs = ["tokio/fs"]

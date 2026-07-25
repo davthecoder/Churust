@@ -83,6 +83,11 @@ pub use app::{App, AppBuilder, Churust, Plugin, ServerConfig};
 
 pub mod engine;
 
+// Percent-decoding for path segments. Internal: the decoding rules are a
+// routing detail, and exposing them would invite decoding at the wrong point in
+// the pipeline.
+mod path;
+
 #[cfg(feature = "tls")]
 pub mod tls;
 

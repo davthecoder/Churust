@@ -48,35 +48,47 @@ The four `examples/*` crates are `publish = false` and are skipped.
 
 ## One-time setup
 
-### Trusted Publishing — still outstanding
+### Trusted Publishing
 
 CI authenticates by OIDC, so no registry token is stored in GitHub. crates.io
 only allows this to be configured on a crate that **already exists**, which is
-why it could not cover the first publish. All seven crates exist now, so this
-can and should be done — **until it is, the workflow cannot publish** and
-releases have to go up from a logged-in machine.
+why it could not cover the first publish — `0.1.0` and most of `0.1.1` went up
+from a logged-in machine.
 
-For each of `churust`, `churust-core`, `churust-macros`, `churust-json`,
-`churust-logging`, `churust-cors`, `churust-auth`:
+Configured per crate, for all of `churust`, `churust-core`, `churust-macros`,
+`churust-json`, `churust-logging`, `churust-cors`, `churust-auth`:
 
 1. crates.io → the crate → Settings → Trusted Publishing → Add
 2. Repository owner: `davthecoder`, repository: `Churust`
 3. Workflow filename: `release.yml`
 4. Environment: leave empty
+5. Enable **Require trusted publishing for all new versions**
 
-### Publishing from a machine
+Step 5 is the one that matters, and it matters *least* on `churust`. The
+umbrella is a thin re-export; `churust-core` is where the engine, router, TLS,
+and static-file handling live, and `churust-auth` parses credentials. A leaked
+API token that can still publish `churust-core` reaches every user of
+`churust`, because they all depend on it transitively. Locking only the
+umbrella protects the least valuable crate in the set.
 
-The fallback while Trusted Publishing is unconfigured, and how `0.1.0` and
-`0.1.1` went up:
+### Releases go through CI, not a laptop
 
-```sh
-cargo login          # paste a crates.io API token
-cargo publish --workspace
+With "require trusted publishing" enabled, `cargo publish` from a developer
+machine is refused:
+
+```
+403 Forbidden: New versions of this crate can only be published
+using Trusted Publishing
 ```
 
-Then push the tag so CI creates the GitHub Release. The workflow checks the
-registry first, finds every crate already published, skips the upload, and goes
-straight to the release — no credentials needed on that path.
+That is the intended state. Publishing happens in `.github/workflows/release.yml`
+and nowhere else, so the release path is reproducible from a clean checkout and
+there is no long-lived credential that can be leaked.
+
+If a release stalls partway, re-run the workflow rather than reaching for a
+token. The publish step checks the registry first and skips anything already
+uploaded, so re-running finishes the job instead of failing on the crates that
+succeeded.
 
 ## crates.io rate limits
 
@@ -84,10 +96,22 @@ Creating **new** crate names is limited to a burst of 5, refilling about 1 every
 10 minutes. Publishing new **versions** of crates that already exist is a burst
 of 30, refilling 1 per minute.
 
-So the first release — seven names at once — stops after five with a `429`.
-That is expected. Wait ten minutes and re-run the same command; cargo skips the
-crates that already landed and continues with the rest. Every later release
-publishes versions, not names, and never hits this.
+So the first release — seven names at once — stopped after five with a `429`.
+Every later release publishes versions rather than names and stays well inside
+the burst.
+
+Recovering from a partial release is **not** a matter of re-running
+`cargo publish --workspace`. That command aborts on the first crate already on
+the registry:
+
+```
+error: crate churust-core@0.1.0 already exists on crates.io index
+```
+
+The release workflow handles this instead: it queries the registry for each
+crate at the target version, publishes only what is missing, and skips
+crates.io authentication entirely when there is nothing left to publish. So the
+recovery for any half-finished release is to re-run the workflow.
 
 ## If a release goes wrong
 

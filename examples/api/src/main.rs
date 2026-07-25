@@ -1,3 +1,44 @@
+//! # API — a JSON service with all four plugins
+//!
+//! Shows `install(plugin)` composition, JSON request and response bodies, and
+//! authentication enforced by the type system: a handler that asks for
+//! `Principal<AdminUser>` cannot run unauthenticated, so there is no way to
+//! forget the check.
+//!
+//! ## Run it
+//!
+//! ```text
+//! cargo run -p api
+//! ```
+//!
+//! ## Try it
+//!
+//! ```text
+//! curl localhost:8080/notes
+//! # []
+//!
+//! curl -X POST localhost:8080/notes -d '{"text":"hi"}'
+//! # {"error":"authentication required","status":401}
+//!
+//! curl -X POST localhost:8080/notes \
+//!   -H 'authorization: Bearer admin-token' \
+//!   -H 'content-type: application/json' \
+//!   -d '{"text":"hi"}'
+//! # {"id":1,"text":"hi"}
+//! ```
+//!
+//! ## In your own project
+//!
+//! ```toml
+//! [dependencies]
+//! churust = { version = "0.2", features = ["full"] }   # json, logging, cors, auth
+//! serde   = { version = "1", features = ["derive"] }
+//! ```
+//!
+//! Two things here are demo-only and must not be copied into production: the
+//! bearer callback compares against a hard-coded token, and `Cors::permissive()`
+//! allows every origin.
+
 use churust::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;

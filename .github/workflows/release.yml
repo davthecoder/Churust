@@ -75,12 +75,22 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
 
-      # Packages and verifies all seven crates without uploading, catching a
-      # broken manifest before anything becomes permanent. `cargo package` is
-      # used rather than `publish --dry-run` because the latter errors on any
-      # version already on the registry, which would break re-runs.
+      # Packages and verifies the seven publishable crates without uploading,
+      # catching a broken manifest before anything becomes permanent.
+      #
+      # `cargo package` rather than `publish --dry-run`, because the latter
+      # errors on any version already on the registry and would break re-runs.
+      #
+      # The examples are excluded deliberately. They are publish = false, so
+      # packaging them proves nothing — and verification would strip their path
+      # dependency on churust and resolve it from crates.io instead, meaning a
+      # release that changes churust's API fails here against the *previous*
+      # published version. Exactly that happened when the examples stopped
+      # carrying their own tokio dependency.
       - name: Package check
-        run: cargo package --workspace
+        run: |
+          cargo package --workspace \
+            --exclude hello --exclude api --exclude chat --exclude static-example
 
       # Work out what is actually missing from the registry before touching
       # credentials. A re-run of an already-complete release then needs no

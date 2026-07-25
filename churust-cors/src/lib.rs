@@ -590,6 +590,30 @@ mod tests {
         assert!(methods.contains("POST"));
     }
 
+    /// The core dispatcher answers an unclaimed `OPTIONS` with `204` plus an
+    /// `Allow` header. That must not shadow CORS preflight, which needs to
+    /// respond with `access-control-*` headers instead.
+    ///
+    /// Cors sits in the `Plugins` phase and the router in `Fallback`, so
+    /// preflight short-circuits first — but that is an assumption about phase
+    /// ordering, and this test is what keeps it true.
+    #[tokio::test]
+    async fn preflight_takes_priority_over_automatic_options() {
+        let client = TestClient::new(app());
+        let res = client
+            .request(Method::OPTIONS, "/")
+            .header("origin", "https://example.com")
+            .header("access-control-request-method", "GET")
+            .send()
+            .await;
+
+        assert_eq!(res.status(), StatusCode::NO_CONTENT);
+        assert!(
+            res.header("access-control-allow-origin").is_some(),
+            "CORS preflight was swallowed by the automatic OPTIONS handler"
+        );
+    }
+
     #[tokio::test]
     async fn disallowed_origin_gets_no_cors_header() {
         let app = Churust::server()
