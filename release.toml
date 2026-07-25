@@ -1,0 +1,35 @@
+# cargo-release configuration.
+#
+# Every Churust crate ships as one release on one version number. There is no
+# such thing as bumping churust-json without bumping churust-core — the whole
+# workspace moves together, always.
+#
+#   cargo release patch    # 0.1.0 -> 0.1.1   (dry run, prints the plan)
+#   cargo release minor --execute
+#
+# `cargo release` only bumps, commits, tags, and pushes. Pushing the tag is what
+# triggers .github/workflows/release.yml, and CI is what actually uploads to
+# crates.io — so a release is always reproducible from a clean checkout.
+
+# One version across all crates, including the publish = false examples.
+shared-version = true
+
+# CI publishes, not your laptop. See the workflow.
+publish = false
+
+# One tag for the workspace instead of seven crate-prefixed ones.
+tag = true
+tag-prefix = ""
+tag-name = "v{{version}}"
+tag-message = "Churust v{{version}}"
+
+# A single commit for the whole bump, not one per crate.
+consolidate-commits = true
+pre-release-commit-message = "chore: release v{{version}}"
+
+# Push the bump commit and the tag; the tag fires the release workflow.
+push = true
+push-remote = "origin"
+
+# Releases come off main and nowhere else.
+allow-branch = ["main"]

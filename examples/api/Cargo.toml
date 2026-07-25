@@ -1,10 +1,10 @@
 [package]
 name = "api"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 publish = false
 
 [dependencies]
-churust = { path = "../../churust", features = ["full"] }
+churust = { workspace = true, features = ["full"] }
 tokio = { workspace = true }
 serde = { workspace = true }

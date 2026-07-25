@@ -1,16 +1,22 @@
 [package]
 name = "churust-cors"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
 description = "CORS plugin (preflight + headers) for the Churust web framework."
 
+[package.metadata.docs.rs]
+all-features = true
+
 [dependencies]
-churust-core = { path = "../churust-core", version = "0.1.0" }
+churust-core = { workspace = true }
 async-trait = { workspace = true }
 http = { workspace = true }
 

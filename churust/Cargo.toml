@@ -1,24 +1,29 @@
 [package]
 name = "churust"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
 keywords.workspace = true
 categories.workspace = true
-readme = "../README.md"
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
 description = "Churust — a Ktor-inspired, secure, easy-to-learn Rust web framework (Churro + Rust)."
 
+[package.metadata.docs.rs]
+all-features = true
+
 [dependencies]
-churust-core = { path = "../churust-core", version = "0.1.0" }
-churust-macros = { path = "../churust-macros", version = "0.1.0" }
+churust-core = { workspace = true }
+churust-macros = { workspace = true }
 http = { workspace = true }
 tokio = { workspace = true }
-churust-json = { path = "../churust-json", version = "0.1.0", optional = true }
-churust-logging = { path = "../churust-logging", version = "0.1.0", optional = true }
-churust-cors = { path = "../churust-cors", version = "0.1.0", optional = true }
-churust-auth = { path = "../churust-auth", version = "0.1.0", optional = true }
+churust-json = { workspace = true, optional = true }
+churust-logging = { workspace = true, optional = true }
+churust-cors = { workspace = true, optional = true }
+churust-auth = { workspace = true, optional = true }
 
 [features]
 default = []

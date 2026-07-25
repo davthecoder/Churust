@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="img/churust_logo.png" alt="Churust logo — a churro spiral inside a gear" width="180" />
+  <img src="https://raw.githubusercontent.com/davthecoder/Churust/main/img/churust_logo.png" alt="Churust logo — a churro spiral inside a gear" width="180" />
 </p>
 
 <h1 align="center">Churust 🌀</h1>
@@ -8,6 +8,42 @@
   <strong>Churro + Rust</strong> — a backend web framework inspired by Kotlin's <a href="https://ktor.io">Ktor</a>.<br />
   Simple, secure, robust, easy to learn.
 </p>
+
+<p align="center">
+  <a href="https://crates.io/crates/churust"><img src="https://img.shields.io/crates/v/churust.svg" alt="crates.io" /></a>
+  <a href="https://docs.rs/churust"><img src="https://docs.rs/churust/badge.svg" alt="docs.rs" /></a>
+  <a href="https://github.com/davthecoder/Churust/actions/workflows/ci.yml"><img src="https://github.com/davthecoder/Churust/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
+  <img src="https://img.shields.io/badge/rust-1.96%2B-blue.svg" alt="MSRV 1.96" />
+  <a href="https://github.com/davthecoder/Churust/blob/main/LICENSE"><img src="https://img.shields.io/crates/l/churust.svg" alt="MIT" /></a>
+</p>
+
+## Install
+
+```toml
+[dependencies]
+churust = "0.1"
+tokio = { version = "1", features = ["full"] }
+```
+
+Plugins and transports are opt-in features on the umbrella crate:
+
+```toml
+churust = { version = "0.1", features = ["full", "ws", "fs", "tls"] }
+```
+
+| Feature | Pulls in | Gives you |
+| --- | --- | --- |
+| `json` | `churust-json` | `Json<T>` extractor/responder, content negotiation |
+| `logging` | `churust-logging` | `CallLogging` via `tracing` |
+| `cors` | `churust-cors` | preflight + CORS headers |
+| `auth` | `churust-auth` | Bearer/Basic/JWT, `Principal<P>` |
+| `full` | all four above | the whole plugin set |
+| `ws` | `churust-core/ws` | WebSocket upgrade + `WebSocket`/`Message` |
+| `fs` | `churust-core/fs` | `StaticFiles` directory handler |
+| `tls` | `churust-core/tls` | rustls-backed HTTPS |
+
+Every Churust crate is released in lockstep on one version number, so
+`churust-core`, `churust-json`, and the rest always match the umbrella version.
 
 Churust gives you Ktor's developer experience in Rust: an application engine, a
 routing DSL, an `install(plugin)` system, and a phased interceptor pipeline —
@@ -150,7 +186,7 @@ r.get("/echo", |ws: WebSocketUpgrade| async move {
 churust = { version = "0.1", features = ["ws"] }
 ```
 
-See [`examples/chat`](examples/chat) for an echo endpoint plus a broadcast room.
+See [`examples/chat`](https://github.com/davthecoder/Churust/tree/main/examples/chat) for an echo endpoint plus a broadcast room.
 
 ## Static files & streaming (feature `fs`)
 
@@ -177,7 +213,7 @@ r.get("/numbers", |_c: Call| async {
 `StaticFiles` detects the `Content-Type` from the file extension, serves an
 optional `index` file for directories, rejects path traversal (`..`, absolute
 paths, symlink escapes) with `404`, and streams the file in chunks. See
-[`examples/static`](examples/static).
+[`examples/static`](https://github.com/davthecoder/Churust/tree/main/examples/static).
 
 ```toml
 churust = { version = "0.1", features = ["fs"] }
@@ -246,7 +282,7 @@ macro. **v2.0** adds WebSockets behind the opt-in `ws` feature (see above).
 file serving (`StaticFiles`, behind the opt-in `fs` feature). Still deferred
 (YAGNI): sessions, response compression, HTTP/3, route-scoped middleware sugar.
 
-Design docs and build plans live in [`docs/`](docs/).
+Design docs and build plans live in [`docs/`](https://github.com/davthecoder/Churust/tree/main/docs).
 
 ## License
 

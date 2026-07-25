@@ -1,9 +1,9 @@
 [package]
 name = "chat"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 publish = false
 
 [dependencies]
-churust = { path = "../../churust", features = ["ws"] }
+churust = { workspace = true, features = ["ws"] }
 tokio = { workspace = true }
