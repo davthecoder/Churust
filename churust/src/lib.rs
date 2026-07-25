@@ -100,6 +100,29 @@ pub use churust_core::*;
 /// `async fn main` in a tokio runtime.
 pub use churust_macros::main;
 
+/// The tokio runtime Churust is built on, re-exported so applications do not
+/// need their own dependency on it.
+///
+/// ```
+/// # async fn example() {
+/// churust::tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+/// # }
+/// ```
+///
+/// Churust enables the tokio features it uses itself. If you need one it does
+/// not enable, add `tokio` to your own `Cargo.toml` with that feature — Cargo
+/// unifies the two.
+pub use tokio;
+
+/// Implementation detail: the path `#[churust::main]` expands to.
+///
+/// Not a stable API. Use [`tokio`] instead.
+#[doc(hidden)]
+pub mod __private {
+    /// Re-export used by the runtime that `#[churust::main]` generates.
+    pub use tokio;
+}
+
 /// WebSocket types (`WebSocket`, `WebSocketUpgrade`, `ws::Message`). Enabled by
 /// the `ws` feature.
 #[cfg(feature = "ws")]

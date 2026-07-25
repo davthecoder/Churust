@@ -9,13 +9,18 @@
 //!
 //! In your application's `main.rs`, after adding `churust` as a dependency:
 //!
-//! ```no_run
-//! #[churust_macros::main]
+//! ```text
+//! #[churust::main]
 //! async fn main() -> std::io::Result<()> {
 //!     // Churust::server()…start().await goes here.
 //!     Ok(())
 //! }
 //! ```
+//!
+//! The examples in this crate are illustrations rather than doctests: the
+//! generated code names `::churust`, which cannot resolve from inside
+//! `churust-macros` because `churust` depends on this crate and not the
+//! reverse. Executable coverage lives in `churust/tests/macro_main.rs`.
 //!
 //! The attribute strips the `async` modifier and injects a Tokio runtime so
 //! that the Rust compiler sees an ordinary synchronous `fn main()`.  This
@@ -67,8 +72,8 @@ use syn::{parse_macro_input, ItemFn};
 /// The return type is preserved unchanged.  Returning `std::io::Result<()>` is
 /// idiomatic because `Churust::server().start().await` returns that type:
 ///
-/// ```no_run
-/// #[churust_macros::main]
+/// ```text
+/// #[churust::main]
 /// async fn main() -> std::io::Result<()> {
 ///     Ok(())
 /// }
@@ -77,8 +82,8 @@ use syn::{parse_macro_input, ItemFn};
 /// Returning `()` is also valid when no top-level I/O error needs to be
 /// propagated:
 ///
-/// ```no_run
-/// #[churust_macros::main]
+/// ```text
+/// #[churust::main]
 /// async fn main() {
 ///     // fire-and-forget setup, panics on failure
 /// }
@@ -94,21 +99,20 @@ use syn::{parse_macro_input, ItemFn};
 ///
 /// Given the following input:
 ///
-/// ```no_run
-/// #[churust_macros::main]
+/// ```text
+/// #[churust::main]
 /// async fn main() -> std::io::Result<()> {
 ///     do_something().await
 /// }
-/// # async fn do_something() -> std::io::Result<()> { Ok(()) }
 /// ```
 ///
 /// The macro expands to roughly the following synchronous function.  The
 /// generated runtime variable uses a mangled name (`__rt`) to avoid shadowing
 /// anything in the caller's scope:
 ///
-/// ```no_run
+/// ```text
 /// fn main() -> std::io::Result<()> {
-///     let __rt = ::tokio::runtime::Builder::new_multi_thread()
+///     let __rt = ::churust::__private::tokio::runtime::Builder::new_multi_thread()
 ///         .enable_all()
 ///         .build()
 ///         .expect("failed to build tokio runtime");
@@ -116,8 +120,10 @@ use syn::{parse_macro_input, ItemFn};
 ///         do_something().await
 ///     })
 /// }
-/// # async fn do_something() -> std::io::Result<()> { Ok(()) }
 /// ```
+///
+/// The runtime is reached through `churust`'s re-export rather than `::tokio`,
+/// so an application needs only `churust` as a dependency.
 ///
 /// All original attributes (e.g. `#[cfg(…)]`, doc comments) and visibility
 /// modifiers on the original function are forwarded to the generated function
@@ -146,7 +152,7 @@ pub fn main(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let expanded = quote! {
         #(#attrs)*
         #vis fn #ident() #output {
-            let __rt = ::tokio::runtime::Builder::new_multi_thread()
+            let __rt = ::churust::__private::tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .expect("failed to build tokio runtime");

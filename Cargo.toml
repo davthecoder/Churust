@@ -27,7 +27,20 @@ churust-logging = { path = "churust-logging", version = "0.1.1" }
 churust-cors = { path = "churust-cors", version = "0.1.1" }
 churust-auth = { path = "churust-auth", version = "0.1.1" }
 
-tokio = { version = "1", features = ["full"] }
+# Only the features Churust actually uses, audited against every `tokio::` path
+# in the workspace: rt-multi-thread (the `main` macro, `Runtime`), net
+# (`TcpListener`), io-util (`AsyncReadExt`), time (request timeouts), sync (the
+# shutdown `oneshot`), signal (`ctrl_c`), macros (`select!`). `fs` is pulled in
+# by churust-core's own `fs` feature rather than always.
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "net",
+  "io-util",
+  "time",
+  "sync",
+  "signal",
+  "macros",
+] }
 hyper = { version = "1", features = ["http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "server-graceful"] }
 http-body-util = "0.1"
