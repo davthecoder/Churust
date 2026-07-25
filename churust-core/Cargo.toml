@@ -20,20 +20,43 @@ tokio.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 http-body-util.workspace = true
+http-body.workspace = true
 http.workspace = true
 bytes.workspace = true
 futures-util.workspace = true
 async-trait.workspace = true
 serde.workspace = true
-serde_urlencoded.workspace = true
+serde_html_form.workspace = true
 toml = "0.8"
+# Connection-level diagnostics: accept failures, TLS handshake failures and
+# timeouts. Costs nothing without a subscriber installed, and these are events
+# an operator needs — a dropped TLS handshake is the most common "the server is
+# up but I cannot connect", and printing to stderr per scanner probe is its own
+# denial of service on the log pipeline.
+tracing.workspace = true
+hmac.workspace = true
+sha2.workspace = true
 rustls = { version = "0.23", optional = true }
 tokio-rustls = { version = "0.26", optional = true }
 rustls-pemfile = { version = "2", optional = true }
 tokio-tungstenite = { version = "0.26", optional = true }
+# IMF-fixdate parsing and formatting for Last-Modified / If-Modified-Since.
+# Not a new tree entry: hyper already depends on httpdate, so this costs nothing
+# beyond naming it. Hand-rolling HTTP date handling is a classic source of
+# caching bugs.
+httpdate = { version = "1", optional = true }
+tower-service = { workspace = true, optional = true }
+tower-layer = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio-tungstenite = "0.26"
+# Self-signed certificates generated in-process, so the TLS serving path can be
+# tested without checking key material into the repository.
+rcgen = "0.13"
+# Hand-written layers in the tower-adapter tests, so those tests check the
+# adapter rather than someone else's middleware.
+tower-layer = "0.3"
+tower-service = "0.3"
 
 [features]
 default = []
@@ -41,4 +64,11 @@ tls = ["dep:rustls", "dep:tokio-rustls", "dep:rustls-pemfile"]
 ws = ["dep:tokio-tungstenite"]
 # StaticFiles is the only thing that needs tokio's filesystem support, so it is
 # pulled in here rather than enabled for every build.
-fs = ["tokio/fs"]
+fs = ["tokio/fs", "dep:httpdate"]
+# Run a `tower::Service` as Churust middleware, so the tower-http ecosystem
+# (compression, tracing, request ids, header manipulation, ...) is reachable
+# without reimplementing it here.
+tower = ["dep:tower-service", "dep:tower-layer"]
+# multipart/form-data parsing. No new dependency: the parser is hand-rolled
+# over the already-buffered body.
+multipart = []

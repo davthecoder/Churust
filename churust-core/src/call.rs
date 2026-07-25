@@ -5,8 +5,100 @@ use crate::response::Response;
 use crate::state::StateMap;
 use bytes::Bytes;
 use http::{HeaderMap, Method, StatusCode, Uri};
-use std::collections::HashMap;
 use std::sync::Arc;
+/// Captured path parameters, in the order the route captured them.
+///
+/// Order matters: `Path<(A, B)>` destructures positionally, so a `HashMap`
+/// would make `/users/{id}/posts/{post}` ambiguous.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Params(Vec<(String, String)>);
+
+impl Params {
+    /// An empty set.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Add or replace `name`.
+    pub fn insert(&mut self, name: String, value: String) {
+        match self.0.iter_mut().find(|(k, _)| *k == name) {
+            Some(slot) => slot.1 = value,
+            None => self.0.push((name, value)),
+        }
+    }
+
+    /// Drop `name`, if present.
+    pub fn remove(&mut self, name: &str) {
+        self.0.retain(|(k, _)| k != name);
+    }
+
+    /// The value for `name`.
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// Pairs in capture order.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.0.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
+
+    /// Whether `name` was captured.
+    pub fn contains_key(&self, name: &str) -> bool {
+        self.get(name).is_some()
+    }
+
+    /// The value at `index`, in capture order.
+    pub fn nth(&self, index: usize) -> Option<&str> {
+        self.0.get(index).map(|(_, v)| v.as_str())
+    }
+
+    /// How many were captured.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether none were captured.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Discard every capture.
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+}
+
+/// The address the connection came from, seeded by the engine.
+///
+/// A newtype rather than a bare `SocketAddr` so it can live in the call's typed
+/// extension map without colliding with anything else of that type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerAddr(pub std::net::SocketAddr);
+
+/// A request body still arriving, as a stream of chunks.
+pub type BodyStream =
+    std::pin::Pin<Box<dyn futures_util::Stream<Item = Result<Bytes>> + Send + 'static>>;
+
+/// Where a request body currently is: already in memory, or still arriving.
+enum RequestBody {
+    Buffered(Bytes),
+    /// Behind a mutex so `Call` stays `Sync`. A boxed stream is `Send` but not
+    /// `Sync`, and handler bounds require `Sync`; the mutex is uncontended
+    /// because the stream is taken exactly once.
+    Stream(std::sync::Mutex<Option<BodyStream>>),
+}
+
+impl std::fmt::Debug for RequestBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RequestBody::Buffered(b) => write!(f, "Buffered({} bytes)", b.len()),
+            RequestBody::Stream(_) => f.write_str("Stream"),
+        }
+    }
+}
 
 /// Per-request context: the single object a handler receives (Ktor-style).
 ///
@@ -47,8 +139,8 @@ pub struct Call {
     method: Method,
     uri: Uri,
     headers: HeaderMap,
-    params: HashMap<String, String>,
-    body: Bytes,
+    params: Params,
+    body: RequestBody,
     state: Arc<StateMap>,
     extensions: http::Extensions,
 }
@@ -56,13 +148,17 @@ pub struct Call {
 impl Call {
     /// Construct a Call from already-parsed request parts (used by the engine
     /// and the test harness alike).
+    /// Build a call whose body is already in memory.
+    ///
+    /// The engine instead attaches the body as a stream, so a handler can read
+    /// a large one incrementally — see [`Call::body_stream`].
     pub fn new(method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Self {
         Self {
             method,
             uri,
             headers,
-            params: HashMap::new(),
-            body,
+            params: Params::new(),
+            body: RequestBody::Buffered(body),
             state: Arc::new(StateMap::default()),
             extensions: http::Extensions::new(),
         }
@@ -83,6 +179,26 @@ impl Call {
     /// The full request header map.
     pub fn headers(&self) -> &HeaderMap {
         &self.headers
+    }
+
+    /// Replace the request URI.
+    ///
+    /// For middleware that rewrites the target — a path normaliser, a rewrite
+    /// rule. Note that routing has already happened by the time middleware
+    /// runs, so this changes what handlers and extractors *read*, not which
+    /// handler was selected.
+    pub fn set_uri(&mut self, uri: Uri) {
+        self.uri = uri;
+    }
+
+    /// Mutable access to the request headers.
+    ///
+    /// Middleware that rewrites the request head needs this — a request-id
+    /// layer that injects a header, or a proxy-header normaliser. Handlers see
+    /// whatever the pipeline left here, so a middleware that edits headers is
+    /// editing what every extractor downstream will read.
+    pub fn headers_mut(&mut self) -> &mut HeaderMap {
+        &mut self.headers
     }
 
     /// The value of header `name` as a UTF-8 string, or `None` if the header is
@@ -137,13 +253,86 @@ impl Call {
     }
 
     /// Set by the router after a successful match.
-    pub(crate) fn set_params(&mut self, params: HashMap<String, String>) {
+    pub(crate) fn set_params(&mut self, params: Params) {
         self.params = params;
     }
 
     /// Injected by `App::process` before the pipeline runs.
     pub(crate) fn set_state(&mut self, state: Arc<StateMap>) {
         self.state = state;
+    }
+
+    /// The address the connection came from.
+    ///
+    /// `None` when the call did not come from the engine — a `TestClient`
+    /// request, for instance, has no socket behind it.
+    ///
+    /// This is the *socket* peer. Behind a reverse proxy it is the proxy, not
+    /// the client: consult `X-Forwarded-For` only after checking this against
+    /// the addresses you actually trust, since the header is client-supplied
+    /// and trivially forged.
+    pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.get::<PeerAddr>().map(|p| p.0)
+    }
+
+    /// The value of request cookie `name`, percent-decoded.
+    ///
+    /// ```
+    /// use churust_core::Call;
+    /// use http::{HeaderMap, HeaderValue, Method};
+    /// use bytes::Bytes;
+    /// let mut headers = HeaderMap::new();
+    /// headers.insert(http::header::COOKIE, HeaderValue::from_static("a=1; b=two"));
+    /// let call = Call::new(Method::GET, "/".parse().unwrap(), headers, Bytes::new());
+    /// assert_eq!(call.cookie("b").as_deref(), Some("two"));
+    /// assert_eq!(call.cookie("missing"), None);
+    /// ```
+    pub fn cookie(&self, name: &str) -> Option<String> {
+        // Every `Cookie` field, not just the first. HTTP/2 permits a client to
+        // send cookie crumbs as several separate header fields (RFC 9113
+        // §8.2.3), and an HTTP/1.1 client may send more than one `Cookie` line
+        // too. Reading only the first meant a session cookie that happened to
+        // land in the second field was invisible, so every request looked
+        // freshly anonymous — a silent logout on each request.
+        self.headers
+            .get_all(http::header::COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .find_map(|raw| crate::cookie::find(raw, name))
+            .map(crate::cookie::decode)
+    }
+
+    /// A copy of this call carrying `body`.
+    ///
+    /// Used by [`Either`](crate::Either), which must be able to hand the same
+    /// request to a second extractor after the first declines it.
+    pub(crate) fn clone_with_body(&self, body: Bytes) -> Call {
+        let mut c = Call::new(
+            self.method.clone(),
+            self.uri.clone(),
+            self.headers.clone(),
+            body,
+        );
+        c.params = self.params.clone();
+        c.state = self.state.clone();
+        c.extensions = self.extensions.clone();
+        c
+    }
+
+    /// A lightweight copy of the request for an error renderer.
+    ///
+    /// [`on_error`](crate::AppBuilder::on_error) needs to inspect the request,
+    /// but running the rest of the pipeline consumes the call. This keeps the
+    /// parts an error page can reasonably ask about — method, URI and headers —
+    /// and deliberately not the body, which has usually been consumed by then
+    /// and would be misleading to hand back.
+    pub(crate) fn snapshot_for_error(&self) -> Call {
+        Call::new(
+            self.method.clone(),
+            self.uri.clone(),
+            self.headers.clone(),
+            Bytes::new(),
+        )
     }
 
     /// Merge externally-built extensions into this call (used by the engine to
@@ -180,17 +369,23 @@ impl Call {
         self.state.get::<T>()
     }
 
-    /// Iterate over the captured path parameters as `(name, value)` pairs.
-    /// Iteration order is unspecified (the parameters are stored in a hash map).
+    /// Iterate over the captured path parameters as `(name, value)` pairs, in
+    /// capture order.
+    /// Pairs come back in the order the route captured them.
     pub fn params_iter(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.params.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+        self.params.iter()
+    }
+
+    /// The captured path parameters, in capture order.
+    pub fn params(&self) -> &Params {
+        &self.params
     }
 
     /// The raw, unparsed value of path parameter `name`, or `None` if the route
     /// has no such parameter. Use [`param`](Call::param) to parse it into a
     /// typed value.
     pub fn param_raw(&self, name: &str) -> Option<&str> {
-        self.params.get(name).map(|s| s.as_str())
+        self.params.get(name)
     }
 
     /// Parse path parameter `name` into `T`.
@@ -241,7 +436,56 @@ impl Call {
     /// # });
     /// ```
     pub async fn receive_bytes(&mut self) -> Bytes {
-        std::mem::take(&mut self.body)
+        self.try_receive_bytes().await.unwrap_or_default()
+    }
+
+    /// Read the whole body, surfacing the size limit as an error.
+    ///
+    /// [`receive_bytes`](Call::receive_bytes) exists for callers that cannot
+    /// report failure and yields an empty buffer instead; extractors should
+    /// prefer this so an oversized body becomes `413` rather than a confusing
+    /// deserialization error.
+    pub async fn try_receive_bytes(&mut self) -> Result<Bytes> {
+        match std::mem::replace(&mut self.body, RequestBody::Buffered(Bytes::new())) {
+            RequestBody::Buffered(b) => Ok(b),
+            RequestBody::Stream(cell) => {
+                let Some(mut s) = cell.lock().ok().and_then(|mut g| g.take()) else {
+                    return Ok(Bytes::new());
+                };
+                use futures_util::StreamExt;
+                let mut buf = bytes::BytesMut::new();
+                while let Some(chunk) = s.next().await {
+                    buf.extend_from_slice(&chunk?);
+                }
+                Ok(buf.freeze())
+            }
+        }
+    }
+
+    /// Take the body as a stream, without buffering it.
+    ///
+    /// This is how a large upload is processed without holding it in memory.
+    /// Returns `None` if the body has already been consumed. A body that
+    /// arrived buffered — from [`Call::new`] or a test client — yields a
+    /// single-chunk stream, so a handler need not care which it got.
+    ///
+    /// The server-wide `max_body_bytes` still applies: exceeding it surfaces as
+    /// an error item in the stream rather than a `413`, because the response
+    /// has usually begun by then.
+    pub fn body_stream(&mut self) -> Option<BodyStream> {
+        match std::mem::replace(&mut self.body, RequestBody::Buffered(Bytes::new())) {
+            RequestBody::Stream(cell) => cell.lock().ok().and_then(|mut g| g.take()),
+            RequestBody::Buffered(b) if !b.is_empty() => {
+                Some(Box::pin(futures_util::stream::once(async move { Ok(b) })))
+            }
+            RequestBody::Buffered(_) => None,
+        }
+    }
+
+    /// Attach a streaming body. Used by the engine.
+    pub(crate) fn with_body_stream(mut self, stream: BodyStream) -> Self {
+        self.body = RequestBody::Stream(std::sync::Mutex::new(Some(stream)));
+        self
     }
 
     /// Take the request body decoded as UTF-8, consuming it.
@@ -259,7 +503,11 @@ impl Call {
     /// # });
     /// ```
     pub async fn receive_text(&mut self) -> Result<String> {
-        let bytes = self.receive_bytes().await;
+        // `try_receive_bytes`, not `receive_bytes`: the latter swallows a read
+        // error into an empty payload, which would turn an over-limit body into
+        // an empty string rather than a `413`.
+        let bytes = self.try_receive_bytes().await?;
+        crate::extract::check_body_limit(self, bytes.len())?;
         String::from_utf8(bytes.to_vec())
             .map_err(|e| Error::bad_request(format!("body is not valid UTF-8: {e}")))
     }
@@ -418,7 +666,7 @@ mod tests {
     #[test]
     fn parses_path_param() {
         let mut c = call("/users/42", "");
-        let mut p = HashMap::new();
+        let mut p = crate::call::Params::new();
         p.insert("id".to_string(), "42".to_string());
         c.set_params(p);
         let id: u64 = c.param("id").unwrap();

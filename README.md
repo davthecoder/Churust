@@ -68,7 +68,8 @@ churust = { version = "0.2", features = ["full", "ws", "fs", "tls"] }
 | `auth` | `churust-auth` | Bearer/Basic/JWT, `Principal<P>` |
 | `full` | all four above | the whole plugin set |
 | `ws` | `churust-core/ws` | WebSocket upgrade + `WebSocket`/`Message` |
-| `fs` | `churust-core/fs` | `StaticFiles` directory handler |
+| `fs` | `churust-core/fs` | `StaticFiles`, conditional GET, byte ranges |
+| `multipart` | `churust-core/multipart` | `multipart/form-data` uploads |
 | `tls` | `churust-core/tls` | rustls-backed HTTPS |
 
 Default features are empty, so a plain `churust = "0.2"` compiles the core
@@ -80,17 +81,58 @@ Every Churust crate is released in lockstep on one version number, so
 ## Features
 
 - **Hybrid handlers** — write call-style (`|call: Call|`) *or* with typed
-  extractors (`Path<T>`, `Query<T>`, `State<T>`, `Json<T>`, `BearerToken`,
-  `Principal<P>`) — mix freely in one handler.
+  extractors (`Path<T>` — including tuples and structs — `Query<T>`, `Form<T>`,
+  `Header<T, N>`, `State<T>`, `Json<T>`, `Payload`, `Either<A, B>`,
+  `BearerToken`, `Principal<P>`) — mix freely in one handler. Wrap any of them
+  in `Option<T>` when the input is optional; absent is `None`, malformed is
+  still an error.
 - **`install(plugin)`** — Ktor-style plugins composed over a named pipeline
-  (`Setup → Monitoring → Plugins → Call → Fallback`) for deterministic order.
+  (`Setup → Monitoring → Plugins → Call → Fallback`) for deterministic order,
+  plus `intercept` for middleware scoped to part of the route tree.
+- **Route guards** — several routes may share a path when `guard::header`,
+  `guard::host` or a custom predicate distinguishes them.
+- **Your own error pages** — `on_error` renders any `4xx`/`5xx`, including
+  routing failures.
+- **Request correlation** — a request id on every log line, echoed as
+  `x-request-id`, continuing an inbound W3C `traceparent`.
 - **Built-in plugins** — JSON content negotiation, request logging, CORS, and
   authentication (Bearer / Basic / JWT).
+- **Cookies and sessions** — a cookie primitive with safe defaults
+  (`HttpOnly`, `SameSite=Lax`), and HMAC-SHA256 signed cookie sessions.
+- **Streaming request bodies** — `Payload` reads an upload incrementally, so it
+  is not capped by memory.
+- **Peer address** — `call.peer_addr()` for rate limiting and audit logs.
+- **Deployment knobs** — idle keep-alive, listen backlog, connection cap, TLS
+  handshake cap and deadline, HTTP/2 stream and header limits, a bounded
+  shutdown grace period that actually drains, several bind addresses, and Unix
+  domain sockets.
+- **File uploads** — `Multipart` behind the `multipart` feature.
 - **Typed app state / DI** — `.state(T)` then extract `State<T>`.
 - **Layered config** — defaults < `churust.toml` < env (`CHURUST_*`) < code DSL.
-- **Secure by default** — body-size limits, request timeouts, panic isolation
-  (a panicking handler returns 500, never crashes the server), no version
-  banner, opt-in rustls TLS.
+- **Secure by default** — security headers on every response, body-size limits,
+  request and header-read timeouts (slow-loris), header and path-depth caps,
+  WebSocket frame and message caps, panic isolation (a panicking handler
+  returns 500, never crashes the server), no version banner, opt-in rustls TLS.
+- **HTTP/1.1 and HTTP/2** — h2 over TLS via ALPN, h2c by prior knowledge in
+  plaintext, negotiated per connection.
+- **Correct HTTP** — automatic `HEAD` and `OPTIONS` (including `OPTIONS *`),
+  one `Allow` header that both `405` and `OPTIONS` agree on, conditional GET
+  (`ETag`/`Last-Modified`/`304`) and byte ranges (`206`/`416`) for static files.
+- **One URL per resource** — `PathPolicy` decides what happens to `//a` and
+  `/a//b`: refuse (default), `308` to the canonical form, or collapse. Silent
+  collapsing makes prefix-based auth checks bypassable and cache identity
+  ambiguous.
+- **Ambiguity is refused, not guessed** — a request carrying both
+  `Transfer-Encoding` and `Content-Length` gets `400` and the connection closed,
+  and a repeated query key on a scalar field is an error rather than a silent
+  first-or-last-wins.
+- **Borrow the ecosystem** — the `tower` feature runs any `tower::Service` as
+  middleware, so `tower-http`'s layers work without Churust reimplementing
+  them.
+- **Errors that carry** — implement `IntoError` on your own error type and `?`
+  works in handlers, without leaking its `Display` text to clients.
+- **Hard to misuse** — a missing static root or a duplicate route fails at
+  startup rather than silently at runtime; `secure_compare` for secrets.
 - **Fast, in-process tests** — `TestClient` drives the full pipeline without
   binding a socket.
 
@@ -105,6 +147,7 @@ Every Churust crate is released in lockstep on one version number, so
 | `churust-logging` | [docs.rs](https://docs.rs/churust-logging) | `CallLogging` plugin via `tracing` (feature `logging`). |
 | `churust-cors` | [docs.rs](https://docs.rs/churust-cors) | `Cors` plugin — preflight + headers (feature `cors`). |
 | `churust-auth` | [docs.rs](https://docs.rs/churust-auth) | `Auth` (Bearer/Basic/JWT) + `Principal<P>` (feature `auth`). |
+| `churust-lab` | [docs.rs](https://docs.rs/churust-lab) | Incubator. **Never reaches 1.0**; expect breaking changes on most releases. |
 
 Runnable examples:
 
@@ -136,7 +179,7 @@ async fn main() -> std::io::Result<()> {
         .state(Store { notes: Mutex::new(Vec::new()) })
         .install(CallLogging::new())
         .install(ContentNegotiation::new())  // renders errors as JSON
-        .install(Cors::permissive())
+        .install(Cors::new().allow_origin("http://localhost:3000"))
         .install(Auth::bearer(|token: String| async move {
             (token == "admin-token").then(|| Admin { name: "admin".into() })
         }))
@@ -233,9 +276,18 @@ churust = { version = "0.2", features = ["fs"] }
 A handler is an `async` closure/fn returning anything that implements
 `IntoResponse`. Arguments are **extractors**:
 
-- `FromCallParts` (borrow the request) — any position: `Path<T>`, `Query<T>`,
-  `State<T>`, `BearerToken`, `Principal<P>`.
-- `FromCall` (consume the body) — last argument only: `Json<T>`, `Call`.
+- `FromCallParts` (borrow the request head) — any position: `Path<T>`,
+  `Query<T>`, `Header<T, N>`, `State<T>`, `BearerToken`, `Principal<P>`.
+- `FromCall` (consume the body) — last argument only: `Json<T>`, `Form<T>`,
+  `Bytes`, `String`, `Payload`, `Multipart`, `Either<A, B>`, `Call`.
+
+The split is enforced by the compiler, not by convention: the body is a
+one-shot stream, so two body-consuming arguments do not compile. Every
+`FromCallParts` is also usable last.
+
+`Option<T>` works for any extractor implementing `OptionalFromCallParts`
+(`Query`, `Path`, `Header`, `BearerToken`). **Absent yields `None`; malformed is
+still an error** — so a typo'd query string does not quietly become a default.
 
 `Call` itself is the call-style base case (`|call: Call| ...`).
 
@@ -252,6 +304,12 @@ host = "0.0.0.0"
 port = 8080
 max_body_bytes = 1048576
 request_timeout_ms = 30000
+keep_alive_ms = 75000          # idle connections; 0 answers and closes
+max_connections = 25000        # connections served at once; 0 is unlimited
+max_tls_handshakes = 256       # much smaller: a handshake is asymmetric work
+tls_handshake_timeout_ms = 10000
+shutdown_timeout_ms = 30000    # bounded drain, so exit is never held hostage
+path_policy = "strict"         # strict | redirect | collapse
 
 [tls]            # requires the `tls` feature
 cert = "cert.pem"
@@ -299,8 +357,16 @@ Everything documented above works today:
 - **Streaming bodies** — the always-on `Body` type
 - **Static files** — `StaticFiles`, opt-in `fs` feature
 
-Deferred on purpose (YAGNI): sessions, response compression, HTTP/3,
-route-scoped middleware sugar. Want one of them? Make the case in
+**Not yet supported.** Response compression and HTTP/3, both deliberate. A
+Redis-backed session store, and a login/logout convenience layer over sessions.
+Multipart parsing runs over the buffered body rather than streaming, so a
+multipart upload is bounded by `max_body_bytes` — a plain body is not, via
+`Payload`.
+
+Those are tracked and ordered in
+[`docs/design/2026-07-25-roadmap-to-parity.md`](https://github.com/davthecoder/Churust/blob/main/docs/design/2026-07-25-roadmap-to-parity.md),
+which also says which are deliberate scope choices and which are simply not
+built yet. Want one sooner? Make the case in
 [Discussions](https://github.com/davthecoder/Churust/discussions/categories/ideas).
 
 Design specs live in

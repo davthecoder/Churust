@@ -201,23 +201,134 @@ struct LogMiddleware {
 
 #[async_trait]
 impl Middleware for LogMiddleware {
-    async fn handle(&self, call: Call, next: Next) -> Response {
+    async fn handle(&self, mut call: Call, next: Next) -> Response {
         let method = call.method().clone();
         let path = call.path().to_string();
+
+        // Continue an inbound trace when the caller supplied one, so a request
+        // crossing service boundaries keeps a single trace id. Otherwise start
+        // one, which is what makes correlation possible at all.
+        let id = RequestId::from_call(&call);
+        let trace_id = id.trace_id.clone();
+        let request_id = id.request_id.clone();
+        call.insert(id);
+
         let start = Instant::now();
-        let res = next.run(call).await;
+        let mut res = next.run(call).await;
         let latency_ms = start.elapsed().as_millis();
         let status = res.status.as_u16();
+
+        // Echo it back so a client can quote the id in a bug report.
+        if let Ok(v) = http::HeaderValue::from_str(&request_id) {
+            res.headers
+                .insert(http::header::HeaderName::from_static("x-request-id"), v);
+        }
+
         // tracing macros need a const level; branch on the configured level.
         match self.level {
-            Level::ERROR => tracing::error!(%method, path, status, latency_ms, "request"),
-            Level::WARN => tracing::warn!(%method, path, status, latency_ms, "request"),
-            Level::INFO => tracing::info!(%method, path, status, latency_ms, "request"),
-            Level::DEBUG => tracing::debug!(%method, path, status, latency_ms, "request"),
-            Level::TRACE => tracing::trace!(%method, path, status, latency_ms, "request"),
+            Level::ERROR => {
+                tracing::error!(%method, path, status, latency_ms, request_id, trace_id, "request")
+            }
+            Level::WARN => {
+                tracing::warn!(%method, path, status, latency_ms, request_id, trace_id, "request")
+            }
+            Level::INFO => {
+                tracing::info!(%method, path, status, latency_ms, request_id, trace_id, "request")
+            }
+            Level::DEBUG => {
+                tracing::debug!(%method, path, status, latency_ms, request_id, trace_id, "request")
+            }
+            Level::TRACE => {
+                tracing::trace!(%method, path, status, latency_ms, request_id, trace_id, "request")
+            }
         }
         res
     }
+}
+
+/// Correlation identifiers for one request.
+///
+/// Seeded by [`CallLogging`] and readable from a handler with
+/// [`Call::get`](churust_core::Call::get). The `x-request-id` response header
+/// carries the request id back to the client.
+///
+/// ```
+/// use churust_core::{Call, Churust, TestClient};
+/// use churust_logging::{CallLogging, RequestId};
+/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// let app = Churust::server()
+///     .install(CallLogging::new())
+///     .routing(|r| {
+///         r.get("/", |c: Call| async move {
+///             c.get::<RequestId>().map(|id| id.request_id).unwrap_or_default()
+///         });
+///     })
+///     .build();
+///
+/// let res = TestClient::new(app).get("/").send().await;
+/// assert!(!res.text().is_empty());
+/// assert_eq!(res.header("x-request-id"), Some(res.text().as_str()));
+/// # });
+/// ```
+#[derive(Debug, Clone)]
+pub struct RequestId {
+    /// Unique to this request.
+    pub request_id: String,
+    /// Shared by every request in the same distributed trace. Taken from an
+    /// inbound W3C `traceparent` when present.
+    pub trace_id: String,
+}
+
+impl RequestId {
+    fn from_call(call: &Call) -> Self {
+        // W3C traceparent: version-traceid-spanid-flags, e.g.
+        // 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+        let inbound = call.header("traceparent").and_then(|v| {
+            let parts: Vec<&str> = v.split('-').collect();
+            // Validate rather than trust: a malformed value must not become a
+            // trace id, or one bad caller poisons the whole correlation index.
+            (parts.len() >= 3
+                && parts[1].len() == 32
+                && parts[1].chars().all(|c| c.is_ascii_hexdigit())
+                && parts[1].chars().any(|c| c != '0'))
+            .then(|| parts[1].to_string())
+        });
+
+        Self {
+            request_id: gen_hex(16),
+            trace_id: inbound.unwrap_or_else(|| gen_hex(32)),
+        }
+    }
+}
+
+/// A hex identifier of `n` characters.
+///
+/// Deliberately not cryptographic and deliberately dependency-free: this is a
+/// correlation id, not a secret. Uniqueness comes from a nanosecond clock, a
+/// per-process counter and the pid, which is enough to keep log lines apart.
+fn gen_hex(n: usize) -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let pid = std::process::id() as u64;
+
+    let mut out = String::with_capacity(n);
+    let mut state = nanos ^ (seq.wrapping_mul(0x9E37_79B9_7F4A_7C15)) ^ (pid << 32);
+    while out.len() < n {
+        // xorshift64*, plenty for log correlation.
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        let v = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
+        out.push_str(&format!("{v:016x}"));
+    }
+    out.truncate(n);
+    out
 }
 
 #[cfg(test)]

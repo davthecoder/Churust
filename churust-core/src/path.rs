@@ -47,6 +47,104 @@ pub(crate) fn decode_path_segment(raw: &str) -> Option<String> {
     String::from_utf8(out).ok()
 }
 
+/// What to do when a request path is a non-canonical spelling of a route.
+///
+/// Interior empty segments — `//a`, `/a//b` — were once collapsed silently,
+/// which gave every resource several URLs. That is not a traversal problem, but
+/// it is an aliasing one, and aliases have teeth:
+///
+/// - Middleware, guards and proxy rules that key on a literal prefix
+///   (`path.starts_with("/admin")`) are bypassable with `//admin`.
+/// - Caches key on the URL, so one resource occupies several entries and an
+///   intermediary can disagree with the origin about identity.
+///
+/// A **trailing** slash is not treated as an alias — see
+/// [`canonical_path`] for why removing it would break directory listings.
+///
+/// Whatever the policy, `%2F` is never decoded into a separator: an encoded
+/// slash is data inside one segment, and decoding it early is how a
+/// normalisation change turns into a traversal bug.
+///
+/// ```
+/// use churust_core::{Churust, Call, PathPolicy, TestClient};
+/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// let app = Churust::server()
+///     .path_policy(PathPolicy::Redirect)
+///     .routing(|r| { r.get("/a", |_c: Call| async { "a" }); })
+///     .build();
+/// let res = TestClient::new(app).get("//a").send().await;
+/// assert_eq!(res.status(), http::StatusCode::PERMANENT_REDIRECT);
+/// assert_eq!(res.header("location"), Some("/a"));
+/// # });
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PathPolicy {
+    /// Refuse an alias: `//a` is not `/a`, and gets `404`.
+    ///
+    /// The default. Fewest surprises and the strongest cache identity — one
+    /// resource, one URL.
+    #[default]
+    Strict,
+    /// Redirect an alias to its canonical form with `308 Permanent Redirect`.
+    ///
+    /// Kind to hand-typed and hand-written URLs. `308` rather than `301` so a
+    /// `POST` stays a `POST`; `301` permits a client to retry as `GET`, which
+    /// silently drops the body.
+    Redirect,
+    /// Collapse aliases silently, serving them as if canonical.
+    ///
+    /// The pre-`PathPolicy` behaviour, kept so an application with
+    /// alias-shaped links has somewhere to stand while it fixes them. It
+    /// creates URL aliases by design; prefer `Strict` or `Redirect`.
+    Collapse,
+}
+
+/// The canonical spelling of `path`, or `None` if it is already canonical.
+///
+/// Canonical means no *interior* empty segments — no repeated slashes.
+///
+/// **A trailing slash is deliberately left alone.** It is not merely
+/// cosmetic: it distinguishes a directory from a file. A listing served at
+/// `/files/` emits bare relative links (`<a href="a.txt">`), which a browser
+/// resolves against the trailing slash; the same markup at `/files` would
+/// resolve to `/a.txt`. Rather than pick a spelling here, `StaticFiles`
+/// redirects a directory URL that lacks the slash (`308`), so there is still
+/// exactly one URL per directory — this policy just is not the thing enforcing
+/// it.
+///
+/// Interior slashes carry no such meaning, and they are the ones with teeth:
+/// `//admin` is what slips past a `path.starts_with("/admin")` check.
+///
+/// ```
+/// use churust_core::path::canonical_path;
+///
+/// assert_eq!(canonical_path("/a/b"), None);              // already canonical
+/// assert_eq!(canonical_path("/"), None);                 // the root
+/// assert_eq!(canonical_path("/a/"), None);               // trailing slash is significant
+/// assert_eq!(canonical_path("//a//b").as_deref(), Some("/a/b"));
+/// assert_eq!(canonical_path("//a//b/").as_deref(), Some("/a/b/"));
+/// ```
+pub fn canonical_path(path: &str) -> Option<String> {
+    // The overwhelmingly common case, checked first so ordinary requests never
+    // allocate.
+    if !path.contains("//") {
+        return None;
+    }
+    let trailing = path.len() > 1 && path.ends_with('/');
+    let joined: String = path
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("/");
+    Some(match (joined.is_empty(), trailing) {
+        // `//` and `///` all mean the root.
+        (true, _) => "/".to_string(),
+        (false, true) => format!("/{joined}/"),
+        (false, false) => format!("/{joined}"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

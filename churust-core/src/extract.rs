@@ -77,10 +77,99 @@ pub trait FromCall: Sized + Send {
 }
 
 /// Any parts extractor can also be the final argument.
+///
+/// `do_not_recommend`: when a *body* extractor is wrongly placed in a leading
+/// position, rustc would otherwise suggest implementing `FromCallParts` for it
+/// — which is the one thing that must not happen, since it would let the body
+/// be consumed twice.
 #[async_trait]
+#[diagnostic::do_not_recommend]
 impl<T: FromCallParts> FromCall for T {
     async fn from_call(mut call: Call) -> Result<Self> {
         T::from_call_parts(&mut call).await
+    }
+}
+
+/// An extractor that can distinguish *absent* from *malformed*.
+///
+/// Implement this and `Option<Self>` becomes usable as a handler argument. That
+/// is the whole design: one trait rather than a parallel `OptionalQuery`,
+/// `OptionalPath`, `OptionalHeader` type per extractor. The parallel-type
+/// approach doubles the API surface and its documentation, and it is the design
+/// axum-extra shipped, deprecated, and replaced with exactly this.
+///
+/// **`Ok(None)` means the input was not supplied. It does not mean extraction
+/// failed.** A malformed value must still be an `Err`, or a typo'd query string
+/// becomes a silent `None` and the handler quietly does the wrong thing with a
+/// default. The distinction is the reason the trait exists — without it,
+/// `Option<T>` could only ever mean "swallow every error".
+///
+/// ```
+/// use churust_core::{Churust, Query, TestClient};
+/// use serde::Deserialize;
+/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// #[derive(Deserialize)]
+/// struct Pager { page: u32 }
+///
+/// let app = Churust::server()
+///     .routing(|r| {
+///         r.get("/list", |p: Option<Query<Pager>>| async move {
+///             match p {
+///                 Some(Query(p)) => format!("page {}", p.page),
+///                 None => "unpaged".to_string(),
+///             }
+///         });
+///     })
+///     .build();
+/// let client = TestClient::new(app);
+/// assert_eq!(client.get("/list?page=2").send().await.text(), "page 2");
+/// assert_eq!(client.get("/list").send().await.text(), "unpaged");
+/// # });
+/// ```
+#[async_trait]
+pub trait OptionalFromCallParts: Sized + Send {
+    /// Build `Self`, or `Ok(None)` when the input is absent. Reserve `Err` for
+    /// input that was supplied and is wrong.
+    async fn from_call_parts_opt(call: &mut Call) -> Result<Option<Self>>;
+}
+
+/// `Option<T>` extracts wherever `T` opts into [`OptionalFromCallParts`].
+#[async_trait]
+impl<T: OptionalFromCallParts> FromCallParts for Option<T> {
+    async fn from_call_parts(call: &mut Call) -> Result<Self> {
+        T::from_call_parts_opt(call).await
+    }
+}
+
+/// Absent means no query string at all. A query string that is present but does
+/// not fit `T` is an error: the caller tried and got it wrong, which is not the
+/// same as not trying.
+#[async_trait]
+impl<T> OptionalFromCallParts for Query<T>
+where
+    T: DeserializeOwned + Send,
+{
+    async fn from_call_parts_opt(call: &mut Call) -> Result<Option<Self>> {
+        if call.query_string().is_empty() {
+            return Ok(None);
+        }
+        Query::<T>::from_call_parts(call).await.map(Some)
+    }
+}
+
+/// Absent means the route captured no parameters. A parameter that is present
+/// but does not parse into `T` is an error — reporting `None` there would claim
+/// the URL had no such parameter at all.
+#[async_trait]
+impl<T> OptionalFromCallParts for Path<T>
+where
+    T: DeserializeOwned + Send,
+{
+    async fn from_call_parts_opt(call: &mut Call) -> Result<Option<Self>> {
+        if call.params().is_empty() {
+            return Ok(None);
+        }
+        Path::<T>::from_call_parts(call).await.map(Some)
     }
 }
 
@@ -125,25 +214,29 @@ pub struct Path<T>(
 #[async_trait]
 impl<T> FromCallParts for Path<T>
 where
-    T: std::str::FromStr + Send,
-    T::Err: std::fmt::Display,
+    T: serde::de::DeserializeOwned + Send,
 {
     async fn from_call_parts(call: &mut Call) -> Result<Self> {
-        let mut params = call.params_iter();
-        let (_name, raw) = params
-            .next()
-            .ok_or_else(|| Error::bad_request("no path parameter to extract"))?;
-        let value = raw
-            .parse::<T>()
-            .map_err(|e| Error::bad_request(format!("bad path param: {e}")))?;
-        Ok(Path(value))
+        crate::path_de::from_params::<T>(call.params())
+            .map(Path)
+            .map_err(|e| Error::bad_request(format!("bad path parameters: {e}")))
     }
 }
 
-/// Deserializes the URL query string into `T` via `serde_urlencoded`.
+/// Deserializes the URL query string into `T`.
 ///
 /// `T` must implement [`serde::Deserialize`]. Missing required fields or
 /// otherwise malformed query strings fail with `400 Bad Request`.
+///
+/// A repeated key fills a `Vec<T>` field: `?tag=a&tag=b` deserializes into
+/// `Vec<String>`, which is what `<select multiple>` and a repeated checkbox
+/// send.
+///
+/// A key repeated against a *scalar* field is **rejected**, not resolved.
+/// Browsers take the last occurrence and some servers take the first, so
+/// picking a winner silently means a proxy and an origin can disagree about
+/// what the request said. Declare the field as `Vec<T>` to accept repetition
+/// deliberately.
 ///
 /// ```
 /// use churust_core::{Churust, Query, TestClient};
@@ -176,7 +269,7 @@ where
 {
     async fn from_call_parts(call: &mut Call) -> Result<Self> {
         let q = call.query_string();
-        let value = serde_urlencoded::from_str::<T>(q)
+        let value = serde_html_form::from_str::<T>(q)
             .map_err(|e| Error::bad_request(format!("invalid query string: {e}")))?;
         Ok(Query(value))
     }
@@ -273,11 +366,372 @@ impl FromCallParts for BearerToken {
                 "missing Authorization header",
             )
         })?;
+        // RFC 7235 §2.1 makes the auth scheme case-insensitive. Matching the
+        // two literals `Bearer ` and `bearer ` rejected `BEARER `, which real
+        // clients do send, with a 401 for a perfectly valid credential.
         let token = raw
-            .strip_prefix("Bearer ")
-            .or_else(|| raw.strip_prefix("bearer "))
+            .split_once(' ')
+            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+            .map(|(_, token)| token)
             .ok_or_else(|| Error::new(http::StatusCode::UNAUTHORIZED, "expected Bearer scheme"))?;
         Ok(BearerToken(token.trim().to_string()))
+    }
+}
+
+/// Absent means no `Authorization` header. A header that is present but is not
+/// a Bearer credential stays a `401`: the client did attempt to authenticate,
+/// and treating a malformed scheme as "anonymous" is how an auth check gets
+/// skipped by accident.
+#[async_trait]
+impl OptionalFromCallParts for BearerToken {
+    async fn from_call_parts_opt(call: &mut Call) -> Result<Option<Self>> {
+        if call.header("authorization").is_none() {
+            return Ok(None);
+        }
+        BearerToken::from_call_parts(call).await.map(Some)
+    }
+}
+
+/// Extracts a single named header, parsed into `T`.
+///
+/// The name is supplied by a type implementing [`HeaderName`], so the header a
+/// handler reads is part of its signature rather than a string repeated at the
+/// call site.
+///
+/// ```
+/// use churust_core::{Churust, Header, HeaderName, TestClient};
+/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// struct ApiVersion;
+/// impl HeaderName for ApiVersion {
+///     const NAME: &'static str = "x-api-version";
+/// }
+///
+/// let app = Churust::server()
+///     .routing(|r| {
+///         r.get("/", |Header(v, _): Header<u32, ApiVersion>| async move {
+///             format!("v{v}")
+///         });
+///     })
+///     .build();
+///
+/// let res = TestClient::new(app).get("/").header("x-api-version", "2").send().await;
+/// assert_eq!(res.text(), "v2");
+/// # });
+/// ```
+///
+/// Fails with `400 Bad Request` when the header is absent or does not parse
+/// into `T`. For an optional header, use `Header<Option<T>, N>`, or read it
+/// directly with [`Call::header`](crate::Call::header).
+///
+/// # Why a marker type
+///
+/// The v1 design named `Header<T>` without saying which header it reads. A
+/// const string parameter is not expressible on stable Rust, deserializing the
+/// whole header map would silently accept junk, and a `headers`-crate typed
+/// trait would pull in a dependency for a small win. A marker type keeps the
+/// name in the type system, costs nothing at runtime, and needs no dependency.
+pub struct Header<T, N: HeaderName>(
+    /// The parsed header value.
+    pub T,
+    /// Zero-sized marker naming the header. Ignore it.
+    pub std::marker::PhantomData<N>,
+);
+
+/// Names the header that a [`Header`] extractor reads.
+pub trait HeaderName: Send + Sync + 'static {
+    /// The header name, lower-case.
+    const NAME: &'static str;
+}
+
+#[async_trait]
+impl<T, N> FromCallParts for Header<T, N>
+where
+    T: std::str::FromStr + Send,
+    T::Err: std::fmt::Display,
+    N: HeaderName,
+{
+    async fn from_call_parts(call: &mut Call) -> Result<Self> {
+        let raw = call
+            .header(N::NAME)
+            .ok_or_else(|| Error::bad_request(format!("missing header `{}`", N::NAME)))?;
+        raw.parse::<T>()
+            .map(|v| Header(v, std::marker::PhantomData))
+            .map_err(|e| Error::bad_request(format!("bad header `{}`: {e}", N::NAME)))
+    }
+}
+
+/// Absent means the header was not sent. A header that was sent but does not
+/// parse into `T` is an error, since the client did state a value.
+#[async_trait]
+impl<T, N> OptionalFromCallParts for Header<T, N>
+where
+    T: std::str::FromStr + Send,
+    T::Err: std::fmt::Display,
+    N: HeaderName,
+{
+    async fn from_call_parts_opt(call: &mut Call) -> Result<Option<Self>> {
+        if call.header(N::NAME).is_none() {
+            return Ok(None);
+        }
+        Header::<T, N>::from_call_parts(call).await.map(Some)
+    }
+}
+
+/// The raw request body as text.
+///
+/// Fails with `400 Bad Request` if the body is not valid UTF-8. For bytes that
+/// may not be text, extract [`Bytes`](bytes::Bytes) instead.
+#[async_trait]
+impl FromCall for String {
+    async fn from_call(mut call: Call) -> Result<Self> {
+        let b = call.try_receive_bytes().await?;
+        check_body_limit(&call, b.len())?;
+        String::from_utf8(b.to_vec())
+            .map_err(|_| Error::bad_request("request body is not valid UTF-8"))
+    }
+}
+
+/// The raw request body as bytes.
+#[async_trait]
+impl FromCall for bytes::Bytes {
+    async fn from_call(mut call: Call) -> Result<Self> {
+        let b = call.try_receive_bytes().await?;
+        check_body_limit(&call, b.len())?;
+        Ok(b)
+    }
+}
+
+/// Accept one of two extractors, whichever succeeds.
+///
+/// The usual case is an endpoint that takes either JSON or a form:
+///
+/// ```
+/// use churust_core::{Churust, Either, Form, TestClient};
+/// use serde::Deserialize;
+/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// #[derive(Deserialize)]
+/// struct Note { text: String }
+///
+/// let app = Churust::server()
+///     .routing(|r| {
+///         r.post("/notes", |body: Either<Form<Note>, String>| async move {
+///             match body {
+///                 Either::Left(Form(n)) => format!("form: {}", n.text),
+///                 Either::Right(raw) => format!("raw: {raw}"),
+///             }
+///         });
+///     })
+///     .build();
+///
+/// let res = TestClient::new(app)
+///     .post("/notes")
+///     .header("content-type", "application/x-www-form-urlencoded")
+///     .body("text=hi")
+///     .send()
+///     .await;
+/// assert_eq!(res.text(), "form: hi");
+/// # });
+/// ```
+///
+/// `Left` is tried first. If it fails, the call is handed to `Right` — which is
+/// why the call is cloned rather than moved: a failed first attempt must not
+/// have consumed the body. When both fail, the **second** error is reported,
+/// since the right-hand side is the fallback and its complaint is usually the
+/// more informative one.
+pub enum Either<L, R> {
+    /// The first extractor succeeded.
+    Left(L),
+    /// The first failed and the second succeeded.
+    Right(R),
+}
+
+#[async_trait]
+impl<L, R> FromCall for Either<L, R>
+where
+    L: FromCall,
+    R: FromCall,
+{
+    async fn from_call(call: Call) -> Result<Self> {
+        // The body can only be read once, so buffer it up front and give each
+        // attempt its own copy.
+        let mut call = call;
+        let body = call.try_receive_bytes().await?;
+
+        let left_call = call.clone_with_body(body.clone());
+        if let Ok(l) = L::from_call(left_call).await {
+            return Ok(Either::Left(l));
+        }
+        R::from_call(call.clone_with_body(body))
+            .await
+            .map(Either::Right)
+    }
+}
+
+/// The request body as a stream, without buffering it.
+///
+/// Consumes the body, so it must be the last handler argument. Use this for a
+/// large upload that should not be held in memory — the counterpart to
+/// [`Json<T>`](../churust_json/index.html) and [`Form<T>`], which buffer.
+///
+/// ```
+/// use churust_core::{Churust, Payload, TestClient};
+/// use futures_util::StreamExt;
+/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// let app = Churust::server()
+///     .routing(|r| {
+///         r.post("/count", |Payload(mut body): Payload| async move {
+///             let mut n = 0usize;
+///             while let Some(Ok(chunk)) = body.next().await {
+///                 n += chunk.len();
+///             }
+///             format!("{n} bytes")
+///         });
+///     })
+///     .build();
+///
+/// let res = TestClient::new(app).post("/count").body("hello").send().await;
+/// assert_eq!(res.text(), "5 bytes");
+/// # });
+/// ```
+///
+/// Both the server-wide `max_body_bytes` and any per-route
+/// [`max_body_bytes`](crate::RouteBuilder::max_body_bytes) apply. Because the
+/// response may already have begun, exceeding either arrives as an error item
+/// in the stream rather than as a `413` — propagate it with `?` to turn it back
+/// into the right status.
+///
+/// The stream is bounded; **collecting it into memory is your allocation, not
+/// the framework's**. A handler that gathers the whole body allocates up to
+/// whichever limit is tighter, so tighten the route where a large ceiling was
+/// raised for some other route's benefit.
+pub struct Payload(
+    /// The body's chunks.
+    pub crate::call::BodyStream,
+);
+
+#[async_trait]
+impl FromCall for Payload {
+    async fn from_call(mut call: Call) -> Result<Self> {
+        let route_limit = call.get::<RouteBodyLimit>().map(|RouteBodyLimit(n)| n);
+        // An absent body is an empty stream rather than an error: a POST with
+        // no body is a legitimate request, not a malformed one.
+        let stream = call
+            .body_stream()
+            .unwrap_or_else(|| Box::pin(futures_util::stream::empty()));
+
+        let Some(max) = route_limit else {
+            // No route cap: the engine's server-wide `Limited` is the only
+            // bound, and it is already wrapped around this stream.
+            return Ok(Payload(stream));
+        };
+
+        // The engine enforces the server-wide cap before the stream is built,
+        // so this only ever *tightens*. Counting here rather than collecting
+        // keeps the streaming property: a body is refused at the byte that
+        // crosses the line, not after it has all been read.
+        use futures_util::StreamExt;
+        let mut seen = 0usize;
+        let counted = stream.map(move |chunk| match chunk {
+            Ok(bytes) => {
+                seen += bytes.len();
+                if seen > max {
+                    Err(Error::new(
+                        http::StatusCode::PAYLOAD_TOO_LARGE,
+                        "request body too large",
+                    ))
+                } else {
+                    Ok(bytes)
+                }
+            }
+            Err(e) => Err(e),
+        });
+        Ok(Payload(Box::pin(counted)))
+    }
+}
+
+/// A per-route body cap, seeded into the call by
+/// [`RouteBuilder::max_body_bytes`](crate::RouteBuilder::max_body_bytes).
+#[derive(Debug, Clone, Copy)]
+pub struct RouteBodyLimit(pub usize);
+
+/// Reject a body larger than the route's cap, if it set one.
+///
+/// Body extractors call this after reading. Public so plugin crates such as
+/// `churust-json` can honour the same per-route configuration.
+pub fn check_body_limit(call: &Call, len: usize) -> Result<()> {
+    match call.get::<RouteBodyLimit>() {
+        Some(RouteBodyLimit(max)) if len > max => Err(Error::new(
+            http::StatusCode::PAYLOAD_TOO_LARGE,
+            "request body too large",
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Deserializes an `application/x-www-form-urlencoded` request body into `T`.
+///
+/// The body counterpart to [`Query<T>`], and the classic HTML form POST. Like
+/// [`Json<T>`](../churust_json/index.html) it consumes the body, so it must be
+/// the last handler argument.
+///
+/// Fails with `415 Unsupported Media Type` when the content type is not
+/// `application/x-www-form-urlencoded`, and `400 Bad Request` when the body
+/// does not deserialize into `T`.
+///
+/// Note `+` means a space here — this is form encoding. In a *path* segment `+`
+/// is a literal plus, which is why path decoding uses its own decoder.
+///
+/// ```
+/// use churust_core::{Churust, Form, TestClient};
+/// use serde::Deserialize;
+/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// #[derive(Deserialize)]
+/// struct Login { user: String }
+///
+/// let app = Churust::server()
+///     .routing(|r| {
+///         r.post("/login", |Form(l): Form<Login>| async move { l.user });
+///     })
+///     .build();
+///
+/// let res = TestClient::new(app)
+///     .post("/login")
+///     .header("content-type", "application/x-www-form-urlencoded")
+///     .body("user=ana")
+///     .send()
+///     .await;
+/// assert_eq!(res.text(), "ana");
+/// # });
+/// ```
+pub struct Form<T>(
+    /// The deserialized form body.
+    pub T,
+);
+
+#[async_trait]
+impl<T> FromCall for Form<T>
+where
+    T: DeserializeOwned + Send,
+{
+    async fn from_call(mut call: Call) -> Result<Self> {
+        let ct = call
+            .header(http::header::CONTENT_TYPE.as_str())
+            .unwrap_or("")
+            .to_string();
+        // Compare only the media type: a charset parameter is legitimate.
+        let media = ct.split(';').next().unwrap_or("").trim();
+        if !media.eq_ignore_ascii_case("application/x-www-form-urlencoded") {
+            return Err(Error::new(
+                http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "expected application/x-www-form-urlencoded",
+            ));
+        }
+
+        let body = call.try_receive_bytes().await?;
+        check_body_limit(&call, body.len())?;
+        serde_html_form::from_bytes::<T>(&body)
+            .map(Form)
+            .map_err(|e| Error::bad_request(format!("invalid form body: {e}")))
     }
 }
 
@@ -320,12 +774,10 @@ mod tests {
         assert_eq!(back.method(), &Method::GET);
     }
 
-    use std::collections::HashMap;
-
     #[tokio::test]
     async fn path_extracts_single_param() {
         let mut c = call();
-        let mut p = HashMap::new();
+        let mut p = crate::call::Params::new();
         p.insert("id".to_string(), "42".to_string());
         c.set_params(p);
         let Path(id) = Path::<u64>::from_call_parts(&mut c).await.unwrap();
@@ -335,7 +787,7 @@ mod tests {
     #[tokio::test]
     async fn path_bad_value_is_400() {
         let mut c = call();
-        let mut p = HashMap::new();
+        let mut p = crate::call::Params::new();
         p.insert("id".to_string(), "notnum".to_string());
         c.set_params(p);
         let err = Path::<u64>::from_call_parts(&mut c).await.unwrap_err();

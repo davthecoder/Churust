@@ -17,7 +17,7 @@
 //!
 //! # tokio::runtime::Runtime::new().unwrap().block_on(async {
 //! let app = Churust::server()
-//!     .install(Cors::permissive())
+//!     .install(Cors::allow_any_origin_insecure())
 //!     .routing(|r| {
 //!         r.get("/api/data", |_c: Call| async { "hello" });
 //!     })
@@ -122,7 +122,7 @@ impl Cors {
     ///
     /// > **Note:** Per the CORS specification, `Access-Control-Allow-Origin: *`
     /// > cannot be combined with `Access-Control-Allow-Credentials: true`.
-    /// > Therefore `permissive()` intentionally leaves credentials **disabled**.
+    /// > Therefore `allow_any_origin_insecure()` intentionally leaves credentials **disabled**.
     /// > If your application needs cookies or HTTP authentication on cross-origin
     /// > requests, use [`Cors::new`] with an explicit origin list and call
     /// > [`.allow_credentials(true)`](Cors::allow_credentials).
@@ -135,7 +135,7 @@ impl Cors {
     ///
     /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
     /// let app = Churust::server()
-    ///     .install(Cors::permissive())
+    ///     .install(Cors::allow_any_origin_insecure())
     ///     .routing(|r| {
     ///         r.get("/", |_c: Call| async { "hello" });
     ///     })
@@ -150,7 +150,26 @@ impl Cors {
     /// assert_eq!(res.header("access-control-allow-origin"), Some("*"));
     /// # });
     /// ```
+    #[deprecated(
+        since = "0.3.0",
+        note = "renamed to `allow_any_origin_insecure`, which says what it does. \
+                This reflects every origin, so any site can read authenticated \
+                responses from your API when credentials are not required."
+    )]
     pub fn permissive() -> Self {
+        Self::allow_any_origin_insecure()
+    }
+
+    /// Allow **every** origin, method and header.
+    ///
+    /// The name is deliberately uncomfortable. This reflects any origin, so if
+    /// your API answers requests based on an ambient credential — a cookie, a
+    /// bearer token a browser extension replays, an IP allowlist — any website
+    /// a user visits can read those responses.
+    ///
+    /// It is genuinely fine for a public, unauthenticated, read-only API, and
+    /// convenient in local development. It is not a default.
+    pub fn allow_any_origin_insecure() -> Self {
         Self {
             origin: AllowOrigin::Any,
             methods: vec![
@@ -556,7 +575,7 @@ mod tests {
 
     fn app() -> App {
         Churust::server()
-            .install(Cors::permissive())
+            .install(Cors::allow_any_origin_insecure())
             .routing(|r| {
                 r.get("/", |_c: Call| async { "ok" });
             })

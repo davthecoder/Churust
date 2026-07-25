@@ -138,6 +138,18 @@ impl Response {
         self
     }
 
+    /// Append a `Set-Cookie` header.
+    ///
+    /// Appends rather than replaces, so several cookies each get their own
+    /// header — which is what the spec requires; folding them into one comma-
+    /// separated value does not work in practice.
+    pub fn with_cookie(mut self, cookie: crate::cookie::Cookie) -> Self {
+        if let Ok(v) = HeaderValue::from_str(&cookie.to_header_value()) {
+            self.headers.append(http::header::SET_COOKIE, v);
+        }
+        self
+    }
+
     /// Insert (or replace) a header, returning `self` for chaining.
     ///
     /// ```

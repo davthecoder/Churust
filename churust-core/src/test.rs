@@ -184,6 +184,13 @@ impl TestResponse {
     pub fn status(&self) -> StatusCode {
         self.status
     }
+    /// The full response header map, for headers that may appear more than
+    /// once — `Set-Cookie` above all, which must never be folded into one
+    /// comma-separated value.
+    pub fn headers(&self) -> &http::HeaderMap {
+        &self.headers
+    }
+
     /// The value of response header `name` as a string, or `None` if absent or
     /// not valid UTF-8. Matching is case-insensitive.
     pub fn header(&self, name: &str) -> Option<&str> {

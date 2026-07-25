@@ -134,6 +134,10 @@ pub use churust_core::ws;
 #[cfg(feature = "fs")]
 pub use churust_core::fs;
 
+/// `multipart/form-data` bodies. Enabled by the `multipart` feature.
+#[cfg(feature = "multipart")]
+pub use churust_core::multipart;
+
 /// Authentication plugin crate (`Auth`, `Principal<P>`). Enabled by the `auth`
 /// feature.
 #[cfg(feature = "auth")]
@@ -159,9 +163,9 @@ pub use churust_logging as logging;
 pub mod prelude {
     pub use crate::main; // #[churust::main]
     pub use churust_core::{
-        App, AppBuilder, BearerToken, Call, Churust, Config, Error, FromCall, FromCallParts,
-        IntoHandler, IntoResponse, Middleware, Next, Path, Plugin, Query, Response, Result, Router,
-        State,
+        App, AppBuilder, BearerToken, Call, Churust, Config, Cookie, Error, FromCall,
+        FromCallParts, IntoHandler, IntoResponse, Middleware, Next, Path, Plugin, Query, Response,
+        Result, Router, SameSite, Session, Sessions, State,
     };
     pub use http::{Method, StatusCode};
 
@@ -169,12 +173,14 @@ pub mod prelude {
     pub use churust_auth::{Auth, Principal};
     #[cfg(feature = "fs")]
     pub use churust_core::fs::StaticFiles;
+    #[cfg(feature = "multipart")]
+    pub use churust_core::multipart::{Multipart, Part};
     #[cfg(feature = "ws")]
     pub use churust_core::ws::{Message as WsMessage, WebSocket, WebSocketUpgrade};
     #[cfg(feature = "cors")]
     pub use churust_cors::Cors;
     #[cfg(feature = "json")]
-    pub use churust_json::{ContentNegotiation, Json};
+    pub use churust_json::{CallJson, ContentNegotiation, Json};
     #[cfg(feature = "logging")]
-    pub use churust_logging::CallLogging;
+    pub use churust_logging::{CallLogging, RequestId};
 }

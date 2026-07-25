@@ -69,6 +69,15 @@ use crate::extract::{FromCall, FromCallParts};
 /// `Handler` via [`IntoHandler`] (see below). This trait is `pub` only because
 /// it appears in the bound of `IntoHandler`/the router's method builders; it is
 /// intentionally NOT re-exported from the crate root.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` is not a Churust handler",
+    label = "not a handler",
+    note = "a handler is an `async fn` or a closure returning a future, taking up to 8 arguments",
+    note = "every argument except the last must implement `FromCallParts` (it sees only the request head)",
+    note = "the last argument may implement `FromCall` and consume the body — `Json`, `Form`, `Bytes`, `String`, `Payload`, `Multipart`, `Either`",
+    note = "two body-consuming arguments cannot compile: the body is a one-shot stream",
+    note = "the return type must implement `IntoResponse`"
+)]
 pub trait HandlerFn<Marker>: Clone + Send + Sync + 'static {
     /// Run the closure against the call: extract each argument from the call in
     /// order, then invoke the closure and convert its return value into a
@@ -168,7 +177,7 @@ where
 
 impl<Marker, H> Handler for HandlerFnAdapter<Marker, H>
 where
-    Marker: Send + Sync + 'static,
+    Marker: 'static,
     H: HandlerFn<Marker>,
 {
     fn handle(&self, call: Call) -> HandlerFuture {
@@ -183,6 +192,14 @@ where
 /// - extractor closures (`HandlerFn<Marker>`) wrap into a `HandlerFnAdapter`;
 /// - anything already implementing `Handler` (including a `BoxHandler`) passes
 ///   through unchanged.
+#[diagnostic::on_unimplemented(
+    message = "`{Self}` cannot be used as a route handler",
+    label = "not a valid handler",
+    note = "check each argument: all but the last must implement `FromCallParts`, and only the last may consume the body",
+    note = "a body-consuming extractor (`Json`, `Form`, `Bytes`, `String`, `Payload`, `Multipart`, `Either`) must come last, and there can be only one",
+    note = "`Option<T>` works where `T` implements `OptionalFromCallParts`",
+    note = "the closure's return type must implement `IntoResponse`; `Result<T, E>` works when both `T: IntoResponse` and `E: IntoError`"
+)]
 pub trait IntoHandler<Marker> {
     /// The concrete [`Handler`] type this value converts into.
     type Handler: Handler;
@@ -195,6 +212,11 @@ pub trait IntoHandler<Marker> {
 #[doc(hidden)]
 pub struct IsHandler;
 
+// Without this, a closure that fails its bounds is reported against the
+// pass-through impl — "the trait `Handler` is not implemented for
+// `{closure}`" — which sends the reader to implement `Handler` by hand rather
+// than to the argument that is actually wrong.
+#[diagnostic::do_not_recommend]
 impl<H: Handler> IntoHandler<IsHandler> for H {
     type Handler = H;
     fn into_handler(self) -> H {
@@ -207,7 +229,7 @@ impl<H: Handler> IntoHandler<IsHandler> for H {
 /// implement `Handler` directly, so no closure can match both impls).
 impl<Marker, H> IntoHandler<(IsHandler, Marker)> for H
 where
-    Marker: Send + Sync + 'static,
+    Marker: 'static,
     H: HandlerFn<Marker>,
 {
     type Handler = HandlerFnAdapter<Marker, H>;

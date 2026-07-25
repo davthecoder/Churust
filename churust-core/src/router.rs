@@ -9,6 +9,55 @@ use crate::handler::{boxed, BoxHandler, IntoHandler};
 use http::Method;
 use std::collections::HashMap;
 
+/// Render an `Allow` header value from the methods explicitly registered for a
+/// path, adding the ones the dispatcher answers implicitly.
+///
+/// The single source of truth for `Allow`, whichever response carries it. RFC
+/// 9110 §15.5.6 (`405`) and §9.3.7 (`OPTIONS`) describe the same fact about the
+/// same resource, and generating it in two places is how they came to disagree:
+/// a path with one `GET` route told `OPTIONS` it supported `GET, HEAD, OPTIONS`
+/// and simultaneously told a `DELETE` that it supported only `GET`.
+///
+/// Returns `None` when nothing is registered — an empty `Allow` tells a client
+/// nothing, and the right answer there is `404` rather than `405`.
+///
+/// ```
+/// use churust_core::router::allow_header_value;
+/// use http::Method;
+///
+/// // A GET route also answers HEAD and OPTIONS.
+/// assert_eq!(allow_header_value(vec![Method::GET]).as_deref(), Some("GET, HEAD, OPTIONS"));
+/// // Without a GET there is no HEAD to synthesize.
+/// assert_eq!(allow_header_value(vec![Method::POST]).as_deref(), Some("OPTIONS, POST"));
+/// assert_eq!(allow_header_value(vec![]), None);
+/// ```
+pub fn allow_header_value(mut methods: Vec<Method>) -> Option<String> {
+    if methods.is_empty() {
+        return None;
+    }
+    // RFC 9110 §9.3.2: HEAD is available wherever GET is, and the dispatcher
+    // synthesizes it. Advertising it where there is no GET would be a promise
+    // the server cannot keep.
+    if methods.contains(&Method::GET) && !methods.contains(&Method::HEAD) {
+        methods.push(Method::HEAD);
+    }
+    // The dispatcher answers OPTIONS for any path that has any route.
+    if !methods.contains(&Method::OPTIONS) {
+        methods.push(Method::OPTIONS);
+    }
+    // Sorted so the header is deterministic: two responses describing one
+    // resource should be byte-identical, and tests can compare them directly.
+    methods.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    methods.dedup();
+    Some(
+        methods
+            .iter()
+            .map(Method::as_str)
+            .collect::<Vec<_>>()
+            .join(", "),
+    )
+}
+
 /// The outcome of routing a `(method, path)` pair against the [`Router`].
 ///
 /// Returned by [`Router::route`]. The framework translates each variant into a
@@ -18,17 +67,22 @@ use std::collections::HashMap;
 ///
 /// ```
 /// use churust_core::{boxed, Call, IntoHandler, Router, Match};
+/// # use bytes::Bytes;
+/// # use http::HeaderMap;
+/// # fn probe(p: &str) -> Call {
+/// #     Call::new(Method::GET, p.parse().unwrap(), HeaderMap::new(), Bytes::new())
+/// # }
 /// use http::Method;
 ///
 /// let mut router = Router::new();
 /// router.add(Method::GET, "/users/{id}", boxed((|_c: Call| async { "ok" }).into_handler()));
 ///
-/// match router.route(&Method::GET, "/users/7") {
+/// match router.route(&Method::GET, "/users/7", &probe("/users/7")) {
 ///     Match::Found { params, .. } => assert_eq!(params.get("id").unwrap(), "7"),
 ///     _ => panic!("expected a match"),
 /// }
-/// assert!(matches!(router.route(&Method::GET, "/nope"), Match::NotFound));
-/// assert!(matches!(router.route(&Method::POST, "/users/7"), Match::MethodNotAllowed { .. }));
+/// assert!(matches!(router.route(&Method::GET, "/nope", &probe("/nope")), Match::NotFound));
+/// assert!(matches!(router.route(&Method::POST, "/users/7", &probe("/users/7")), Match::MethodNotAllowed { .. }));
 /// ```
 ///
 /// Marked `#[non_exhaustive]`: a `match` on this enum outside `churust-core`
@@ -42,7 +96,7 @@ pub enum Match {
         /// The handler registered for this `(path, method)`.
         handler: BoxHandler,
         /// The captured path parameters, keyed by name.
-        params: HashMap<String, String>,
+        params: crate::call::Params,
     },
     /// The path matched a route, but not for this method. `allow` lists the
     /// methods that *are* registered (used to build the `Allow` header).
@@ -66,8 +120,58 @@ struct Node {
     handlers: BoxHandlers,
 }
 
+/// One registered route: a handler plus the guards that must pass for it to
+/// serve. Several may share a method; the first whose guards pass wins.
+struct Candidate {
+    guards: Vec<crate::guard::BoxGuard>,
+    handler: BoxHandler,
+}
+
 #[derive(Default)]
-struct BoxHandlers(HashMap<Method, BoxHandler>);
+struct BoxHandlers(HashMap<Method, Vec<Candidate>>);
+
+impl BoxHandlers {
+    /// The first candidate whose guards all pass.
+    fn pick(&self, method: &Method, call: &crate::call::Call) -> Option<&BoxHandler> {
+        self.0
+            .get(method)?
+            .iter()
+            .find_map(|c| c.guards.iter().all(|g| g.check(call)).then_some(&c.handler))
+    }
+
+    /// Methods with at least one registered route, guards ignored. Used for
+    /// `Allow` on an `OPTIONS` request, which describes the resource rather
+    /// than any particular request.
+    fn methods(&self) -> Vec<Method> {
+        self.0.keys().cloned().collect()
+    }
+
+    /// Methods that could actually serve *this* request.
+    ///
+    /// A method whose every candidate fails its guards does not count: the
+    /// route does not match, so the answer is `404`, not `405`. Reporting it
+    /// as allowed would tell a client to retry a request that can never work.
+    fn methods_matching(&self, call: &crate::call::Call) -> Vec<Method> {
+        self.0
+            .iter()
+            .filter(|(_, cands)| cands.iter().any(|c| c.guards.iter().all(|g| g.check(call))))
+            .map(|(m, _)| m.clone())
+            .collect()
+    }
+
+    fn push(&mut self, method: Method, pattern: &str, handler: BoxHandler) {
+        let entries = self.0.entry(method.clone()).or_default();
+        // Only an unguarded duplicate is a mistake: guarded siblings are the
+        // whole point of guards.
+        if entries.iter().any(|c| c.guards.is_empty()) {
+            panic!("duplicate route: {method} {pattern} is already registered");
+        }
+        entries.push(Candidate {
+            guards: Vec::new(),
+            handler,
+        });
+    }
+}
 
 impl std::fmt::Debug for Node {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -91,11 +195,16 @@ impl std::fmt::Debug for Node {
 ///
 /// ```
 /// use churust_core::{boxed, Call, IntoHandler, Router, Match};
+/// # use bytes::Bytes;
+/// # use http::HeaderMap;
+/// # fn probe(p: &str) -> Call {
+/// #     Call::new(Method::GET, p.parse().unwrap(), HeaderMap::new(), Bytes::new())
+/// # }
 /// use http::Method;
 ///
 /// let mut router = Router::new();
 /// router.add(Method::GET, "/files/{path...}", boxed((|_c: Call| async { "" }).into_handler()));
-/// match router.route(&Method::GET, "/files/a/b/c.txt") {
+/// match router.route(&Method::GET, "/files/a/b/c.txt", &probe("/files/a/b/c.txt")) {
 ///     Match::Found { params, .. } => assert_eq!(params.get("path").unwrap(), "a/b/c.txt"),
 ///     _ => panic!("expected wildcard match"),
 /// }
@@ -124,11 +233,16 @@ impl Router {
     ///
     /// ```
     /// use churust_core::{boxed, Call, IntoHandler, Router, Match};
+    /// # use bytes::Bytes;
+    /// # use http::HeaderMap;
+    /// # fn probe(p: &str) -> Call {
+    /// #     Call::new(Method::GET, p.parse().unwrap(), HeaderMap::new(), Bytes::new())
+    /// # }
     /// use http::Method;
     ///
     /// let mut router = Router::new();
     /// router.add(Method::GET, "/ping", boxed((|_c: Call| async { "pong" }).into_handler()));
-    /// assert!(matches!(router.route(&Method::GET, "/ping"), Match::Found { .. }));
+    /// assert!(matches!(router.route(&Method::GET, "/ping", &probe("/ping")), Match::Found { .. }));
     /// ```
     pub fn add(&mut self, method: Method, pattern: &str, handler: BoxHandler) {
         let mut node = &mut self.root;
@@ -143,18 +257,30 @@ impl Router {
                 let entry = node
                     .wildcard
                     .get_or_insert_with(|| (name.to_string(), BoxHandlers::default()));
-                entry.1 .0.insert(method, handler);
+                entry.1.push(method, pattern, handler);
                 return;
             } else if let Some(name) = seg.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
                 let entry = node
                     .param
                     .get_or_insert_with(|| (name.to_string(), Box::new(Node::default())));
+                // One node, one parameter name. Registering `/users/{id}` and
+                // then `/users/{name}/profile` used to silently reuse `id` for
+                // both, so the second route's handler looked up `name` and found
+                // nothing — a 400 at request time with no clue why. Failing here
+                // matches how this router already treats a misplaced wildcard
+                // and a duplicate route.
+                assert!(
+                    entry.0 == name,
+                    "conflicting path parameter names at the same position: \
+                     `{{{}}}` and `{{{name}}}` (registering {method} {pattern})",
+                    entry.0
+                );
                 node = entry.1.as_mut();
             } else {
                 node = node.statics.entry(seg.to_string()).or_default();
             }
         }
-        node.handlers.0.insert(method, handler);
+        node.handlers.push(method, pattern, handler);
     }
 
     /// Route `path` for `method`, returning a [`Match`].
@@ -167,14 +293,19 @@ impl Router {
     ///
     /// ```
     /// use churust_core::{boxed, Call, IntoHandler, Router, Match};
+    /// # use bytes::Bytes;
+    /// # use http::HeaderMap;
+    /// # fn probe(p: &str) -> Call {
+    /// #     Call::new(Method::GET, p.parse().unwrap(), HeaderMap::new(), Bytes::new())
+    /// # }
     /// use http::Method;
     ///
     /// let mut router = Router::new();
     /// router.add(Method::GET, "/", boxed((|_c: Call| async { "home" }).into_handler()));
-    /// assert!(matches!(router.route(&Method::GET, "/"), Match::Found { .. }));
-    /// assert!(matches!(router.route(&Method::GET, "/missing"), Match::NotFound));
+    /// assert!(matches!(router.route(&Method::GET, "/", &probe("/")), Match::Found { .. }));
+    /// assert!(matches!(router.route(&Method::GET, "/missing", &probe("/missing")), Match::NotFound));
     /// ```
-    pub fn route(&self, method: &Method, path: &str) -> Match {
+    pub fn route(&self, method: &Method, path: &str, call: &crate::call::Call) -> Match {
         // Split first, decode second. Decoding before splitting would let %2F
         // manufacture separators and forge extra path segments.
         let decoded = match decode_segments(path) {
@@ -182,12 +313,12 @@ impl Router {
             None => return Match::BadPath,
         };
         let segments: Vec<&str> = decoded.iter().map(String::as_str).collect();
-        let mut params = HashMap::new();
+        let mut params = crate::call::Params::new();
 
         // 1. Exact walk. Static beats param, unchanged.
         let exact = Self::walk(&self.root, &segments, 0, &mut params);
         if let Some(node) = exact {
-            if let Some(h) = node.handlers.0.get(method) {
+            if let Some(h) = node.handlers.pick(method, call) {
                 return Match::Found {
                     handler: h.clone(),
                     params,
@@ -195,7 +326,7 @@ impl Router {
             }
         }
         let exact_allow: Vec<Method> = exact
-            .map(|n| n.handlers.0.keys().cloned().collect())
+            .map(|n| n.handlers.methods_matching(call))
             .unwrap_or_default();
 
         // 2. Wildcard fallback. Reaching a node that has no handler for this
@@ -207,7 +338,7 @@ impl Router {
         //    belong to the branch just abandoned and must not reach the
         //    wildcard handler.
         params.clear();
-        match Self::walk_wildcard(&self.root, &segments, 0, method, &mut params) {
+        match Self::walk_wildcard(&self.root, &segments, 0, method, call, &mut params) {
             Some(found @ Match::Found { .. }) => found,
             Some(Match::MethodNotAllowed { allow: wild_allow }) => {
                 let mut allow = exact_allow;
@@ -220,6 +351,83 @@ impl Router {
             }
             _ if !exact_allow.is_empty() => Match::MethodNotAllowed { allow: exact_allow },
             _ => Match::NotFound,
+        }
+    }
+
+    /// Attach a guard to the most recently registered route at
+    /// `(method, pattern)`.
+    ///
+    /// Used by [`RouteBuilder::guard`]; registration order is what makes "most
+    /// recent" unambiguous.
+    fn attach_guard(&mut self, method: &Method, pattern: &str, g: crate::guard::BoxGuard) {
+        let mut node = &mut self.root;
+        let segments: Vec<&str> = split_segments(pattern);
+        for (i, seg) in segments.iter().enumerate() {
+            if let Some(_name) = seg.strip_prefix('{').and_then(|s| s.strip_suffix("...}")) {
+                debug_assert!(i == segments.len() - 1);
+                if let Some(entry) = node.wildcard.as_mut() {
+                    if let Some(c) = entry.1 .0.get_mut(method).and_then(|v| v.last_mut()) {
+                        c.guards.push(g);
+                    }
+                }
+                return;
+            } else if seg.starts_with('{') && seg.ends_with('}') {
+                match node.param.as_mut() {
+                    Some(entry) => node = entry.1.as_mut(),
+                    None => return,
+                }
+            } else {
+                match node.statics.get_mut(*seg) {
+                    Some(child) => node = child,
+                    None => return,
+                }
+            }
+        }
+        if let Some(c) = node.handlers.0.get_mut(method).and_then(|v| v.last_mut()) {
+            c.guards.push(g);
+        }
+    }
+
+    /// Wrap the most recently registered route at `(method, pattern)` so it
+    /// carries a per-route body limit.
+    fn attach_limit(&mut self, method: &Method, pattern: &str, max_body_bytes: usize) {
+        let mut node = &mut self.root;
+        let segments: Vec<&str> = split_segments(pattern);
+        for (i, seg) in segments.iter().enumerate() {
+            if seg
+                .strip_prefix('{')
+                .and_then(|s| s.strip_suffix("...}"))
+                .is_some()
+            {
+                debug_assert!(i == segments.len() - 1);
+                if let Some(entry) = node.wildcard.as_mut() {
+                    if let Some(c) = entry.1 .0.get_mut(method).and_then(|v| v.last_mut()) {
+                        let inner = c.handler.clone();
+                        c.handler = std::sync::Arc::new(LimitedHandler {
+                            max_body_bytes,
+                            inner,
+                        });
+                    }
+                }
+                return;
+            } else if seg.starts_with('{') && seg.ends_with('}') {
+                match node.param.as_mut() {
+                    Some(entry) => node = entry.1.as_mut(),
+                    None => return,
+                }
+            } else {
+                match node.statics.get_mut(*seg) {
+                    Some(child) => node = child,
+                    None => return,
+                }
+            }
+        }
+        if let Some(c) = node.handlers.0.get_mut(method).and_then(|v| v.last_mut()) {
+            let inner = c.handler.clone();
+            c.handler = std::sync::Arc::new(LimitedHandler {
+                max_body_bytes,
+                inner,
+            });
         }
     }
 
@@ -244,17 +452,30 @@ impl Router {
             None => return Vec::new(),
         };
         let segments: Vec<&str> = decoded.iter().map(String::as_str).collect();
-        let mut params = HashMap::new();
+        let mut params = crate::call::Params::new();
         let mut out: Vec<Method> = Self::walk(&self.root, &segments, 0, &mut params)
-            .map(|n| n.handlers.0.keys().cloned().collect())
+            .map(|n| n.handlers.methods())
             .unwrap_or_default();
 
         // TRACE is a probe: nothing registers it, so `walk_wildcard` reports
         // MethodNotAllowed carrying the wildcard's full method list.
         params.clear();
-        if let Some(Match::MethodNotAllowed { allow }) =
-            Self::walk_wildcard(&self.root, &segments, 0, &Method::TRACE, &mut params)
-        {
+        // `Allow` describes the resource, not this request, so guards are not
+        // consulted: a probe call stands in for one.
+        let probe = crate::call::Call::new(
+            Method::TRACE,
+            "/".parse().expect("static uri"),
+            http::HeaderMap::new(),
+            bytes::Bytes::new(),
+        );
+        if let Some(Match::MethodNotAllowed { allow }) = Self::walk_wildcard(
+            &self.root,
+            &segments,
+            0,
+            &Method::TRACE,
+            &probe,
+            &mut params,
+        ) {
             for m in allow {
                 if !out.contains(&m) {
                     out.push(m);
@@ -264,11 +485,54 @@ impl Router {
         out
     }
 
+    /// Every method registered anywhere in this router, deduplicated.
+    ///
+    /// Answers `OPTIONS *`, which RFC 9110 §9.3.7 defines as a question about
+    /// the server rather than about any one resource.
+    ///
+    /// ```
+    /// use churust_core::{boxed, Call, IntoHandler, Router};
+    /// use http::Method;
+    ///
+    /// let mut router = Router::new();
+    /// router.add(Method::GET, "/a", boxed((|_c: Call| async { "" }).into_handler()));
+    /// router.add(Method::POST, "/b", boxed((|_c: Call| async { "" }).into_handler()));
+    /// let mut all = router.all_methods();
+    /// all.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+    /// assert_eq!(all, vec![Method::GET, Method::POST]);
+    /// ```
+    pub fn all_methods(&self) -> Vec<Method> {
+        let mut out = Vec::new();
+        Self::collect_methods(&self.root, &mut out);
+        out
+    }
+
+    fn collect_methods(node: &Node, out: &mut Vec<Method>) {
+        for m in node.handlers.methods() {
+            if !out.contains(&m) {
+                out.push(m);
+            }
+        }
+        if let Some((_, handlers)) = &node.wildcard {
+            for m in handlers.methods() {
+                if !out.contains(&m) {
+                    out.push(m);
+                }
+            }
+        }
+        for child in node.statics.values() {
+            Self::collect_methods(child, out);
+        }
+        if let Some((_, child)) = &node.param {
+            Self::collect_methods(child, out);
+        }
+    }
+
     fn walk<'a>(
         node: &'a Node,
         segs: &[&str],
         i: usize,
-        params: &mut HashMap<String, String>,
+        params: &mut crate::call::Params,
     ) -> Option<&'a Node> {
         if i == segs.len() {
             return Some(node);
@@ -289,41 +553,111 @@ impl Router {
         None
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn walk_wildcard(
         node: &Node,
         segs: &[&str],
         i: usize,
         method: &Method,
-        params: &mut HashMap<String, String>,
+        call: &crate::call::Call,
+        params: &mut crate::call::Params,
     ) -> Option<Match> {
-        if let Some((name, handlers)) = &node.wildcard {
-            let rest = segs[i..].join("/");
-            params.insert(name.clone(), rest);
-            return Some(match handlers.0.get(method) {
-                Some(h) => Match::Found {
-                    handler: h.clone(),
-                    params: std::mem::take(params),
-                },
-                None => Match::MethodNotAllowed {
-                    allow: handlers.0.keys().cloned().collect(),
-                },
-            });
-        }
+        // Descend before considering this node's own wildcard, so the *deepest*
+        // wildcard wins. Consulting it first made a shallow `{p...}` shadow every
+        // deeper one: with `/files/{p...}` and `/files/img/{q...}` registered,
+        // nothing under `/files/img/` could ever reach the second handler, and
+        // nothing reported the shadowing at registration or at match time.
+        //
+        // A `MethodNotAllowed` found deeper is remembered rather than returned:
+        // a shallower wildcard may still have a real handler for this method,
+        // and a `405` must not pre-empt a `200`.
+        let mut method_mismatch: Option<Match> = None;
         if i < segs.len() {
             if let Some(child) = node.statics.get(segs[i]) {
-                if let Some(m) = Self::walk_wildcard(child, segs, i + 1, method, params) {
-                    return Some(m);
+                match Self::walk_wildcard(child, segs, i + 1, method, call, params) {
+                    Some(found @ Match::Found { .. }) => return Some(found),
+                    Some(other) => method_mismatch = Some(other),
+                    None => {}
                 }
             }
             if let Some((pname, child)) = &node.param {
                 params.insert(pname.clone(), segs[i].to_string());
-                if let Some(m) = Self::walk_wildcard(child, segs, i + 1, method, params) {
-                    return Some(m);
+                match Self::walk_wildcard(child, segs, i + 1, method, call, params) {
+                    Some(found @ Match::Found { .. }) => return Some(found),
+                    Some(other) => {
+                        // The capture belongs to a branch we are abandoning.
+                        params.remove(pname);
+                        method_mismatch = Some(other);
+                    }
+                    None => params.remove(pname),
                 }
-                params.remove(pname);
             }
         }
-        None
+
+        if let Some((name, handlers)) = &node.wildcard {
+            let rest = segs[i..].join("/");
+            params.insert(name.clone(), rest);
+            return Some(match handlers.pick(method, call) {
+                Some(h) => Match::Found {
+                    handler: h.clone(),
+                    params: std::mem::take(params),
+                },
+                None => {
+                    params.remove(name);
+                    let mut allow = handlers.methods_matching(call);
+                    // Both depths reject the method, so `Allow` must describe
+                    // every method either of them would have served.
+                    if let Some(Match::MethodNotAllowed { allow: deeper }) = method_mismatch {
+                        for m in deeper {
+                            if !allow.contains(&m) {
+                                allow.push(m);
+                            }
+                        }
+                    }
+                    Match::MethodNotAllowed { allow }
+                }
+            });
+        }
+        method_mismatch
+    }
+}
+
+/// Seeds a per-route body limit into the call before delegating.
+///
+/// The engine's global cap still bounds what is read off the socket; this is
+/// the per-route tightening that extractors consult, which is the same place
+/// per-route extractor configuration belongs.
+struct LimitedHandler {
+    max_body_bytes: usize,
+    inner: BoxHandler,
+}
+
+impl crate::handler::Handler for LimitedHandler {
+    fn handle(&self, mut call: crate::call::Call) -> crate::handler::HandlerFuture {
+        call.insert(crate::extract::RouteBodyLimit(self.max_body_bytes));
+        let inner = self.inner.clone();
+        Box::pin(async move { inner.handle(call).await })
+    }
+}
+
+/// A handler with a scope's middleware chain wrapped around it.
+///
+/// Built once at route registration rather than consulted per request, so a
+/// route in no scope is exactly as cheap as before.
+struct ScopedHandler {
+    chain: Vec<std::sync::Arc<dyn crate::pipeline::Middleware>>,
+    inner: BoxHandler,
+}
+
+impl crate::handler::Handler for ScopedHandler {
+    fn handle(&self, call: crate::call::Call) -> crate::handler::HandlerFuture {
+        let inner = self.inner.clone();
+        let endpoint: crate::pipeline::Endpoint = std::sync::Arc::new(move |call| {
+            let inner = inner.clone();
+            Box::pin(async move { inner.handle(call).await })
+        });
+        let chain: std::collections::VecDeque<_> = self.chain.iter().cloned().collect();
+        Box::pin(crate::pipeline::Next::new(chain, endpoint).run(call))
     }
 }
 
@@ -371,6 +705,12 @@ fn decode_segments(path: &str) -> Option<Vec<String>> {
 pub struct RouteBuilder<'r> {
     router: &'r mut Router,
     prefix: String,
+    /// Middleware applied to routes registered in this scope, outermost first.
+    /// Nested scopes inherit a clone, so a child cannot affect its parent.
+    chain: Vec<std::sync::Arc<dyn crate::pipeline::Middleware>>,
+    /// The most recent `(method, full path)` registered here, so `guard` knows
+    /// which route it modifies.
+    last: Option<(Method, String)>,
 }
 
 impl<'r> RouteBuilder<'r> {
@@ -378,7 +718,58 @@ impl<'r> RouteBuilder<'r> {
         Self {
             router,
             prefix: String::new(),
+            chain: Vec::new(),
+            last: None,
         }
+    }
+
+    /// Apply `mw` to every route registered in this scope **after** this call,
+    /// including those in nested scopes.
+    ///
+    /// This is v1 design §6's scope-local interception, and the equivalent of
+    /// scope-local interception. Ordering is deliberate: a route registered before
+    /// the `intercept` call is not covered by it, so the reading order of the
+    /// block matches the behaviour.
+    ///
+    /// ```
+    /// use churust_core::{Call, Churust, Middleware, Next, Response, TestClient};
+    /// use async_trait::async_trait;
+    /// use http::StatusCode;
+    ///
+    /// struct RequireKey;
+    /// #[async_trait]
+    /// impl Middleware for RequireKey {
+    ///     async fn handle(&self, call: Call, next: Next) -> Response {
+    ///         if call.header("x-key").is_some() {
+    ///             next.run(call).await
+    ///         } else {
+    ///             Response::new(StatusCode::UNAUTHORIZED)
+    ///         }
+    ///     }
+    /// }
+    ///
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// let app = Churust::server()
+    ///     .routing(|r| {
+    ///         r.get("/open", |_c: Call| async { "open" });
+    ///         r.route("/admin", |r| {
+    ///             r.intercept(RequireKey);
+    ///             r.get("/panel", |_c: Call| async { "panel" });
+    ///         });
+    ///     })
+    ///     .build();
+    ///
+    /// let client = TestClient::new(app);
+    /// assert_eq!(client.get("/open").send().await.status(), StatusCode::OK);
+    /// assert_eq!(
+    ///     client.get("/admin/panel").send().await.status(),
+    ///     StatusCode::UNAUTHORIZED
+    /// );
+    /// # });
+    /// ```
+    pub fn intercept<M: crate::pipeline::Middleware>(&mut self, mw: M) -> &mut Self {
+        self.chain.push(std::sync::Arc::new(mw));
+        self
     }
 
     fn full(&self, path: &str) -> String {
@@ -398,8 +789,100 @@ impl<'r> RouteBuilder<'r> {
         H: IntoHandler<Marker>,
     {
         let full = self.full(path);
-        self.router
-            .add(method, &full, boxed(handler.into_handler()));
+        let h = boxed(handler.into_handler());
+        // Wrap once, at registration: the scope chain is fixed by then, so the
+        // request path pays nothing for scopes it is not in.
+        let h = if self.chain.is_empty() {
+            h
+        } else {
+            std::sync::Arc::new(ScopedHandler {
+                chain: self.chain.clone(),
+                inner: h,
+            }) as BoxHandler
+        };
+        self.router.add(method.clone(), &full, h);
+        self.last = Some((method, full));
+        self
+    }
+
+    /// Attach a [`Guard`](crate::Guard) to the route just registered.
+    ///
+    /// Routes may share a `(method, path)` when guards distinguish them; the
+    /// first whose guards all pass serves the request, in registration order,
+    /// so an unguarded route registered last is the fallback. A request that
+    /// matches no candidate is a `404`.
+    ///
+    /// ```
+    /// use churust_core::{guard, Call, Churust, TestClient};
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// let app = Churust::server()
+    ///     .routing(|r| {
+    ///         r.get("/", |_c: Call| async { "beta" })
+    ///             .guard(guard::header("x-beta", "1"));
+    ///         r.get("/", |_c: Call| async { "stable" });
+    ///     })
+    ///     .build();
+    /// let client = TestClient::new(app);
+    /// assert_eq!(client.get("/").header("x-beta", "1").send().await.text(), "beta");
+    /// assert_eq!(client.get("/").send().await.text(), "stable");
+    /// # });
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if no route has been registered on this builder yet — there would
+    /// be nothing for the guard to apply to.
+    pub fn guard(&mut self, g: crate::guard::BoxGuard) -> &mut Self {
+        let (method, path) = self
+            .last
+            .clone()
+            .expect("guard() must follow a route registration");
+        self.router.attach_guard(&method, &path, g);
+        self
+    }
+
+    /// Cap the request body for the route just registered.
+    ///
+    /// The server-wide [`max_body_bytes`](crate::AppBuilder::max_body_bytes)
+    /// still bounds what is read off the socket; this tightens it for one
+    /// route, which is what lets an upload endpoint be generous while the rest
+    /// of the API stays strict. Body extractors (`Json<T>`, `Form<T>`) enforce
+    /// it and answer `413`.
+    ///
+    /// ```
+    /// use churust_core::{Call, Churust, Form, TestClient};
+    /// use http::StatusCode;
+    /// use serde::Deserialize;
+    /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+    /// #[derive(Deserialize)]
+    /// struct Note { text: String }
+    ///
+    /// let app = Churust::server()
+    ///     .routing(|r| {
+    ///         r.post("/tiny", |Form(n): Form<Note>| async move { n.text })
+    ///             .max_body_bytes(8);
+    ///     })
+    ///     .build();
+    ///
+    /// let res = TestClient::new(app)
+    ///     .post("/tiny")
+    ///     .header("content-type", "application/x-www-form-urlencoded")
+    ///     .body("text=this-is-far-too-long")
+    ///     .send()
+    ///     .await;
+    /// assert_eq!(res.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    /// # });
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics if no route has been registered on this builder yet.
+    pub fn max_body_bytes(&mut self, n: usize) -> &mut Self {
+        let (method, path) = self
+            .last
+            .clone()
+            .expect("max_body_bytes() must follow a route registration");
+        self.router.attach_limit(&method, &path, n);
         self
     }
 
@@ -440,6 +923,8 @@ impl<'r> RouteBuilder<'r> {
         let mut child = RouteBuilder {
             router: self.router,
             prefix,
+            chain: self.chain.clone(),
+            last: None,
         };
         f(&mut child);
         self
@@ -471,8 +956,18 @@ mod tests {
         r
     }
 
+    /// A bare call for tests that exercise routing rather than guards.
+    fn probe(path: &str) -> Call {
+        Call::new(
+            Method::GET,
+            path.parse::<Uri>().unwrap_or_else(|_| "/".parse().unwrap()),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+    }
+
     fn run(r: &Router, m: Method, path: &str) -> Match {
-        r.route(&m, path)
+        r.route(&m, path, &probe(path))
     }
 
     #[tokio::test]
@@ -515,7 +1010,7 @@ mod tests {
             let mut b = RouteBuilder::new(&mut r);
             b.get("/u/{name}", |_c: Call| async { "" });
         }
-        match r.route(&Method::GET, "/u/John%20Doe") {
+        match r.route(&Method::GET, "/u/John%20Doe", &probe("/u/John%20Doe")) {
             Match::Found { params, .. } => assert_eq!(params.get("name").unwrap(), "John Doe"),
             _ => panic!("expected a match"),
         }
@@ -530,7 +1025,7 @@ mod tests {
         }
         // Matching at all proves %2F stayed inside one segment. Had it been
         // decoded before splitting, this would be two segments and miss.
-        match r.route(&Method::GET, "/u/a%2Fb") {
+        match r.route(&Method::GET, "/u/a%2Fb", &probe("/u/a%2Fb")) {
             Match::Found { params, .. } => assert_eq!(params.get("name").unwrap(), "a/b"),
             _ => panic!("%2F must not manufacture a separator"),
         }
@@ -544,7 +1039,7 @@ mod tests {
             b.get("/a b", |_c: Call| async { "" });
         }
         assert!(matches!(
-            r.route(&Method::GET, "/a%20b"),
+            r.route(&Method::GET, "/a%20b", &probe("/a%20b")),
             Match::Found { .. }
         ));
     }
@@ -556,8 +1051,14 @@ mod tests {
             let mut b = RouteBuilder::new(&mut r);
             b.get("/u/{name}", |_c: Call| async { "" });
         }
-        assert!(matches!(r.route(&Method::GET, "/u/%zz"), Match::BadPath));
-        assert!(matches!(r.route(&Method::GET, "/u/%FF"), Match::BadPath));
+        assert!(matches!(
+            r.route(&Method::GET, "/u/%zz", &probe("/u/%zz")),
+            Match::BadPath
+        ));
+        assert!(matches!(
+            r.route(&Method::GET, "/u/%FF", &probe("/u/%FF")),
+            Match::BadPath
+        ));
     }
 
     #[test]
@@ -567,7 +1068,7 @@ mod tests {
             let mut b = RouteBuilder::new(&mut r);
             b.get("/f/{rest...}", |_c: Call| async { "" });
         }
-        match r.route(&Method::GET, "/f/a%20b/c") {
+        match r.route(&Method::GET, "/f/a%20b/c", &probe("/f/a%20b/c")) {
             Match::Found { params, .. } => assert_eq!(params.get("rest").unwrap(), "a b/c"),
             _ => panic!("expected the wildcard to match"),
         }
@@ -619,7 +1120,7 @@ mod tests {
             b.post("/u/{id}/edit", |_c: Call| async { "edit" });
             b.get("/u/{rest...}", |_c: Call| async { "wild" });
         }
-        match r.route(&Method::GET, "/u/7/edit") {
+        match r.route(&Method::GET, "/u/7/edit", &probe("/u/7/edit")) {
             Match::Found { params, .. } => {
                 assert_eq!(params.get("rest").unwrap(), "7/edit");
                 assert!(

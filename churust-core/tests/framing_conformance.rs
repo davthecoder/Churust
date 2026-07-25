@@ -1,0 +1,157 @@
+//! Message-framing conformance (RFC 9112 §6).
+//!
+//! hyper owns HTTP/1 framing, so none of this is Churust's implementation —
+//! which is exactly why it is worth pinning. These are behaviours the framework
+//! depends on and would otherwise notice only after a dependency upgrade
+//! changed one of them. A failure here is a signal to read hyper's changelog,
+//! not necessarily a bug in this repository.
+
+use churust_core::{Call, Churust};
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+fn free_addr() -> std::net::SocketAddr {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = l.local_addr().unwrap();
+    drop(l);
+    addr
+}
+
+/// Serve an echo-length app, send `raw` verbatim, and read what comes back.
+async fn exchange(raw: &[u8]) -> String {
+    let addr = free_addr();
+    let app = Churust::server()
+        .routing(|r| {
+            r.post("/echo", |body: String| async move {
+                format!("len={}", body.len())
+            });
+            r.get("/", |_c: Call| async { "ok" });
+        })
+        .build();
+    let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        churust_core::engine::serve(app, addr, async {
+            let _ = rx.await;
+        })
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    sock.write_all(raw).await.unwrap();
+    let mut buf = Vec::new();
+    // Read to EOF where the server closes; otherwise take what is available.
+    let _ = tokio::time::timeout(Duration::from_millis(800), sock.read_to_end(&mut buf)).await;
+    String::from_utf8_lossy(&buf).into_owned()
+}
+
+#[tokio::test]
+async fn transfer_encoding_wins_over_content_length() {
+    // RFC 9112 §6.3 rule 3: if a message has both a Transfer-Encoding and a
+    // Content-Length, the Transfer-Encoding overrides. The mismatch is the
+    // classic request-smuggling primitive — a proxy that believes one header
+    // and an origin that believes the other disagree about where the next
+    // request starts.
+    //
+    // The chunked body is 5 bytes; the Content-Length lies and says 99.
+    let res = exchange(
+        b"POST /echo HTTP/1.1\r\n\
+          Host: x\r\n\
+          Content-Length: 99\r\n\
+          Transfer-Encoding: chunked\r\n\
+          \r\n\
+          5\r\nhello\r\n0\r\n\r\n",
+    )
+    .await;
+
+    // Churust rejects rather than framing-by-chunked-and-continuing. hyper
+    // frames it correctly on its own, which is permitted — but the risk is not
+    // what this server does with the message, it is that an intermediary in
+    // front may have believed the Content-Length and forwarded a different
+    // number of body bytes. Refusing removes the desync regardless.
+    assert!(
+        res.starts_with("HTTP/1.1 400"),
+        "expected 400 for a Transfer-Encoding + Content-Length request: {res}"
+    );
+    assert!(
+        res.to_ascii_lowercase().contains("connection: close"),
+        "the connection must be closed, or leftover bytes become the next request: {res}"
+    );
+    assert!(
+        !res.contains("len="),
+        "the body was served despite ambiguous framing: {res}"
+    );
+}
+
+#[tokio::test]
+async fn a_smuggled_second_request_is_not_served_from_one_message() {
+    // The CL.TE smuggling shape: the Content-Length covers bytes that, read as
+    // chunked, terminate early — leaving a second request line in the buffer.
+    // Exactly one response must come back.
+    let res = exchange(
+        b"POST /echo HTTP/1.1\r\n\
+          Host: x\r\n\
+          Content-Length: 6\r\n\
+          Transfer-Encoding: chunked\r\n\
+          \r\n\
+          0\r\n\r\n\
+          GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+    )
+    .await;
+
+    let responses = res.matches("HTTP/1.1 ").count();
+    assert!(
+        responses <= 1,
+        "one message produced {responses} responses — smuggled request served: {res}"
+    );
+}
+
+#[tokio::test]
+async fn duplicate_conflicting_content_lengths_are_rejected() {
+    // RFC 9112 §6.3 rule 5: differing Content-Length values are unrecoverable.
+    let res = exchange(
+        b"POST /echo HTTP/1.1\r\n\
+          Host: x\r\n\
+          Content-Length: 5\r\n\
+          Content-Length: 6\r\n\
+          \r\n\
+          hello",
+    )
+    .await;
+    assert!(
+        res.starts_with("HTTP/1.1 400") || res.is_empty(),
+        "conflicting Content-Length values were not rejected: {res}"
+    );
+}
+
+#[tokio::test]
+async fn an_unrecognised_transfer_encoding_is_refused() {
+    // RFC 9112 §6.1: a Transfer-Encoding the server cannot decode must not be
+    // guessed at.
+    let res = exchange(
+        b"POST /echo HTTP/1.1\r\n\
+          Host: x\r\n\
+          Transfer-Encoding: bogus\r\n\
+          \r\n\
+          hello",
+    )
+    .await;
+    assert!(
+        !res.contains("len="),
+        "an undecodable Transfer-Encoding was served as a body: {res}"
+    );
+}
+
+#[tokio::test]
+async fn a_well_formed_chunked_body_still_works() {
+    // The tests above pass trivially if chunked is broken outright.
+    let res = exchange(
+        b"POST /echo HTTP/1.1\r\n\
+          Host: x\r\n\
+          Transfer-Encoding: chunked\r\n\
+          \r\n\
+          5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n",
+    )
+    .await;
+    assert!(res.contains("len=11"), "{res}");
+}

@@ -117,6 +117,56 @@ impl std::fmt::Debug for Body {
     }
 }
 
+/// [`Body`] is an `http_body::Body`, so it can be handed to anything written
+/// against the `http`/`http-body` crates — which is what makes the `tower`
+/// adapter possible without a wrapper type at every boundary.
+impl http_body::Body for Body {
+    type Data = Bytes;
+    type Error = Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<std::result::Result<http_body::Frame<Bytes>, Error>>> {
+        match &mut *self {
+            Body::Bytes(bytes) => {
+                if bytes.is_empty() {
+                    std::task::Poll::Ready(None)
+                } else {
+                    // Take the payload so the next poll reports end-of-stream
+                    // rather than yielding the same bytes forever.
+                    let out = std::mem::take(bytes);
+                    std::task::Poll::Ready(Some(Ok(http_body::Frame::data(out))))
+                }
+            }
+            Body::Stream(stream) => match stream.as_mut().poll_next(cx) {
+                std::task::Poll::Ready(Some(Ok(chunk))) => {
+                    std::task::Poll::Ready(Some(Ok(http_body::Frame::data(chunk))))
+                }
+                std::task::Poll::Ready(Some(Err(e))) => std::task::Poll::Ready(Some(Err(e))),
+                std::task::Poll::Ready(None) => std::task::Poll::Ready(None),
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            },
+        }
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        match self {
+            // Exact for a buffered body, so `Content-Length` can be set.
+            Body::Bytes(b) => http_body::SizeHint::with_exact(b.len() as u64),
+            // A stream's length is not known until it ends.
+            Body::Stream(_) => http_body::SizeHint::default(),
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        match self {
+            Body::Bytes(b) => b.is_empty(),
+            Body::Stream(_) => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

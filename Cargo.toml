@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["churust-core", "churust-macros", "churust", "examples/hello", "churust-json", "churust-logging", "churust-cors", "churust-auth", "examples/api", "examples/chat", "examples/static"]
+members = ["churust-core", "churust-macros", "churust", "examples/hello", "churust-json", "churust-logging", "churust-cors", "churust-auth", "churust-lab", "examples/api", "examples/chat", "examples/static"]
 
 [workspace.package]
 # Every Churust crate releases in lockstep on this single version.
@@ -26,6 +26,9 @@ churust-json = { path = "churust-json", version = "0.2.0" }
 churust-logging = { path = "churust-logging", version = "0.2.0" }
 churust-cors = { path = "churust-cors", version = "0.2.0" }
 churust-auth = { path = "churust-auth", version = "0.2.0" }
+# Shares the workspace version despite never promising 1.0 — see the crate docs
+# for why, and for when that must be revisited.
+churust-lab = { path = "churust-lab", version = "0.2.0" }
 
 # Only the features Churust actually uses, audited against every `tokio::` path
 # in the workspace: rt-multi-thread (the `main` macro, `Runtime`), net
@@ -41,19 +44,36 @@ tokio = { version = "1", features = [
   "signal",
   "macros",
 ] }
-hyper = { version = "1", features = ["http1", "server"] }
+hyper = { version = "1", features = ["http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "server-auto", "server-graceful"] }
 http-body-util = "0.1"
+# The `http_body::Body` trait itself, so Churust's `Body` can implement it and
+# be handed to anything written against the http/http-body crates.
+http-body = "1"
+# A tower `Service`/`Layer` boundary, feature-gated. Only the two trait crates:
+# `tower` itself brings a large middleware tree Churust does not need, and the
+# traits are what the ecosystem is actually written against.
+tower-service = "0.3"
+tower-layer = "0.3"
 http = "1"
 bytes = "1"
 futures-util = "0.3"
 async-trait = "0.1"
 serde = { version = "1", features = ["derive"] }
-serde_urlencoded = "0.7"
+# Query and form parsing. `serde_urlencoded` maps each key exactly once, so a
+# `Vec<T>` field is unrepresentable — which breaks checkbox groups and
+# `<select multiple>`, the ordinary HTML for a multi-value control.
+# `serde_html_form` is the same surface with repeated keys supported.
+serde_html_form = "0.2"
 serde_json = "1"
 tracing = "0.1"
 jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
 base64 = "0.22"
+# Real MAC for signed session cookies. Both are RustCrypto, pure Rust, no_std
+# capable and pull nothing heavy — worth it to make a session a trust boundary
+# rather than a documented weakness.
+hmac = "0.12"
+sha2 = "0.10"
 syn = { version = "2", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"

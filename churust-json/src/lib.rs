@@ -157,7 +157,8 @@ where
     T: DeserializeOwned + Send,
 {
     async fn from_call(mut call: Call) -> Result<Self> {
-        let bytes = call.receive_bytes().await;
+        let bytes = call.try_receive_bytes().await?;
+        churust_core::check_body_limit(&call, bytes.len())?;
         let value = serde_json::from_slice::<T>(&bytes)
             .map_err(|e| Error::bad_request(format!("invalid JSON body: {e}")))?;
         Ok(Json(value))
@@ -340,6 +341,77 @@ impl Middleware for JsonErrors {
             }
         }
         res
+    }
+}
+
+/// Call-style JSON helpers — v1 design §5.1.
+///
+/// The extractor [`Json<T>`] covers the typed-handler style. This trait covers
+/// the `call`-style one, so both halves of Churust's hybrid API can speak JSON:
+///
+/// ```
+/// use churust_core::{Call, Churust, TestClient};
+/// use churust_json::CallJson;
+/// use serde::{Deserialize, Serialize};
+/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// #[derive(Deserialize, Serialize)]
+/// struct Note { text: String }
+///
+/// let app = Churust::server()
+///     .routing(|r| {
+///         r.post("/echo", |mut call: Call| async move {
+///             let note: Note = call.receive_json().await?;
+///             Ok::<_, churust_core::Error>(call.respond_json(&note))
+///         });
+///     })
+///     .build();
+///
+/// let res = TestClient::new(app)
+///     .post("/echo")
+///     .header("content-type", "application/json")
+///     .body(r#"{"text":"hi"}"#)
+///     .send()
+///     .await;
+/// assert_eq!(res.text(), r#"{"text":"hi"}"#);
+/// # });
+/// ```
+///
+/// Lives here rather than in `churust-core` so the core keeps no `serde_json`
+/// dependency; bring it into scope with `use churust_json::CallJson`.
+#[async_trait::async_trait]
+pub trait CallJson {
+    /// Deserialize the request body as JSON.
+    ///
+    /// Consumes the body. Fails with `400 Bad Request` if it does not parse
+    /// into `T`.
+    async fn receive_json<T: serde::de::DeserializeOwned>(&mut self) -> churust_core::Result<T>;
+
+    /// Build a `200 OK` JSON response from `value`.
+    ///
+    /// Serialization failure yields a `500` rather than panicking: a type that
+    /// cannot serialize is a bug in the application, not in the request.
+    fn respond_json<T: serde::Serialize + Sync>(&self, value: &T) -> churust_core::Response;
+}
+
+#[async_trait::async_trait]
+impl CallJson for churust_core::Call {
+    async fn receive_json<T: serde::de::DeserializeOwned>(&mut self) -> churust_core::Result<T> {
+        // `try_receive_bytes` and the route limit, matching the `Json<T>`
+        // extractor. `receive_bytes` swallows a read error into an empty
+        // payload, which turned an over-limit body into
+        // `400 invalid JSON body: EOF while parsing a value` instead of `413`,
+        // and skipped the per-route cap entirely.
+        let bytes = self.try_receive_bytes().await?;
+        churust_core::check_body_limit(self, bytes.len())?;
+        serde_json::from_slice::<T>(&bytes)
+            .map_err(|e| churust_core::Error::bad_request(format!("invalid JSON body: {e}")))
+    }
+
+    fn respond_json<T: serde::Serialize + Sync>(&self, value: &T) -> churust_core::Response {
+        match serde_json::to_vec(value) {
+            Ok(body) => churust_core::Response::bytes("application/json", body),
+            Err(_) => churust_core::Error::internal("failed to serialize response").into_response(),
+        }
     }
 }
 

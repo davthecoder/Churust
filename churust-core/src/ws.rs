@@ -35,7 +35,7 @@ use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use tokio_tungstenite::tungstenite::protocol::Role;
+use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 use tokio_tungstenite::WebSocketStream;
 
 /// A cloneable, takeable holder for hyper's pending connection upgrade. The
@@ -43,6 +43,20 @@ use tokio_tungstenite::WebSocketStream;
 /// handshake requests; [`WebSocketUpgrade`] takes it back out.
 #[derive(Clone)]
 pub struct OnUpgradeHandle(Arc<Mutex<Option<OnUpgrade>>>);
+
+/// Frame and message size caps for an upgraded socket, seeded into the call by
+/// the engine so `on_upgrade` can apply them without reaching for global state.
+///
+/// The two are separate on purpose: a peer that respects the frame cap can
+/// still send an unbounded number of small continuation frames that reassemble
+/// into one enormous message.
+#[derive(Debug, Clone, Copy)]
+pub struct WsLimits {
+    /// Maximum size of a single frame, in bytes.
+    pub max_frame_bytes: usize,
+    /// Maximum size of a reassembled message, in bytes.
+    pub max_message_bytes: usize,
+}
 
 impl OnUpgradeHandle {
     /// Wrap a pending upgrade.
@@ -178,6 +192,7 @@ pub struct WebSocketUpgrade {
     on_upgrade: OnUpgrade,
     accept_key: HeaderValue,
     protocol: Option<HeaderValue>,
+    limits: WsLimits,
 }
 
 #[async_trait]
@@ -217,8 +232,16 @@ impl FromCallParts for WebSocketUpgrade {
             .take()
             .ok_or_else(|| Error::internal("WebSocket upgrade already consumed"))?;
 
+        // Absent only when a call was built without the engine (unit tests);
+        // the conservative defaults then apply.
+        let limits = call.get::<WsLimits>().unwrap_or(WsLimits {
+            max_frame_bytes: 1 << 20,
+            max_message_bytes: 4 << 20,
+        });
+
         Ok(WebSocketUpgrade {
             on_upgrade,
+            limits,
             accept_key,
             protocol,
         })
@@ -238,13 +261,24 @@ impl WebSocketUpgrade {
             on_upgrade,
             accept_key,
             protocol,
+            limits,
         } = self;
 
         tokio::spawn(async move {
             if let Ok(upgraded) = on_upgrade.await {
-                let stream =
-                    WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, None)
-                        .await;
+                // Bound both a single frame and a reassembled message: a peer
+                // respecting the frame cap can still stream unbounded
+                // continuation frames into one enormous message.
+                let mut ws_config = WebSocketConfig::default();
+                ws_config.max_frame_size = Some(limits.max_frame_bytes);
+                ws_config.max_message_size = Some(limits.max_message_bytes);
+
+                let stream = WebSocketStream::from_raw_socket(
+                    TokioIo::new(upgraded),
+                    Role::Server,
+                    Some(ws_config),
+                )
+                .await;
                 callback(WebSocket { inner: stream }).await;
             }
         });

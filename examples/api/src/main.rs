@@ -35,9 +35,10 @@
 //! serde   = { version = "1", features = ["derive"] }
 //! ```
 //!
-//! Two things here are demo-only and must not be copied into production: the
-//! bearer callback compares against a hard-coded token, and `Cors::permissive()`
-//! allows every origin.
+//! One thing here is demo-only and must not be copied into production: the
+//! bearer callback compares a hard-coded token with `==`. Use
+//! [`churust::secure_compare`] against a real credential store — a plain `==`
+//! leaks how much of a guess was right through its timing.
 
 use churust::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -75,7 +76,9 @@ async fn main() -> std::io::Result<()> {
         // Order of installation; phases make execution deterministic regardless.
         .install(CallLogging::new())
         .install(ContentNegotiation::new())
-        .install(Cors::permissive())
+        // Restrictive on purpose: an example is what people copy. Name the
+        // origins your browser client is actually served from.
+        .install(Cors::new().allow_origin("http://localhost:3000"))
         .install(Auth::bearer(|token: String| async move {
             // Demo only: accept a fixed admin token.
             if token == "admin-token" {
