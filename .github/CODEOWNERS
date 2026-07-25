@@ -1,0 +1,15 @@
+# Default owner for everything in the repo.
+* @davthecoder
+
+# Security-sensitive surfaces — auth, CORS, TLS, static file paths, and the
+# router. Changes here always want a maintainer's eyes, even trivial ones.
+/churust-auth/            @davthecoder
+/churust-cors/            @davthecoder
+/churust-core/src/tls.rs  @davthecoder
+/churust-core/src/fs.rs   @davthecoder
+/churust-core/src/router.rs @davthecoder
+
+# Release and CI machinery. A bad change here can publish something permanent.
+/.github/workflows/       @davthecoder
+/release.toml             @davthecoder
+/Cargo.toml               @davthecoder

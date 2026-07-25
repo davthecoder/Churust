@@ -1,0 +1,18 @@
+# Drives the "Sponsor" button on the repository.
+#
+# GitHub only renders a platform once the account behind it actually exists, so
+# the github: entry stays quiet until GitHub Sponsors enrollment is approved at
+# https://github.com/sponsors — nothing breaks in the meantime.
+#
+# Uncomment and fill in any of the others you set up. `custom` takes up to four
+# arbitrary URLs.
+
+github: [davthecoder]
+
+# ko_fi: davthecoder
+# buy_me_a_coffee: davthecoder
+# liberapay: davthecoder
+# open_collective: churust
+# thanks_dev: davthecoder
+# polar: davthecoder
+# custom: ["https://davthecoder.com/sponsor"]

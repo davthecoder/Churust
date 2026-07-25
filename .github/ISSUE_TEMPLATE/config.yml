@@ -1,0 +1,19 @@
+# Feature requests deliberately do not get an issue template — they belong in
+# Discussions, where a design can be argued before anyone writes code.
+blank_issues_enabled: false
+contact_links:
+  - name: Ask a question
+    url: https://github.com/davthecoder/Churust/discussions/categories/q-a
+    about: How do I…? Is this supposed to…? Questions live in Discussions, not Issues.
+
+  - name: Suggest a feature or an API change
+    url: https://github.com/davthecoder/Churust/discussions/categories/ideas
+    about: Churust has a deliberately narrow scope. Propose it here first — accepted ideas become issues.
+
+  - name: Report a security vulnerability
+    url: https://github.com/davthecoder/Churust/security/advisories/new
+    about: Report privately. Never open a public issue for a security bug.
+
+  - name: Rust or async help
+    url: https://users.rust-lang.org/
+    about: General Rust, tokio, or hyper questions that are not about Churust itself.

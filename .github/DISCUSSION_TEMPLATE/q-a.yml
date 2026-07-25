@@ -1,0 +1,32 @@
+title: "[question] "
+labels: ["question"]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        Before posting, the [examples](https://github.com/davthecoder/Churust/tree/main/examples)
+        cover routing, all four plugins, WebSockets, and static files, and
+        [docs.rs/churust](https://docs.rs/churust) has the full API.
+
+  - type: textarea
+    id: question
+    attributes:
+      label: Your question
+      description: What are you trying to do?
+    validations:
+      required: true
+
+  - type: textarea
+    id: attempted
+    attributes:
+      label: What you've tried
+      description: Code you've written, and what it did instead of what you wanted.
+      render: rust
+
+  - type: input
+    id: version
+    attributes:
+      label: Churust version and features
+      placeholder: "0.1.0 with full, ws"
+    validations:
+      required: true

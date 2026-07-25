@@ -1,0 +1,40 @@
+name: Documentation problem
+description: Something in the docs is wrong, missing, or misleading
+title: "[docs] "
+labels: ["documentation", "needs triage"]
+body:
+  - type: markdown
+    attributes:
+      value: >
+        Docs that mislead are worse than docs that are absent, so these reports
+        are genuinely useful. Small fixes are very welcome as direct PRs.
+
+  - type: dropdown
+    id: location
+    attributes:
+      label: Where
+      options:
+        - API docs on docs.rs
+        - README
+        - Design specs (docs/design/)
+        - Implementation plans (docs/plans/)
+        - CONTRIBUTING / RELEASING / SUPPORT
+        - Example code
+    validations:
+      required: true
+
+  - type: input
+    id: link
+    attributes:
+      label: Link or path
+      placeholder: "https://docs.rs/churust-core/latest/... or README.md#static-files"
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What's wrong
+      description: Quote the passage if you can, and say what it should say instead.
+    validations:
+      required: true

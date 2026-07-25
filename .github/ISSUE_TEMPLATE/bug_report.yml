@@ -1,0 +1,109 @@
+name: Bug report
+description: Something in Churust behaves incorrectly
+title: "[bug] "
+labels: ["bug", "needs triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. A bug we can reproduce gets fixed; one we can't
+        usually stalls, so the reproduction field matters more than any other.
+
+        **Found a security issue?** Stop here and follow
+        [SECURITY.md](https://github.com/davthecoder/Churust/blob/main/SECURITY.md)
+        instead — do not file it publicly.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What did you expect, and what did you get instead?
+      placeholder: |
+        Expected: a 404 for a traversal path
+        Actual: the file outside the served root was returned
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: >
+        The smallest program or test that shows the problem. Code that compiles
+        beats a description of code.
+      render: rust
+      placeholder: |
+        use churust::prelude::*;
+
+        #[churust::main]
+        async fn main() -> std::io::Result<()> {
+            Churust::server()
+                .routing(|r| { /* ... */ })
+                .start()
+                .await
+        }
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Churust version
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: features
+    attributes:
+      label: Enabled features
+      description: Select every feature enabled on the churust crate.
+      multiple: true
+      options:
+        - default (none)
+        - json
+        - logging
+        - cors
+        - auth
+        - full
+        - ws
+        - fs
+        - tls
+    validations:
+      required: true
+
+  - type: input
+    id: rust-version
+    attributes:
+      label: Rust version
+      description: Output of `rustc --version`. MSRV is 1.96.
+      placeholder: "rustc 1.96.0"
+    validations:
+      required: true
+
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      placeholder: "macOS 15.2 arm64 / Ubuntu 24.04 x86_64"
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error output
+      description: >
+        Full compiler error, panic with backtrace, or log output. Set
+        `RUST_BACKTRACE=1` for panics. No need for backticks.
+      render: shell
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and this is not a duplicate
+          required: true
+        - label: I reproduced this on the latest published version
+          required: true

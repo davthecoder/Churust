@@ -17,34 +17,6 @@
   <a href="https://github.com/davthecoder/Churust/blob/main/LICENSE"><img src="https://img.shields.io/crates/l/churust.svg" alt="MIT" /></a>
 </p>
 
-## Install
-
-```toml
-[dependencies]
-churust = "0.1"
-tokio = { version = "1", features = ["full"] }
-```
-
-Plugins and transports are opt-in features on the umbrella crate:
-
-```toml
-churust = { version = "0.1", features = ["full", "ws", "fs", "tls"] }
-```
-
-| Feature | Pulls in | Gives you |
-| --- | --- | --- |
-| `json` | `churust-json` | `Json<T>` extractor/responder, content negotiation |
-| `logging` | `churust-logging` | `CallLogging` via `tracing` |
-| `cors` | `churust-cors` | preflight + CORS headers |
-| `auth` | `churust-auth` | Bearer/Basic/JWT, `Principal<P>` |
-| `full` | all four above | the whole plugin set |
-| `ws` | `churust-core/ws` | WebSocket upgrade + `WebSocket`/`Message` |
-| `fs` | `churust-core/fs` | `StaticFiles` directory handler |
-| `tls` | `churust-core/tls` | rustls-backed HTTPS |
-
-Every Churust crate is released in lockstep on one version number, so
-`churust-core`, `churust-json`, and the rest always match the umbrella version.
-
 Churust gives you Ktor's developer experience in Rust: an application engine, a
 routing DSL, an `install(plugin)` system, and a phased interceptor pipeline —
 built on a battle-tested async stack (**tokio + hyper + rustls**). Churust owns
@@ -68,6 +40,39 @@ async fn main() -> std::io::Result<()> {
 }
 ```
 
+## Install
+
+```toml
+[dependencies]
+churust = "0.1"
+tokio = { version = "1", features = ["full"] }
+```
+
+Plugins and transports are opt-in features on the umbrella crate — depend on
+`churust` and enable what you need rather than pulling in the plugin crates
+directly:
+
+```toml
+churust = { version = "0.1", features = ["full", "ws", "fs", "tls"] }
+```
+
+| Feature | Pulls in | Gives you |
+| --- | --- | --- |
+| `json` | `churust-json` | `Json<T>` extractor/responder, content negotiation |
+| `logging` | `churust-logging` | `CallLogging` via `tracing` |
+| `cors` | `churust-cors` | preflight + CORS headers |
+| `auth` | `churust-auth` | Bearer/Basic/JWT, `Principal<P>` |
+| `full` | all four above | the whole plugin set |
+| `ws` | `churust-core/ws` | WebSocket upgrade + `WebSocket`/`Message` |
+| `fs` | `churust-core/fs` | `StaticFiles` directory handler |
+| `tls` | `churust-core/tls` | rustls-backed HTTPS |
+
+Default features are empty, so a plain `churust = "0.1"` compiles the core
+engine and nothing else.
+
+Every Churust crate is released in lockstep on one version number, so
+`churust-core`, `churust-json`, and the rest always match the umbrella version.
+
 ## Features
 
 - **Hybrid handlers** — write call-style (`|call: Call|`) *or* with typed
@@ -87,25 +92,24 @@ async fn main() -> std::io::Result<()> {
 
 ## Workspace layout
 
-| Crate | What it is |
-|-------|------------|
-| `churust` | Umbrella crate + `prelude`. Depend on this. Plugins behind features. |
-| `churust-core` | Engine, routing, pipeline, `Call`, extractors, config, state, TLS, test harness. |
-| `churust-macros` | `#[churust::main]`. |
-| `churust-json` | `Json<T>` extractor/responder + `ContentNegotiation` plugin (feature `json`). |
-| `churust-logging` | `CallLogging` plugin via `tracing` (feature `logging`). |
-| `churust-cors` | `Cors` plugin — preflight + headers (feature `cors`). |
-| `churust-auth` | `Auth` (Bearer/Basic/JWT) + `Principal<P>` (feature `auth`). |
-| `examples/hello` | Minimal server. |
-| `examples/api` | JSON CRUD using all four plugins + auth-gated routes. |
+| Crate | Docs | What it is |
+|-------|------|------------|
+| `churust` | [docs.rs](https://docs.rs/churust) | Umbrella crate + `prelude`. Depend on this. Plugins behind features. |
+| `churust-core` | [docs.rs](https://docs.rs/churust-core) | Engine, routing, pipeline, `Call`, extractors, config, state, TLS, WebSockets, static files, test harness. |
+| `churust-macros` | [docs.rs](https://docs.rs/churust-macros) | `#[churust::main]`. |
+| `churust-json` | [docs.rs](https://docs.rs/churust-json) | `Json<T>` extractor/responder + `ContentNegotiation` plugin (feature `json`). |
+| `churust-logging` | [docs.rs](https://docs.rs/churust-logging) | `CallLogging` plugin via `tracing` (feature `logging`). |
+| `churust-cors` | [docs.rs](https://docs.rs/churust-cors) | `Cors` plugin — preflight + headers (feature `cors`). |
+| `churust-auth` | [docs.rs](https://docs.rs/churust-auth) | `Auth` (Bearer/Basic/JWT) + `Principal<P>` (feature `auth`). |
 
-Enable plugins via features (`full` enables all four; `tls` enables rustls):
+Runnable examples:
 
-```toml
-[dependencies]
-churust = { version = "0.1", features = ["full"] } # json, logging, cors, auth
-tokio = { version = "1", features = ["full"] }
-```
+| Example | Run it | Shows |
+|---------|--------|-------|
+| [`examples/hello`](https://github.com/davthecoder/Churust/tree/main/examples/hello) | `cargo run -p hello` | Minimal server, path params. |
+| [`examples/api`](https://github.com/davthecoder/Churust/tree/main/examples/api) | `cargo run -p api` | JSON CRUD with all four plugins + auth-gated routes. |
+| [`examples/chat`](https://github.com/davthecoder/Churust/tree/main/examples/chat) | `cargo run -p chat` | WebSocket echo endpoint and a broadcast room. |
+| [`examples/static`](https://github.com/davthecoder/Churust/tree/main/examples/static) | `cargo run -p static-example` | `StaticFiles` plus a streamed response body. |
 
 ## A fuller example
 
@@ -264,26 +268,70 @@ assert_eq!(res.status(), StatusCode::OK);
 
 ## Development
 
+Requires Rust **1.96+** (the MSRV, and what CI pins).
+
 ```bash
-cargo test --workspace                  # all unit + integration tests
-cargo test -p churust --features full   # umbrella with all plugins
-cargo test -p churust-core --features tls
-cargo clippy --workspace --all-targets -- -D warnings
-cargo run -p hello        # http://127.0.0.1:8080
-cargo run -p api
+git clone https://github.com/davthecoder/Churust.git
+cd Churust
+cargo test --workspace
 ```
+
+Warnings are errors in CI. Before opening a PR, run the full gate — the exact
+command list is in [CONTRIBUTING.md](CONTRIBUTING.md#before-you-open-a-pr), and
+it covers `fmt`, the clippy feature matrix, the test feature matrix, the
+examples, and a docs build.
 
 ## Status
 
-Churust **v1** is feature-complete: routing, hybrid extractors, the four core
-plugins, named phases, config, state, timeouts, TLS, and the `#[churust::main]`
-macro. **v2.0** adds WebSockets behind the opt-in `ws` feature (see above).
-**v2.1** adds streaming response bodies (the always-on `Body` type) and static
-file serving (`StaticFiles`, behind the opt-in `fs` feature). Still deferred
-(YAGNI): sessions, response compression, HTTP/3, route-scoped middleware sugar.
+Published at **0.1.0**. Pre-1.0, so the API is settling rather than settled —
+expect breaking changes in minor releases until 1.0.
 
-Design docs and build plans live in [`docs/`](https://github.com/davthecoder/Churust/tree/main/docs).
+Everything documented above works today:
+
+- **Core** — routing, hybrid extractors, the four plugins, named phases, layered
+  config, typed state, timeouts, TLS, `#[churust::main]`
+- **WebSockets** — opt-in `ws` feature
+- **Streaming bodies** — the always-on `Body` type
+- **Static files** — `StaticFiles`, opt-in `fs` feature
+
+Deferred on purpose (YAGNI): sessions, response compression, HTTP/3,
+route-scoped middleware sugar. Want one of them? Make the case in
+[Discussions](https://github.com/davthecoder/Churust/discussions/categories/ideas).
+
+Design specs live in
+[`docs/design/`](https://github.com/davthecoder/Churust/tree/main/docs/design)
+and implementation plans in
+[`docs/plans/`](https://github.com/davthecoder/Churust/tree/main/docs/plans).
+Those documents label work as v1 / v2.0 / v2.1 — those are internal build
+milestones, not published versions.
+
+## Contributing
+
+Contributions are welcome — read [CONTRIBUTING.md](CONTRIBUTING.md) first. The
+short version: Churust keeps a narrow scope, tests come first, and anything
+optional is feature-gated so default builds never change.
+
+| | |
+| --- | --- |
+| Ask a question | [Discussions → Q&A](https://github.com/davthecoder/Churust/discussions/categories/q-a) |
+| Propose a feature | [Discussions → Ideas](https://github.com/davthecoder/Churust/discussions/categories/ideas) |
+| Report a bug | [Issues](https://github.com/davthecoder/Churust/issues/new/choose) |
+| Report a vulnerability | [SECURITY.md](SECURITY.md) — privately, never a public issue |
+| Get help | [SUPPORT.md](SUPPORT.md) |
+| Cut a release (maintainers) | [RELEASING.md](RELEASING.md) |
+
+Everyone taking part is held to the [Code of Conduct](CODE_OF_CONDUCT.md).
+
+## Sponsor
+
+Churust is built and maintained in spare time. If it saves you some, you can
+support the work through [GitHub Sponsors](https://github.com/sponsors/davthecoder).
+
+Sponsorship funds maintenance — issue triage, security response, keeping up with
+tokio/hyper/rustls releases — not feature bounties. Features are decided on
+merit in [Discussions](https://github.com/davthecoder/Churust/discussions),
+and that stays true regardless of who is sponsoring.
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).
