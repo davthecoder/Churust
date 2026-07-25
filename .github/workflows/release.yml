@@ -9,6 +9,11 @@ permissions:
   contents: write # create the GitHub Release
   id-token: write # mint the short-lived crates.io token via OIDC
 
+# Must match ci.yml, or a release could ship code a pull request would reject.
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
 jobs:
   publish:
     name: Publish to crates.io
@@ -20,6 +25,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: "1.96.0"
+          components: rustfmt, clippy
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@v2
@@ -49,6 +55,9 @@ jobs:
       - name: Clippy (umbrella, all plugins)
         run: cargo clippy -p churust --all-targets --features full -- -D warnings
 
+      - name: Clippy (core, TLS feature)
+        run: cargo clippy -p churust-core --all-targets --features tls -- -D warnings
+
       - name: Test (workspace)
         run: cargo test --workspace
 
@@ -57,6 +66,14 @@ jobs:
 
       - name: Test (core, TLS feature)
         run: cargo test -p churust-core --features tls
+
+      - name: Build examples
+        run: cargo build -p hello -p api
+
+      - name: Docs
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
 
       # Packages and verifies all seven crates without uploading, catching a
       # broken manifest before anything becomes permanent. `cargo package` is
