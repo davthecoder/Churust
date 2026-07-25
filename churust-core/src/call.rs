@@ -181,6 +181,45 @@ impl Call {
         &self.headers
     }
 
+    /// The request's host, without the port.
+    ///
+    /// Reads the `Host` header first, falling back to the URI authority. Both
+    /// spellings matter: HTTP/1.1 carries the host in a header, and HTTP/2
+    /// removed that header in favour of the `:authority` pseudo-header, which
+    /// lands in the URI. Anything that makes a decision about *which site* a
+    /// request is for must consult both, or it silently stops matching on the
+    /// protocol most clients now negotiate.
+    ///
+    /// ```
+    /// use churust_core::Call;
+    /// use http::{HeaderMap, HeaderValue, Method, header::HOST};
+    /// use bytes::Bytes;
+    ///
+    /// let mut headers = HeaderMap::new();
+    /// headers.insert(HOST, HeaderValue::from_static("example.com:8443"));
+    /// let call = Call::new(Method::GET, "/".parse().unwrap(), headers, Bytes::new());
+    /// assert_eq!(call.host().as_deref(), Some("example.com"));
+    ///
+    /// // HTTP/2: no Host header, authority in the URI.
+    /// let h2 = Call::new(
+    ///     Method::GET,
+    ///     "https://example.com/".parse().unwrap(),
+    ///     HeaderMap::new(),
+    ///     Bytes::new(),
+    /// );
+    /// assert_eq!(h2.host().as_deref(), Some("example.com"));
+    /// ```
+    pub fn host(&self) -> Option<String> {
+        let raw = self
+            .header(http::header::HOST.as_str())
+            .map(str::to_string)
+            .or_else(|| self.uri.authority().map(|a| a.as_str().to_string()))?;
+        // Strip any userinfo, then the port.
+        let after_at = raw.rsplit('@').next().unwrap_or(&raw);
+        let host = after_at.split(':').next().unwrap_or(after_at);
+        (!host.is_empty()).then(|| host.to_string())
+    }
+
     /// Replace the request URI.
     ///
     /// For middleware that rewrites the target — a path normaliser, a rewrite
@@ -422,8 +461,19 @@ impl Call {
 
     /// Take the request body as raw [`Bytes`], leaving the call's body empty.
     ///
-    /// This consumes the body: a second call returns an empty buffer. It is
-    /// `async` to leave room for future streaming bodies.
+    /// This consumes the body: a second call returns an empty buffer.
+    ///
+    /// # Prefer [`try_receive_bytes`](Call::try_receive_bytes)
+    ///
+    /// **An empty return does not mean an empty body.** The body now arrives as
+    /// a stream, and this method has no error channel, so a read that fails —
+    /// most importantly one that exceeds `max_body_bytes` — is reported as zero
+    /// bytes. A handler built on this answers `200` with whatever an empty body
+    /// produces, where the caller should have seen `413 Payload Too Large`.
+    ///
+    /// Use [`try_receive_bytes`](Call::try_receive_bytes) and let `?` turn the
+    /// failure into the right status. This method is kept for the case where
+    /// the distinction genuinely does not matter.
     ///
     /// ```
     /// use churust_core::Call;

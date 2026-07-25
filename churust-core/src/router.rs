@@ -626,6 +626,18 @@ impl Router {
         }
 
         if let Some((name, handlers)) = &node.wildcard {
+            // Refuse a tail whose segments decoded to something containing a
+            // separator. Segments are split before decoding precisely so `%2F`
+            // cannot manufacture one — rejoining the decoded pieces with `/`
+            // handed that back, making `/files/a%2Fb/c` indistinguishable from
+            // `/files/a/b/c` for every consumer of the capture. `StaticFiles`
+            // has its own guard; nothing else did.
+            if segs[i..]
+                .iter()
+                .any(|s| s.contains('/') || s.contains('\\'))
+            {
+                return Some(Match::BadPath);
+            }
             let rest = segs[i..].join("/");
             params.insert(name.clone(), rest);
             return Some(match handlers.pick(method, call) {

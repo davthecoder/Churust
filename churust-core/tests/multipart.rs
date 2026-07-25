@@ -207,3 +207,76 @@ async fn a_per_route_body_cap_still_applies() {
         "an upload route must still honour its cap"
     );
 }
+
+#[tokio::test]
+async fn a_part_cannot_forge_another_part_by_embedding_the_boundary() {
+    // RFC 2046 §5.1.1: a delimiter is CRLF followed by `--boundary`. Splitting
+    // on the bare `--boundary` let a part's *content* forge extra parts — one
+    // uploaded file could inject a field the client never sent, and the same
+    // body then framed differently for any proxy in front.
+    let body = concat!(
+        "--XYZ\r\n",
+        "Content-Disposition: form-data; name=\"file\"\r\n",
+        "\r\n",
+        // The inner `--XYZ` is NOT preceded by CRLF, so it is content.
+        "head--XYZ\r\nContent-Disposition: form-data; name=\"role\"\r\n\r\nadmin\r\n",
+        "--XYZ--\r\n"
+    );
+
+    let app = Churust::server()
+        .routing(|r| {
+            r.post("/u", |m: churust_core::multipart::Multipart| async move {
+                let names: Vec<&str> = m.parts().iter().map(|p| p.name.as_str()).collect();
+                format!("{}:{names:?}", names.len())
+            });
+        })
+        .build();
+
+    let res = TestClient::new(app)
+        .post("/u")
+        .header("content-type", "multipart/form-data; boundary=XYZ")
+        .body(body)
+        .send()
+        .await;
+
+    let text = res.text();
+    assert!(
+        text.starts_with("1:"),
+        "the embedded boundary forged an extra part: {text}"
+    );
+    assert!(!text.contains("role"), "a forged field appeared: {text}");
+}
+
+#[tokio::test]
+async fn an_empty_boundary_is_rejected() {
+    // A bare `--` delimiter would split the body on every pair of hyphens.
+    let app = Churust::server()
+        .routing(|r| {
+            r.post("/u", |m: churust_core::multipart::Multipart| async move {
+                format!("{}", m.parts().len())
+            });
+        })
+        .build();
+
+    for ct in [
+        "multipart/form-data; boundary=",
+        "multipart/form-data; boundary=\"\"",
+    ] {
+        let res = TestClient::new(
+            Churust::server()
+                .routing(|r| {
+                    r.post("/u", |m: churust_core::multipart::Multipart| async move {
+                        format!("{}", m.parts().len())
+                    });
+                })
+                .build(),
+        )
+        .post("/u")
+        .header("content-type", ct)
+        .body("--\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nx\r\n----\r\n")
+        .send()
+        .await;
+        assert_ne!(res.status(), http::StatusCode::OK, "accepted {ct}");
+    }
+    let _ = app;
+}

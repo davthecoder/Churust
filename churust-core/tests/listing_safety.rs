@@ -154,3 +154,57 @@ async fn files_are_unaffected_by_the_directory_redirect() {
     assert_eq!(res.text(), "AAA");
     let _ = std::fs::remove_dir_all(root.parent().unwrap());
 }
+
+#[tokio::test]
+async fn a_filename_cannot_become_a_url_scheme_or_query() {
+    // The listing's threat model is a filename chosen by whoever can write to
+    // the served directory. HTML-escaping alone left `:` intact, so
+    // `javascript:alert(...)` was emitted as a syntactically valid absolute URL
+    // that a browser executes in the serving origin rather than resolving
+    // relatively. `#` and `?` truncated the target instead.
+    let base = std::env::temp_dir().join(format!("churust-hostile-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let root = base.join("public");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let hostile = [
+        "javascript:alert(document.cookie)",
+        "a#b.txt",
+        "q?x=1.txt",
+        "50%.txt",
+        "a b.txt",
+    ];
+    for name in hostile {
+        std::fs::write(root.join(name), "X").unwrap();
+    }
+
+    let body = TestClient::new(app(&root)).get("/s/").send().await.text();
+
+    assert!(
+        !body.contains(r#"href="javascript:"#),
+        "a filename became a live script URL: {body}"
+    );
+    assert!(
+        body.contains("javascript%3A"),
+        "the colon must be encoded so the href stays a relative path: {body}"
+    );
+    for (raw, encoded) in [("a#b.txt", "a%23b.txt"), ("q?x=1.txt", "q%3Fx%3D1.txt")] {
+        assert!(
+            body.contains(&format!(r#"href="{encoded}""#)),
+            "{raw} should link to {encoded}: {body}"
+        );
+    }
+
+    // The visible label stays readable — only the href is encoded.
+    assert!(
+        body.contains("a b.txt"),
+        "label should not be percent-encoded: {body}"
+    );
+
+    // And an encoded link still fetches the file it names.
+    let res = TestClient::new(app(&root)).get("/s/a%20b.txt").send().await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.text(), "X");
+
+    let _ = std::fs::remove_dir_all(&base);
+}

@@ -57,15 +57,21 @@ struct HostGuard(String);
 
 impl Guard for HostGuard {
     fn check(&self, call: &Call) -> bool {
-        // Compare the host only: an explicit port is not part of the identity
-        // the caller asked about.
-        call.header("host")
-            .map(|h| h.split(':').next().unwrap_or(h))
-            .is_some_and(|h| h.eq_ignore_ascii_case(&self.0))
+        // `Call::host` reads the `Host` header *and* the URI authority. HTTP/2
+        // dropped the header in favour of `:authority`, so reading only the
+        // header meant every host-guarded route silently stopped matching over
+        // h2 — which ALPN prefers — and traffic fell through to whatever
+        // unguarded sibling was registered as the fallback. The port is not
+        // part of the identity the caller asked about, and `host` strips it.
+        call.host().is_some_and(|h| h.eq_ignore_ascii_case(&self.0))
     }
 }
 
-/// Passes when the `Host` header matches, ignoring any port and case.
+/// Passes when the request's host matches, ignoring any port and case.
+///
+/// Reads the `Host` header over HTTP/1.1 and the `:authority` pseudo-header
+/// over HTTP/2, so a vhost-scoped route matches on both protocols. See
+/// [`Call::host`](crate::Call::host).
 pub fn host(name: impl Into<String>) -> BoxGuard {
     Arc::new(HostGuard(name.into()))
 }

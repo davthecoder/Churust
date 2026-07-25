@@ -149,14 +149,32 @@ fn boundary_of(content_type: &str) -> Option<String> {
         };
         if k.trim().eq_ignore_ascii_case("boundary") {
             // The value may be quoted.
-            return Some(v.trim().trim_matches('"').to_string());
+            let value = v.trim().trim_matches('"');
+            // An empty boundary would make the delimiter a bare `--`, splitting
+            // the body on every occurrence of two hyphens.
+            if value.is_empty() {
+                return None;
+            }
+            return Some(value.to_string());
         }
     }
     None
 }
 
 fn parse(body: &[u8], boundary: &str) -> Result<Vec<Part>> {
-    let delim = format!("--{boundary}");
+    // RFC 2046 §5.1.1: a delimiter is CRLF followed by `--boundary`. Splitting
+    // on the bare `--boundary` let a part whose *content* embedded the boundary
+    // forge additional parts — so a single uploaded file could inject a second
+    // field the client never sent. It is also a parser differential against any
+    // proxy or WAF in front, which is the more dangerous half.
+    //
+    // The opening delimiter has no preceding CRLF, so a synthetic one is
+    // prepended rather than special-casing offset 0.
+    let delim = format!("\r\n--{boundary}");
+    let mut framed = Vec::with_capacity(body.len() + 2);
+    framed.extend_from_slice(b"\r\n");
+    framed.extend_from_slice(body);
+    let body: &[u8] = &framed;
     let mut parts = Vec::new();
 
     for chunk in split_on(body, delim.as_bytes()).into_iter().skip(1) {

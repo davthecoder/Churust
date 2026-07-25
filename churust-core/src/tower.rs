@@ -209,13 +209,17 @@ where
         let slot = std::cell::RefCell::new(Some((call, next)));
         let outcome = IN_FLIGHT
             .scope(slot, async move {
+                // Log the layer's own error, but do not render it: a
+                // `Service`'s `Display` is not written with a client audience
+                // in mind and routinely carries internal detail.
                 futures_util::future::poll_fn(|cx| service.poll_ready(cx))
                     .await
-                    .map_err(|e| format!("tower service not ready: {e}"))?;
-                service
-                    .call(req)
-                    .await
-                    .map_err(|e| format!("tower service failed: {e}"))
+                    .map_err(|e| {
+                        tracing::error!(error = %e, "tower service not ready");
+                    })?;
+                service.call(req).await.map_err(|e| {
+                    tracing::error!(error = %e, "tower service failed");
+                })
             })
             .await;
 
@@ -241,8 +245,9 @@ where
                 }
                 out
             }
-            // The invariant holds: a response is always produced.
-            Err(message) => crate::Error::internal(message).into_response(),
+            // The invariant holds: a response is always produced — and it says
+            // no more than the catch_unwind path does.
+            Err(()) => crate::Error::internal("Internal Server Error").into_response(),
         }
     }
 }

@@ -172,3 +172,49 @@ async fn guards_do_not_break_the_duplicate_route_check() {
         "two unguarded routes are still a duplicate"
     );
 }
+
+#[tokio::test]
+async fn host_guards_match_the_http2_authority_too() {
+    // HTTP/2 removed the `Host` header in favour of the `:authority`
+    // pseudo-header, which lands in the request URI. A host guard that reads
+    // only the header silently stopped matching over h2 — and since ALPN
+    // prefers h2, traffic fell through to whatever unguarded sibling was
+    // registered as the fallback, i.e. the wrong vhost's content.
+    use churust_core::{Call, Churust, TestClient};
+
+    let build = || {
+        Churust::server()
+            .routing(|r| {
+                r.get("/", |_c: Call| async { "ADMIN" })
+                    .guard(churust_core::guard::host("admin.example.com"));
+                r.get("/", |_c: Call| async { "PUBLIC" });
+            })
+            .build()
+    };
+
+    // HTTP/1.1 shape: host in the header.
+    let res = TestClient::new(build())
+        .get("/")
+        .header("host", "admin.example.com")
+        .send()
+        .await;
+    assert_eq!(res.text(), "ADMIN");
+
+    // HTTP/2 shape: no Host header, authority in the URI.
+    let res = TestClient::new(build())
+        .get("https://admin.example.com/")
+        .send()
+        .await;
+    assert_eq!(
+        res.text(),
+        "ADMIN",
+        "the guard ignored the :authority and fell through to the public route"
+    );
+
+    // A different authority must still miss.
+    let res = TestClient::new(build())
+        .get("https://www.example.com/")
+        .send()
+        .await;
+    assert_eq!(res.text(), "PUBLIC");
+}

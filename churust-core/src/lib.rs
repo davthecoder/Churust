@@ -147,9 +147,15 @@ where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
 {
-    tokio::task::spawn_blocking(f)
-        .await
-        .map_err(|e| Error::internal(format!("blocking task failed: {e}")))
+    tokio::task::spawn_blocking(f).await.map_err(|e| {
+        // A `JoinError` embeds the panic payload, and `Error`'s message is what
+        // is rendered to the client — so formatting it into the message published whatever an
+        // `.expect("connecting to postgres://user:pw@host")` happened to say.
+        // Keep it for the operator, send the client the same bare message a
+        // panicking handler already produces.
+        tracing::error!(error = %e, "blocking task failed");
+        Error::internal("Internal Server Error").with_source(e)
+    })
 }
 
 /// Compare two secrets without leaking their contents through timing.

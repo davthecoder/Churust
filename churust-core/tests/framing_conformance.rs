@@ -155,3 +155,32 @@ async fn a_well_formed_chunked_body_still_works() {
     .await;
     assert!(res.contains("len=11"), "{res}");
 }
+
+#[tokio::test]
+async fn a_buffered_response_is_framed_with_content_length() {
+    // Anything that wraps the response body engine-wide — the in-flight guard,
+    // for one — must stay transparent to `size_hint`. Re-streaming a buffered
+    // body silently switches every response to chunked encoding, which loses
+    // the length clients use to size a download and to satisfy a `HEAD`.
+    let res = exchange(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await;
+    let head = res.to_ascii_lowercase();
+    assert!(
+        head.contains("content-length: 2"),
+        "a buffered body lost its Content-Length: {res}"
+    );
+    assert!(
+        !head.contains("transfer-encoding: chunked"),
+        "a known-length body must not be chunked: {res}"
+    );
+}
+
+#[tokio::test]
+async fn a_head_reply_still_reports_the_length() {
+    // RFC 9110 §9.3.2: HEAD carries the headers GET would, and clients use the
+    // length to size a resource before fetching it.
+    let res = exchange(b"HEAD / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n").await;
+    assert!(
+        res.to_ascii_lowercase().contains("content-length: 2"),
+        "HEAD lost Content-Length: {res}"
+    );
+}

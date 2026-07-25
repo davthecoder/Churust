@@ -47,9 +47,20 @@ pub struct ServerSection {
     pub port: u16,
     /// Maximum accepted request body size in bytes (default `1 MiB`). Larger
     /// bodies are rejected with `413 Payload Too Large`.
+    ///
+    /// Raise [`request_timeout_ms`](Self::request_timeout_ms) alongside it: the
+    /// per-request timeout spans the upload, so a generous size cap paired with
+    /// a short timeout rejects large-but-legitimate transfers part-way through.
     pub max_body_bytes: usize,
     /// Per-request timeout in milliseconds (default `30000`). `0` disables the
     /// timeout.
+    ///
+    /// **It bounds the whole exchange, including reading the request body.**
+    /// Bodies stream, so they are read inside the handler rather than before
+    /// it, and a slow upload consumes this budget however small it is. Raising
+    /// [`max_body_bytes`](Self::max_body_bytes) therefore means raising this in
+    /// step: a 100 MiB cap with a 30-second timeout rejects any client slower
+    /// than ~3.4 MiB/s, mid-transfer, with `408`.
     pub request_timeout_ms: u64,
     /// How long a connection may take to send its complete header block, in
     /// milliseconds (default `10000`). `0` disables it.

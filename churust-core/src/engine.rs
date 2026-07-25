@@ -458,22 +458,49 @@ impl Drop for InFlight {
     }
 }
 
+/// A response body that holds an [`InFlight`] guard until it is finished.
+///
+/// A transparent wrapper, not a re-stream: `size_hint` and `is_end_stream`
+/// delegate to the inner body so a buffered response keeps its exact length and
+/// hyper still frames it with `Content-Length`. Converting everything to a
+/// stream here would have made every response chunked.
+struct GuardedBody {
+    inner: UnsyncBoxBody<Bytes, std::io::Error>,
+    /// Dropped with the body — after the last frame, or when the client goes
+    /// away mid-transfer.
+    _guard: InFlight,
+}
+
+impl hyper::body::Body for GuardedBody {
+    type Data = Bytes;
+    type Error = std::io::Error;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<std::result::Result<Frame<Bytes>, std::io::Error>>> {
+        std::pin::Pin::new(&mut self.inner).poll_frame(cx)
+    }
+
+    fn size_hint(&self) -> hyper::body::SizeHint {
+        self.inner.size_hint()
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+}
+
 /// Keep `guard` alive until the body has been fully written.
 fn attach_guard(
     body: UnsyncBoxBody<Bytes, std::io::Error>,
     guard: InFlight,
 ) -> UnsyncBoxBody<Bytes, std::io::Error> {
-    // The guard is moved into the stream's closure, so it is dropped when the
-    // stream is — whether that is after the last frame or because the client
-    // went away mid-transfer.
-    let mut guard = Some(guard);
-    let stream = BodyDataStream::new(body).map(move |chunk| {
-        if chunk.is_err() {
-            guard.take();
-        }
-        chunk.map(Frame::data)
-    });
-    StreamBody::new(stream).boxed_unsync()
+    GuardedBody {
+        inner: body,
+        _guard: guard,
+    }
+    .boxed_unsync()
 }
 
 impl ConnActivity {

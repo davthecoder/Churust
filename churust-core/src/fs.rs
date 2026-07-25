@@ -330,8 +330,15 @@ impl StaticFiles {
             let slash = if is_dir { "/" } else { "" };
             html.push_str(&format!(
                 "<li><a href=\"{}{}\">{}{}</a></li>",
-                escape_html(&name),
+                // The href is a URL, so it needs URL escaping — HTML escaping
+                // alone left `:` intact, and a file named
+                // `javascript:alert(document.cookie)` is then a syntactically
+                // valid absolute URL that a browser will not resolve
+                // relatively. It also fixes ordinary names: `a#b.txt` linked to
+                // `a` with a fragment, `q?x=1.txt` to `q` with a query.
+                escape_html(&percent_encode_segment(&name)),
                 slash,
+                // The label is text, so it stays HTML-escaped and undecorated.
                 escape_html(&name),
                 slash
             ));
@@ -346,6 +353,25 @@ impl StaticFiles {
 }
 
 /// Escape the five characters that can break out of HTML text or an attribute.
+/// Percent-encode everything outside the unreserved set, so a filename cannot
+/// be read as anything but one path segment.
+///
+/// Deliberately aggressive: the threat model here is a filename chosen by
+/// whoever can write to the served directory, and the cost of over-encoding is
+/// a longer URL that resolves identically.
+fn percent_encode_segment(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for byte in name.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
 fn escape_html(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
