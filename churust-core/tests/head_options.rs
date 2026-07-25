@@ -21,6 +21,46 @@ fn app() -> App {
 }
 
 #[tokio::test]
+async fn options_reports_the_allowed_methods() {
+    let res = TestClient::new(app())
+        .request(Method::OPTIONS, "/")
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    let allow = res.header("allow").unwrap_or_default();
+    assert!(allow.contains("GET"), "allow was {allow:?}");
+    assert!(
+        allow.contains("HEAD"),
+        "HEAD is synthesized wherever GET exists, so it belongs in Allow: {allow:?}"
+    );
+    assert!(allow.contains("OPTIONS"), "allow was {allow:?}");
+}
+
+#[tokio::test]
+async fn options_lists_only_the_methods_a_path_has() {
+    let res = TestClient::new(app())
+        .request(Method::OPTIONS, "/submit")
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    let allow = res.header("allow").unwrap_or_default();
+    assert!(allow.contains("POST"), "allow was {allow:?}");
+    assert!(
+        !allow.contains("HEAD"),
+        "/submit has no GET, so HEAD must not be advertised: {allow:?}"
+    );
+}
+
+#[tokio::test]
+async fn options_on_an_unknown_path_is_404() {
+    let res = TestClient::new(app())
+        .request(Method::OPTIONS, "/nope")
+        .send()
+        .await;
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn head_falls_back_to_get() {
     let res = TestClient::new(app())
         .request(Method::HEAD, "/")

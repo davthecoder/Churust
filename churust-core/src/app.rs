@@ -453,6 +453,29 @@ impl App {
                     }
                 }
 
+                // Automatic OPTIONS, only where no handler claimed the request.
+                // CORS runs in the Plugins phase and short-circuits preflight
+                // before this endpoint is reached, so an installed Cors keeps
+                // priority over this.
+                if method == Method::OPTIONS && !matches!(lookup, Match::Found { .. }) {
+                    let mut allow = inner.router.methods_for(&path);
+                    if !allow.is_empty() {
+                        if allow.contains(&Method::GET) && !allow.contains(&Method::HEAD) {
+                            allow.push(Method::HEAD);
+                        }
+                        allow.push(Method::OPTIONS);
+                        let value = allow
+                            .iter()
+                            .map(|m| m.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        return Response::new(StatusCode::NO_CONTENT).with_header(
+                            ALLOW,
+                            HeaderValue::from_str(&value).unwrap_or(HeaderValue::from_static("")),
+                        );
+                    }
+                }
+
                 match lookup {
                     Match::Found { handler, params } => {
                         call.set_params(params);

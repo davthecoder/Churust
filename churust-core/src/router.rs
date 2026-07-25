@@ -208,6 +208,43 @@ impl Router {
         }
     }
 
+    /// The methods registered for `path`, including any a trailing wildcard
+    /// would serve. Empty when the path matches no route at all.
+    ///
+    /// Used by the dispatcher to build the `Allow` header for an `OPTIONS`
+    /// request that has no handler of its own.
+    ///
+    /// ```
+    /// use churust_core::{boxed, Call, IntoHandler, Router};
+    /// use http::Method;
+    ///
+    /// let mut router = Router::new();
+    /// router.add(Method::GET, "/x", boxed((|_c: Call| async { "" }).into_handler()));
+    /// assert_eq!(router.methods_for("/x"), vec![Method::GET]);
+    /// assert!(router.methods_for("/nope").is_empty());
+    /// ```
+    pub fn methods_for(&self, path: &str) -> Vec<Method> {
+        let segments = split_segments(path);
+        let mut params = HashMap::new();
+        let mut out: Vec<Method> = Self::walk(&self.root, &segments, 0, &mut params)
+            .map(|n| n.handlers.0.keys().cloned().collect())
+            .unwrap_or_default();
+
+        // TRACE is a probe: nothing registers it, so `walk_wildcard` reports
+        // MethodNotAllowed carrying the wildcard's full method list.
+        params.clear();
+        if let Some(Match::MethodNotAllowed { allow }) =
+            Self::walk_wildcard(&self.root, &segments, 0, &Method::TRACE, &mut params)
+        {
+            for m in allow {
+                if !out.contains(&m) {
+                    out.push(m);
+                }
+            }
+        }
+        out
+    }
+
     fn walk<'a>(
         node: &'a Node,
         segs: &[&str],

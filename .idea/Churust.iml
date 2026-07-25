@@ -15,6 +15,7 @@
       <sourceFolder url="file://$MODULE_DIR$/examples/api/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/examples/chat/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/examples/static/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/churust/tests" isTestSource="true" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
     <orderEntry type="inheritedJdk" />
