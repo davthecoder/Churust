@@ -66,7 +66,7 @@ churust = { version = "0.2", features = ["full", "ws", "fs", "tls"] }
 | `logging` | `churust-logging` | `CallLogging` via `tracing` |
 | `cors` | `churust-cors` | preflight + CORS headers |
 | `auth` | `churust-auth` | Bearer/Basic/JWT, `Principal<P>` |
-| `ratelimit` | `churust-ratelimit` | `RateLimit`, GCRA, keyed on the peer address |
+| `ratelimit` | `churust-ratelimit` | `RateLimit`, GCRA, keyed on the peer address (IPv6 by prefix) |
 | `compression` | `churust-compression` | brotli / gzip / deflate response bodies |
 | `templates` | `churust-templates` | `Templates` + `Renderer`, minijinja, HTML-escaped whatever the template is named |
 | `full` | the seven above | the whole plugin set |
@@ -110,18 +110,23 @@ Every Churust crate is released in lockstep on one version number, so
   is not capped by memory.
 - **Peer address** — `call.peer_addr()` for rate limiting and audit logs.
 - **Deployment knobs** — idle keep-alive, listen backlog, connection cap, TLS
-  handshake cap and deadline, HTTP/2 stream and header limits, a bounded
-  shutdown grace period that actually drains, several bind addresses, and Unix
-  domain sockets.
+  handshake cap and a deadline that bounds queueing for it as well as the
+  handshake itself, HTTP/2 stream and header limits, a bounded shutdown grace
+  period that actually drains, several bind addresses, and Unix domain sockets
+  that refuse to unlink a live one.
 - **File uploads** — `Multipart` buffers the whole body; `MultipartStream` reads
   fields and their content incrementally, so memory stops scaling with upload
   size. Both behind the `multipart` feature.
 - **Typed app state / DI** — `.state(T)` then extract `State<T>`.
 - **Layered config** — defaults < `churust.toml` < env (`CHURUST_*`) < code DSL.
-- **Secure by default** — security headers on every response, body-size limits,
-  request and header-read timeouts (slow-loris), header and path-depth caps,
-  WebSocket frame and message caps, panic isolation (a panicking handler
-  returns 500, never crashes the server), no version banner, opt-in rustls TLS.
+- **Secure by default** — security headers on every response, including the
+  `413`s, `400`s and `408`s a transport writes for itself without reaching a
+  handler; body-size limits; request and header-read timeouts, the latter
+  covering a connection from the moment it is accepted rather than from the
+  moment a protocol is chosen, so a peer that connects and says nothing is still
+  bounded (slow-loris); header and path-depth caps; WebSocket frame and message
+  caps; panic isolation (a panicking handler returns 500, never crashes the
+  server); no version banner; opt-in rustls TLS.
 - **HTTP/1.1, HTTP/2 and HTTP/3** — h2 over TLS via ALPN, h2c by prior knowledge
   in plaintext, negotiated per connection; h3 over QUIC on its own listener
   behind the `http3` feature, with `advertise_http3` emitting the `Alt-Svc`
@@ -129,11 +134,15 @@ Every Churust crate is released in lockstep on one version number, so
 - **Response compression** — brotli, gzip and deflate, negotiated from
   `Accept-Encoding`, streaming bodies included (feature `compression`).
 - **Rate limiting** — GCRA, so bursts are smoothed and `Retry-After` is exact
-  rather than estimated (feature `ratelimit`).
-- **Templating** — minijinja, parsed at startup, auto-escaped by file extension
+  rather than estimated. IPv6 peers are bucketed by network prefix, because a
+  subscriber is handed a whole `/64` and limiting each address in it separately
+  limits nobody (feature `ratelimit`).
+- **Templating** — minijinja, parsed at startup, HTML-escaped whatever the
+  template is called, since the rendered output is served as HTML either way
   (feature `templates`).
-- **Server-side sessions** — Redis-backed, so logging out actually revokes
-  (feature `redis`).
+- **Server-side sessions** — Redis-backed, so logging out actually revokes, and
+  a revocation that could not be carried out is an error rather than a cheerful
+  `200` over a session that is still live (feature `redis`).
 - **An HTTP client** — pooled, bounded, on the same hyper the server runs on
   (feature `client`).
 - **OpenAPI 3.1** — paths and parameters from the router, prose and schemas from
