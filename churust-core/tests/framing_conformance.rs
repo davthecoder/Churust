@@ -66,22 +66,35 @@ async fn transfer_encoding_wins_over_content_length() {
     )
     .await;
 
-    // Churust rejects rather than framing-by-chunked-and-continuing. hyper
-    // frames it correctly on its own, which is permitted — but the risk is not
-    // what this server does with the message, it is that an intermediary in
-    // front may have believed the Content-Length and forwarded a different
-    // number of body bytes. Refusing removes the desync regardless.
-    assert!(
-        res.starts_with("HTTP/1.1 400"),
-        "expected 400 for a Transfer-Encoding + Content-Length request: {res}"
-    );
+    // What matters is the desync, not the status line, and two different
+    // layers remove it depending on which hyper resolved.
+    //
+    // Churust's own guard (`engine::handle`) answers `400` when it can see both
+    // headers. From hyper 1.11 it cannot: hyper strips the `Content-Length`
+    // during parsing, so the guard's condition is never true and the request
+    // reaches the handler framed by the chunked coding — but hyper also sets
+    // `keep_alive = false` for exactly this message shape, so the connection
+    // still closes. Both paths end the same way, and the property below is the
+    // one that actually holds off the attack: whatever an intermediary in front
+    // believed the body length to be, no leftover byte survives to be read as
+    // the start of a second request.
+    //
+    // `hyper = "1"` still admits pre-1.11 versions, so the guard stays.
     assert!(
         res.to_ascii_lowercase().contains("connection: close"),
         "the connection must be closed, or leftover bytes become the next request: {res}"
     );
+    let responses = res.matches("HTTP/1.1 ").count();
+    assert_eq!(
+        responses, 1,
+        "one ambiguous message produced {responses} responses: {res}"
+    );
+    // If it was served rather than refused, the transfer coding must be what
+    // framed it. Honouring the lying Content-Length instead would mean reading
+    // 99 bytes for a 5-byte body — the desync itself.
     assert!(
-        !res.contains("len="),
-        "the body was served despite ambiguous framing: {res}"
+        res.starts_with("HTTP/1.1 400") || res.contains("len=5"),
+        "the Content-Length was framed on instead of the transfer coding: {res}"
     );
 }
 

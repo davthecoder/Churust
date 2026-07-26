@@ -483,6 +483,15 @@ released together, so every entry below applies to the whole set.
   was already blocked by the `..` rejection, but `%2F` silently became a real
   separator once a wildcard's segments were rejoined, which made the safety
   argument depend on reasoning about rejoining.
+- **A request carrying both `Transfer-Encoding` and `Content-Length` answers
+  `400` below hyper 1.11 and is served-then-closed from 1.11 onwards.** Either
+  way the connection does not survive the message, which is the property that
+  matters: whatever a proxy in front believed the body length to be, no leftover
+  byte is read as the start of a second request. hyper 1.11 removes the
+  `Content-Length` while parsing, so Churust's own check can no longer see the
+  ambiguity to refuse it — but the same release sets `keep_alive = false` for
+  exactly this shape. The check stays for the versions `hyper = "1"` still
+  admits below 1.11, where nothing else closes the connection.
 
 ## [0.2.0] - 2026-07-25
 

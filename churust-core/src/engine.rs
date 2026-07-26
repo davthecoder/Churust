@@ -1008,14 +1008,25 @@ async fn handle(
     // `Content-Length` is framed by the transfer coding, and "ought to be
     // handled as an error" — no legitimate client sends both.
     //
-    // hyper frames it correctly and then keeps the connection open, which is
-    // permitted. The danger is not what Churust does with the message; it is
-    // what an intermediary in front of Churust did with it. A proxy that
-    // believes the `Content-Length` forwards a different number of body bytes
-    // than this server consumes, and the leftovers become the start of the
-    // *next* request on a reused connection — request smuggling. Since we
-    // cannot know what is upstream, refuse the ambiguity and close, which
-    // removes the desync surface whatever the proxy decided.
+    // The danger is not what Churust does with the message; it is what an
+    // intermediary in front of Churust did with it. A proxy that believes the
+    // `Content-Length` forwards a different number of body bytes than this
+    // server consumes, and the leftovers become the start of the *next* request
+    // on a reused connection — request smuggling. Since we cannot know what is
+    // upstream, refuse the ambiguity and close, which removes the desync
+    // surface whatever the proxy decided.
+    //
+    // This only fires below hyper 1.11. From 1.11 hyper removes the
+    // `Content-Length` from the parsed header map itself, so nothing here can
+    // observe the ambiguity — and there is no supported way to ask for the
+    // headers as they arrived (`HeaderCaseMap` is `pub(crate)`). Recovering the
+    // `400` would mean parsing HTTP/1 message framing off the socket ahead of
+    // hyper, which is a second framing implementation guarding the seam between
+    // two framing implementations. Not worth it, because 1.11 also sets
+    // `keep_alive = false` for this exact shape: the message is served, framed
+    // by the transfer coding, and the connection closes — which is the desync
+    // removal this branch existed to buy. `hyper = "1"` still resolves to
+    // pre-1.11 versions, where it is the only thing standing there, so it stays.
     if req.headers().contains_key(http::header::TRANSFER_ENCODING)
         && req.headers().contains_key(http::header::CONTENT_LENGTH)
     {

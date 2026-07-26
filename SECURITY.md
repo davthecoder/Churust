@@ -87,9 +87,12 @@ bug has real consequences:
   prefix-matching middleware — is in scope, as is any way to make `%2F` act as
   a separator
 - **Message framing** — a request bearing both `Transfer-Encoding` and
-  `Content-Length` is refused with `400` and the connection closed. A framing
-  disagreement that survives that, or any other way to desynchronise a
-  connection shared with an upstream proxy, is a report worth making
+  `Content-Length` does not keep its connection: below hyper 1.11 Churust
+  refuses it with `400`, and from 1.11 hyper removes the `Content-Length`,
+  frames by the transfer coding and closes afterwards. A framing disagreement
+  that survives that — above all a connection that stays open — or any other way
+  to desynchronise a connection shared with an upstream proxy, is a report worth
+  making
 - **Connection limits** — `max_connections`, `max_tls_handshakes` and
   `tls_handshake_timeout_ms`. A way to hold connections or handshake slots
   without consuming a permit, or to make the accept loop spin, is in scope
