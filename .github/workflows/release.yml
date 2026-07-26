@@ -50,28 +50,28 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Clippy (workspace, default features)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Clippy (umbrella, all plugins)
-        run: cargo clippy -p churust --all-targets --features full -- -D warnings
+        run: cargo clippy --locked -p churust --all-targets --features full -- -D warnings
 
       - name: Clippy (core, TLS feature)
-        run: cargo clippy -p churust-core --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked -p churust-core --all-targets --all-features -- -D warnings
 
       - name: Test (workspace)
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
       - name: Test (umbrella, all plugins)
-        run: cargo test -p churust --features full
+        run: cargo test --locked -p churust --features full
 
       - name: Test (core, TLS feature)
-        run: cargo test -p churust-core --all-features
+        run: cargo test --locked -p churust-core --all-features
 
       - name: Build examples
-        run: cargo build -p hello -p api
+        run: cargo build --locked -p hello -p api
 
       - name: Docs
-        run: cargo doc --workspace --no-deps
+        run: cargo doc --locked --workspace --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"
 
@@ -89,7 +89,7 @@ jobs:
       # carrying their own tokio dependency.
       - name: Package check
         run: |
-          cargo package --workspace \
+          cargo package --locked --workspace \
             --exclude hello --exclude api --exclude chat --exclude static-example
 
       # Work out what is actually missing from the registry before touching
@@ -159,7 +159,7 @@ jobs:
           published=0
           for crate in $PENDING; do
             echo "publish  $crate"
-            cargo publish -p "$crate"
+            cargo publish --locked -p "$crate"
             published=$((published + 1))
           done
           echo "::notice::published $published crate(s)"

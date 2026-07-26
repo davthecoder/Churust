@@ -104,6 +104,13 @@ RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 Warnings are errors here — `RUSTFLAGS: "-D warnings"` is set for the whole CI
 run. If it warns locally it fails remotely.
 
+`Cargo.lock` is committed, and CI passes `--locked`, so your run and CI's use
+the same dependency versions. Commit the lockfile alongside any manifest change
+that moves it, or CI fails before it compiles anything. Don't run `cargo update`
+to fix an unrelated failure: `.github/workflows/ci-float.yml` already tests the
+newest of everything weekly, and that is where an upstream behaviour change is
+supposed to surface.
+
 Touching WebSockets, static files, or TLS? Also run the feature you touched
 *and* the default build, because the whole point of the gating is that default
 builds don't change.

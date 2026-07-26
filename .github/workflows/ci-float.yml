@@ -1,0 +1,103 @@
+name: CI (floating dependencies)
+
+# The other half of committing Cargo.lock.
+#
+# ci.yml pins, so a pull request tests the author's tree and nothing else can
+# turn it red. That protection has a cost: a dependency that changes behaviour
+# under a semver-compatible version is then invisible until someone updates the
+# lockfile. This job pays that cost deliberately — it throws the lockfile away,
+# resolves the newest of everything, and runs the same gates.
+#
+# A failure here is not a broken branch. It means an upstream release changed
+# something Churust depends on, and the fix is to read that project's changelog
+# before the next `cargo update` lands it on everybody. hyper 1.11 is the worked
+# example: it began stripping a request's `Content-Length` when a
+# `Transfer-Encoding` is present, which silently disarmed the smuggling guard in
+# `engine::handle`.
+on:
+  schedule:
+    # Mondays, 05:00 UTC. Early enough in the week that a break has somewhere to
+    # go before the weekend.
+    - cron: "0 5 * * 1"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+# A manual run started while the scheduled one is going would resolve the same
+# versions twice for nothing.
+concurrency:
+  group: ci-float
+  cancel-in-progress: false
+
+jobs:
+  float:
+    name: Newest dependencies
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # Same pin as ci.yml. This job varies the dependencies, not the
+          # compiler — a toolchain change here would make a failure ambiguous.
+          toolchain: "1.96.0"
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Its own cache. Sharing ci.yml's would mean this job's resolutions
+          # get written back and served to pinned runs.
+          key: float
+
+      # Newest semver-compatible version of everything, ignoring what is
+      # committed. `--verbose` prints what moved, which is the first thing to
+      # read when the run below fails.
+      - name: Resolve newest dependencies
+        run: cargo update --verbose
+
+      # No `--locked` anywhere past this point; that is the whole point.
+      - name: Clippy (workspace, default features)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Clippy (core, every feature)
+        run: cargo clippy -p churust-core --all-targets --all-features -- -D warnings
+
+      # `--no-fail-fast`, unlike ci.yml. A scheduled report wants every
+      # behaviour change an upgrade caused, not just the first one — the hyper
+      # 1.11 failure stopped the run before four later suites had been built at
+      # all.
+      - name: Test (workspace)
+        run: cargo test --workspace --no-fail-fast
+
+      - name: Test (umbrella, all plugins)
+        run: cargo test -p churust --features full --no-fail-fast
+
+      - name: Test (core, every feature)
+        run: cargo test -p churust-core --all-features --no-fail-fast
+
+      - name: Test (plugin crates, every feature)
+        run: |
+          cargo test -p churust-json -p churust-logging -p churust-cors \
+                     -p churust-auth -p churust-lab -p churust-ratelimit \
+                     -p churust-compression -p churust-templates \
+                     -p churust-redis -p churust-client -p churust-openapi \
+                     --all-features --no-fail-fast
+
+      - name: Docs
+        run: cargo doc --workspace --no-deps
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+
+      # The lockfile that produced the result above, so a failure can be
+      # reproduced exactly instead of re-resolved into a different one.
+      - name: Upload the resolved lockfile
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Cargo.lock-resolved
+          path: Cargo.lock
+          if-no-files-found: warn
