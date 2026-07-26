@@ -479,6 +479,19 @@ released together, so every entry below applies to the whole set.
   permits a literal `%`, but since values are decoded on read, letting one
   through made the round trip lossy — a stored `%3D` came back as `=`, which
   corrupted a session payload before its signature was checked.
+- **`tls_handshake_timeout_ms` now covers the wait for a handshake permit, not
+  just the handshake.** The deadline was armed after `max_tls_handshakes` had
+  been acquired, and that acquisition had no deadline of its own — so the budget
+  behaved as a rate limiter on failure rather than as a cap. At the defaults,
+  stalled ClientHellos expired 256 per 10s while the rest waited untimed, each
+  still holding the connection permit taken before the handshake task started;
+  filling `max_connections` that way costs one TCP connect per slot and blocks
+  the accept loop for as long as the queue takes to drain, which is minutes
+  rather than the advertised ten seconds. The clock now starts when the
+  connection is accepted, and cancelling on expiry releases the queued
+  acquisition too. Under genuine handshake overload this can drop a legitimate
+  client while it is still queued; the alternative was holding its connection
+  slot instead.
 - **A connection that never chooses a protocol is now closed at
   `header_read_timeout_ms`.** The knob documented itself as "the slow-loris
   defence", but both mechanisms it drives — the HTTP/1 header deadline and the

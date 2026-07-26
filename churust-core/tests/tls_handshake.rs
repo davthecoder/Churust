@@ -140,3 +140,75 @@ async fn a_real_tls_request_still_works() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn the_deadline_covers_the_queue_and_not_just_the_handshake() {
+    // `tls_handshake_timeout_ms` exists to bound how long a peer that has not
+    // proved it can speak TLS may hold a *connection* permit. Starting the
+    // clock after `max_tls_handshakes` has been acquired bounds only the
+    // cryptography, which is the part that was never the problem: the queue in
+    // front of it is unbounded, so N stalled ClientHellos are held for N/limit
+    // deadlines rather than for one, and the connection budget drains at the
+    // rate handshakes expire.
+    //
+    // One permit and eight stalled peers makes the difference visible: covered,
+    // every peer is gone one deadline after it arrived; uncovered, the last one
+    // waits for the seven in front of it to expire first.
+    let dir = temp_dir("queue");
+    let (cert, key) = self_signed(&dir);
+    let (l, addr) = bound().await;
+
+    const DEADLINE_MS: u64 = 300;
+    const PEERS: usize = 8;
+
+    let app = Churust::server()
+        .tls(cert, key)
+        .max_tls_handshakes(1)
+        .tls_handshake_timeout_ms(DEADLINE_MS)
+        .routing(|r| {
+            r.get("/", |_c: Call| async { "ok" });
+        })
+        .build();
+    let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(async move {
+        churust_core::engine::serve_on(app, l, async {
+            let _ = rx.await;
+        })
+        .await
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // Every peer opens and stalls the same way: a plausible TLS record header
+    // and then nothing. Only one of them can be handshaking at a time.
+    let mut socks = Vec::with_capacity(PEERS);
+    for _ in 0..PEERS {
+        let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+        sock.write_all(&[0x16, 0x03, 0x01, 0x00, 0xff])
+            .await
+            .unwrap();
+        socks.push(sock);
+    }
+
+    // Measured from the moment they are all queued, so the assertion is about
+    // the depth of the queue rather than about how long connecting took.
+    let t0 = Instant::now();
+    for (i, sock) in socks.iter_mut().enumerate() {
+        let mut buf = [0u8; 64];
+        match tokio::time::timeout(Duration::from_secs(10), sock.read(&mut buf)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => {}
+            Ok(Ok(n)) => panic!("peer {i} expected a drop, read {n} bytes"),
+            Err(_) => panic!("peer {i} was still queued after 10s"),
+        }
+    }
+    let elapsed = t0.elapsed();
+
+    // Serialised, the eighth peer leaves at roughly PEERS * DEADLINE_MS
+    // (~2.4s). Covered, every peer leaves at roughly DEADLINE_MS.
+    assert!(
+        elapsed < Duration::from_millis(DEADLINE_MS * 4),
+        "{PEERS} stalled handshakes took {elapsed:?} to clear against a {DEADLINE_MS}ms \
+         deadline — the queue is not covered by it"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

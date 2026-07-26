@@ -182,6 +182,15 @@ pub struct ServerSection {
     /// this: before the handshake completes there is no HTTP layer to time out.
     /// Without it, a client that completes the TCP handshake and then sends one
     /// byte per minute holds a connection open indefinitely.
+    ///
+    /// The clock starts when the connection is accepted, so it covers waiting
+    /// for a [`max_tls_handshakes`](Self::max_tls_handshakes) permit as well as
+    /// the handshake itself. That is what makes it a bound on how long a peer
+    /// can hold a *connection* permit: timing only the handshake would let a
+    /// queue of stalled peers expire a permit's worth at a time while the rest
+    /// waited unbounded. A consequence worth knowing is that under genuine
+    /// handshake overload a legitimate client can be dropped while still
+    /// queued — the alternative is holding its connection slot instead.
     pub tls_handshake_timeout_ms: u64,
 }
 

@@ -214,33 +214,74 @@ where
                         // the accept loop.
                         let token = drain.token();
                         let conn_builder_fut = async move {
+                            // Queueing for the handshake budget and performing
+                            // the handshake are one timed step.
+                            //
                             // Handshakes get their own, much smaller budget: the
                             // work is asymmetric, cheap to ask for and expensive
                             // to answer, so the connection cap alone is too
-                            // loose a bound.
-                            let _handshake_permit = match &handshakes {
-                                Some(sem) => sem.clone().acquire_owned().await.ok(),
-                                None => None,
+                            // loose a bound. But the deadline has to cover the
+                            // wait for that budget as well as the work it
+                            // guards, because the thing being bounded is how
+                            // long a peer that has not yet proved it can speak
+                            // TLS may hold a *connection* permit — and the
+                            // connection permit is taken before this task even
+                            // starts.
+                            //
+                            // Timing only the handshake turned the budget into
+                            // a rate limiter on failure: with the default 256
+                            // permits and a 10s deadline, stalled ClientHellos
+                            // expire 256 per 10s while the rest wait on
+                            // `acquire_owned` with no deadline at all. Filling
+                            // the connection budget that way costs an attacker
+                            // one TCP connect each and blocks the accept loop
+                            // for as long as it takes to drain — minutes, at
+                            // the default caps, rather than the advertised ten
+                            // seconds.
+                            //
+                            // The cost of covering the queue is that under
+                            // genuine handshake overload a legitimate client
+                            // can be dropped while still queued. That is load
+                            // shedding, and it is the behaviour the knob
+                            // promises: no peer holds a connection permit for
+                            // longer than this.
+                            let queue_and_shake = async {
+                                let permit = match &handshakes {
+                                    Some(sem) => sem.clone().acquire_owned().await.ok(),
+                                    None => None,
+                                };
+                                // Held alongside the result so it outlives the
+                                // handshake and is released deliberately below,
+                                // rather than at the end of this block.
+                                (acceptor.accept(stream).await, permit)
                             };
-                            let handshake = acceptor.accept(stream);
-                            let accepted = match handshake_timeout {
-                                Some(limit) => match tokio::time::timeout(limit, handshake).await {
-                                    Ok(res) => res,
-                                    Err(_) => {
-                                        // Before the handshake completes there is
-                                        // no HTTP layer, so `header_read_timeout`
-                                        // cannot cover this case.
-                                        tracing::debug!(%peer, "TLS handshake timed out");
-                                        return;
+                            let (accepted, handshake_permit) = match handshake_timeout {
+                                Some(limit) => {
+                                    match tokio::time::timeout(limit, queue_and_shake).await {
+                                        Ok(pair) => pair,
+                                        Err(_) => {
+                                            // Dropping the future here cancels
+                                            // the acquire as well as the
+                                            // handshake, so a peer that timed
+                                            // out while queued returns nothing
+                                            // and holds nothing.
+                                            //
+                                            // Before the handshake completes
+                                            // there is no HTTP layer, so
+                                            // `header_read_timeout` cannot
+                                            // cover this case.
+                                            tracing::debug!(%peer, "TLS handshake timed out");
+                                            return;
+                                        }
                                     }
-                                },
-                                None => handshake.await,
+                                }
+                                None => queue_and_shake.await,
                             };
                             match accepted {
                                 Ok(tls_stream) => {
                                     // The handshake budget is for handshakes; the
                                     // connection budget takes over from here.
-                                    drop(_handshake_permit);
+                                    drop(handshake_permit);
                                     serve_stream(app, tls_stream, conn_cfg, peer, token, slot).await;
                                 }
                                 // Certificate, protocol-version and SNI failures
