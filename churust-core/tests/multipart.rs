@@ -248,6 +248,91 @@ async fn a_part_cannot_forge_another_part_by_embedding_the_boundary() {
 }
 
 #[tokio::test]
+async fn a_delimiter_followed_by_anything_but_padding_is_content() {
+    // RFC 2046 §5.1.1 allows only transport padding — SP and HTAB — between a
+    // delimiter and the CRLF that ends its line. `\r\n--Xz` is therefore not a
+    // delimiter at all, and every conforming parser reads it as part content.
+    // Accepting it here is a parser differential rather than a mere leniency:
+    // a proxy or gateway filtering on a field named `role` sees one part whose
+    // content happens to mention it, waves the body through, and the origin
+    // then parses out the field the filter exists to reject.
+    let body = concat!(
+        "--X\r\n",
+        "Content-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\n",
+        "\r\n",
+        "BEGIN\r\n",
+        "--Xz\r\n",
+        "Content-Disposition: form-data; name=\"role\"\r\n",
+        "\r\n",
+        "admin\r\n",
+        "--X--\r\n"
+    );
+
+    let app = Churust::server()
+        .routing(|r| {
+            r.post("/u", |m: churust_core::multipart::Multipart| async move {
+                let names: Vec<&str> = m.parts().iter().map(|p| p.name.as_str()).collect();
+                format!("{}:{names:?}", names.len())
+            });
+        })
+        .build();
+
+    let res = TestClient::new(app)
+        .post("/u")
+        .header("content-type", "multipart/form-data; boundary=X")
+        .body(body)
+        .send()
+        .await;
+
+    let text = res.text();
+    assert!(
+        text.starts_with("1:"),
+        "the padded delimiter forged an extra part: {text}"
+    );
+    assert!(!text.contains("role"), "a forged field appeared: {text}");
+}
+
+#[tokio::test]
+async fn real_transport_padding_after_a_delimiter_is_still_accepted() {
+    // The other half of the rule: spaces and tabs before the CRLF are legal and
+    // ignorable, so tightening the parser must not start refusing them.
+    let body = concat!(
+        "--X \t\r\n",
+        "Content-Disposition: form-data; name=\"note\"\r\n",
+        "\r\n",
+        "hi\r\n",
+        "--X--\r\n"
+    );
+
+    let app = Churust::server()
+        .routing(|r| {
+            r.post("/u", |m: churust_core::multipart::Multipart| async move {
+                m.field("note").unwrap_or_else(|| "-".into())
+            });
+        })
+        .build();
+
+    let res = TestClient::new(app)
+        .post("/u")
+        .header("content-type", "multipart/form-data; boundary=X")
+        .body(body)
+        .send()
+        .await;
+
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.text(), "hi");
+}
+
+#[tokio::test]
+async fn a_body_with_no_delimiter_at_all_is_400() {
+    // The streaming parser has always refused this. The buffered one answered
+    // `200` with no parts, so the same body was a client error through one API
+    // and a successful empty upload through the other.
+    let res = post("not multipart at all".into()).await;
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn an_empty_boundary_is_rejected() {
     // A bare `--` delimiter would split the body on every pair of hyphens.
     let app = Churust::server()

@@ -161,84 +161,217 @@ fn boundary_of(content_type: &str) -> Option<String> {
     None
 }
 
+/// The most transport padding accepted on a delimiter line.
+///
+/// RFC 2046 writes `transport-padding := *LWSP-char`, so in principle it is
+/// unbounded, but it exists for line-oriented transports that pad and no HTTP
+/// client sends any. The streaming parser has to buffer the padding before it
+/// can tell a delimiter from content, so an unbounded run would be an
+/// unbounded buffer; both parsers use the same ceiling, because two parsers
+/// that disagree about where a part ends are exactly the differential this
+/// module is trying not to be.
+const MAX_TRANSPORT_PADDING: usize = 64;
+
+/// What follows a `\r\n--boundary` match in the body.
+///
+/// RFC 2046 §5.1.1 is precise about the shape of a delimiter *line*: the
+/// delimiter, then `transport-padding` — SP and HTAB only — then CRLF; the
+/// closing delimiter puts `--` immediately after the boundary instead. A run of
+/// bytes that looks like a delimiter but is followed by anything else was never
+/// a delimiter, and belongs to the enclosing part's content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Tail {
+    /// Another part follows. The payload is how many bytes past the match its
+    /// headers begin, which is the padding plus the CRLF.
+    Part(usize),
+    /// The closing delimiter: everything after it is epilogue.
+    Close,
+    /// Not a delimiter line, so the matched bytes are part content.
+    Content,
+    /// Undecidable until more of the body arrives. Only the streaming parser
+    /// ever sees this; the buffered one has the whole body and says so.
+    NeedMore,
+}
+
+/// Classify the bytes immediately after a `\r\n--boundary` match.
+///
+/// `at_end` says that no further bytes can arrive, which turns every otherwise
+/// ambiguous truncation into a decision rather than a wait.
+fn delimiter_tail(after: &[u8], at_end: bool) -> Tail {
+    // The closing delimiter's `--` comes before its own padding, so the first
+    // two bytes settle that case on their own.
+    match (after.first(), after.get(1)) {
+        (Some(b'-'), Some(b'-')) => return Tail::Close,
+        (Some(b'-'), Some(_)) => return Tail::Content,
+        (Some(b'-'), None) => {
+            return if at_end {
+                Tail::Content
+            } else {
+                Tail::NeedMore
+            }
+        }
+        _ => {}
+    }
+
+    let mut i = 0;
+    loop {
+        match after.get(i) {
+            Some(b' ' | b'\t') if i < MAX_TRANSPORT_PADDING => i += 1,
+            Some(b'\r') => {
+                return match after.get(i + 1) {
+                    Some(b'\n') => Tail::Part(i + 2),
+                    Some(_) => Tail::Content,
+                    None if at_end => Tail::Content,
+                    None => Tail::NeedMore,
+                }
+            }
+            // Anything else — including padding past the ceiling — means this
+            // was not a delimiter line.
+            Some(_) => return Tail::Content,
+            None if at_end => return Tail::Content,
+            None => return Tail::NeedMore,
+        }
+    }
+}
+
 fn parse(body: &[u8], boundary: &str) -> Result<Vec<Part>> {
-    // RFC 2046 §5.1.1: a delimiter is CRLF followed by `--boundary`. Splitting
-    // on the bare `--boundary` let a part whose *content* embedded the boundary
-    // forge additional parts — so a single uploaded file could inject a second
-    // field the client never sent. It is also a parser differential against any
-    // proxy or WAF in front, which is the more dangerous half.
+    // RFC 2046 §5.1.1: a delimiter is CRLF followed by `--boundary`, and the
+    // line it opens carries nothing but transport padding before its CRLF. Both
+    // halves of that are load-bearing.
+    //
+    // Splitting on the bare `--boundary` let a part whose *content* embedded the
+    // boundary forge additional parts — so a single uploaded file could inject a
+    // second field the client never sent. Accepting arbitrary bytes where only
+    // padding is allowed left exactly the same hole one character further along:
+    // `\r\n--boundaryZ` is content to Go, to Python and to anything else in
+    // front, and used to be a delimiter here. That difference of opinion is the
+    // dangerous half, because a proxy or WAF that filters on a field name never
+    // sees the field it is there to reject while the origin parses it out and
+    // acts on it.
+    //
+    // So a match whose tail is not a well-formed delimiter line is content, and
+    // the scan carries on straight through it.
     //
     // The opening delimiter has no preceding CRLF, so a synthetic one is
     // prepended rather than special-casing offset 0.
-    let delim = format!("\r\n--{boundary}");
+    let delim = format!("\r\n--{boundary}").into_bytes();
     let mut framed = Vec::with_capacity(body.len() + 2);
     framed.extend_from_slice(b"\r\n");
     framed.extend_from_slice(body);
     let body: &[u8] = &framed;
+
     let mut parts = Vec::new();
+    // Where the current part's headers begin, or `None` while the scan is still
+    // in the preamble that precedes the first delimiter.
+    let mut part_at: Option<usize> = None;
+    let mut closed = false;
+    let mut at = 0;
 
-    for chunk in split_on(body, delim.as_bytes()).into_iter().skip(1) {
-        // The terminating delimiter is followed by "--".
-        if chunk.starts_with(b"--") {
-            break;
-        }
-        // Trim the CRLF that follows the delimiter and precedes the next one.
-        let chunk = strip_prefix(chunk, b"\r\n").unwrap_or(chunk);
-        let chunk = strip_suffix(chunk, b"\r\n").unwrap_or(chunk);
-        if chunk.is_empty() {
-            continue;
-        }
-
-        let Some(split) = find(chunk, b"\r\n\r\n") else {
-            return Err(Error::bad_request(
-                "malformed multipart part: no header block",
-            ));
-        };
-        let (head, content) = chunk.split_at(split);
-        let content = &content[4..];
-
-        let headers = std::str::from_utf8(head)
-            .map_err(|_| Error::bad_request("multipart headers are not valid UTF-8"))?;
-
-        let mut name = None;
-        let mut filename = None;
-        let mut content_type = None;
-        for line in headers.split("\r\n") {
-            let Some((k, v)) = line.split_once(':') else {
-                continue;
-            };
-            match k.trim().to_ascii_lowercase().as_str() {
-                "content-disposition" => {
-                    name = param_of(v, "name");
-                    filename = param_of(v, "filename");
+    while let Some(rel) = find(&body[at..], &delim) {
+        let hit = at + rel;
+        // The whole body is in hand, so the tail is always decidable; the
+        // `NeedMore` arm below only keeps the match exhaustive without a panic.
+        match delimiter_tail(&body[hit + delim.len()..], true) {
+            Tail::Part(skip) => {
+                if let Some(from) = part_at {
+                    push_part(&mut parts, &body[from..hit])?;
                 }
-                "content-type" => content_type = Some(v.trim().to_string()),
-                _ => {}
+                at = hit + delim.len() + skip;
+                part_at = Some(at);
             }
+            Tail::Close => {
+                // `take` clears the open part because it has just ended
+                // properly; the check after the loop is only for a body that
+                // ran out with a part still open.
+                if let Some(from) = part_at.take() {
+                    push_part(&mut parts, &body[from..hit])?;
+                }
+                closed = true;
+                break;
+            }
+            // Content the scan must keep. Resuming one byte past the start of
+            // the false match rather than past the whole of it matters when the
+            // boundary can overlap itself: a real delimiter may begin inside the
+            // bytes that just failed to be one.
+            Tail::Content | Tail::NeedMore => at = hit + 1,
         }
+    }
 
-        let Some(name) = name else {
-            return Err(Error::bad_request(
-                "multipart part is missing a Content-Disposition name",
-            ));
-        };
-
-        if parts.len() >= MAX_PARTS {
-            return Err(Error::new(
-                http::StatusCode::PAYLOAD_TOO_LARGE,
-                "too many multipart parts",
-            ));
-        }
-
-        parts.push(Part {
-            name,
-            filename,
-            content_type,
-            bytes: Bytes::copy_from_slice(content),
-        });
+    if part_at.is_some() {
+        // A part was opened and the body ran out before its delimiter arrived.
+        // Reporting the truncation is what the streaming parser does, and a
+        // truncated upload silently becoming a shorter file is the failure this
+        // avoids.
+        return Err(Error::bad_request("multipart body ended inside a part"));
+    }
+    if !closed {
+        // No delimiter line anywhere, so this was not a multipart body at all.
+        // It used to be `200` with no parts here and `400` through
+        // `MultipartStream`; one body, one answer.
+        return Err(Error::bad_request(
+            "multipart body has no boundary delimiter",
+        ));
     }
 
     Ok(parts)
+}
+
+/// Parse one part out of the bytes between the end of its delimiter line and
+/// the start of the next delimiter, and append it.
+///
+/// `chunk` carries no framing of its own: the CRLF ending the delimiter line
+/// was consumed by the caller and the CRLF before the next delimiter is part of
+/// that delimiter, so everything after the header block is content exactly as
+/// it was sent.
+fn push_part(parts: &mut Vec<Part>, chunk: &[u8]) -> Result<()> {
+    let Some(split) = find(chunk, b"\r\n\r\n") else {
+        return Err(Error::bad_request(
+            "malformed multipart part: no header block",
+        ));
+    };
+    let (head, content) = chunk.split_at(split);
+    let content = &content[4..];
+
+    let headers = std::str::from_utf8(head)
+        .map_err(|_| Error::bad_request("multipart headers are not valid UTF-8"))?;
+
+    let mut name = None;
+    let mut filename = None;
+    let mut content_type = None;
+    for line in headers.split("\r\n") {
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
+        match k.trim().to_ascii_lowercase().as_str() {
+            "content-disposition" => {
+                name = param_of(v, "name");
+                filename = param_of(v, "filename");
+            }
+            "content-type" => content_type = Some(v.trim().to_string()),
+            _ => {}
+        }
+    }
+
+    let Some(name) = name else {
+        return Err(Error::bad_request(
+            "multipart part is missing a Content-Disposition name",
+        ));
+    };
+
+    if parts.len() >= MAX_PARTS {
+        return Err(Error::new(
+            http::StatusCode::PAYLOAD_TOO_LARGE,
+            "too many multipart parts",
+        ));
+    }
+
+    parts.push(Part {
+        name,
+        filename,
+        content_type,
+        bytes: Bytes::copy_from_slice(content),
+    });
+    Ok(())
 }
 
 /// The most bytes of part headers accepted before a part is refused.
@@ -255,8 +388,10 @@ const DEFAULT_MAX_FIELD_BYTES: usize = 8 * 1024 * 1024;
 enum Phase {
     /// Before the first delimiter. Anything here is preamble and is discarded.
     Preamble,
-    /// A delimiter was just consumed; the next two bytes say whether another
-    /// part follows or the body is over.
+    /// A whole delimiter line was consumed, padding and CRLF included, so the
+    /// buffer now starts at the next part's headers. Whoever matched the
+    /// delimiter has already decided it was one, which is why nothing further
+    /// re-examines those bytes.
     AfterDelimiter,
     /// Inside a part's content.
     InPart,
@@ -394,30 +529,12 @@ impl MultipartStream {
             return Ok(None);
         }
 
-        // AfterDelimiter: two bytes decide whether another part follows.
-        while self.buffer.len() < 2 {
-            if !self.fill().await? {
-                return Err(Error::bad_request("multipart body ended after a delimiter"));
-            }
-        }
-        if &self.buffer[..2] == b"--" {
-            self.phase = Phase::Done;
-            return Ok(None);
-        }
-        // Any transport padding between the delimiter and the CRLF is legal and
-        // ignorable, but the CRLF itself is required.
-        let line_end = loop {
-            match find(&self.buffer, b"\r\n") {
-                Some(at) => break at,
-                None => {
-                    if self.buffer.len() > MAX_PART_HEADER_BYTES || !self.fill().await? {
-                        return Err(Error::bad_request("malformed multipart delimiter"));
-                    }
-                }
-            }
-        };
-        let _ = self.buffer.split_to(line_end + 2);
-
+        // AfterDelimiter: the delimiter line was classified and consumed where
+        // it was matched, so what is buffered here is the part's header block.
+        // This used to skip to the next CRLF from wherever the delimiter ended,
+        // which quietly accepted arbitrary bytes in place of the transport
+        // padding RFC 2046 allows, and so let `\r\n--boundaryZ` inside a part's
+        // content open a part of its own.
         let (name, filename, content_type) = self.read_part_headers().await?;
 
         self.parts_seen += 1;
@@ -439,13 +556,48 @@ impl MultipartStream {
         }))
     }
 
-    /// Discard everything up to and including the next delimiter.
+    /// Decide whether the boundary match at `at` in the buffer really opens a
+    /// delimiter line, reading more of the body while the tail is ambiguous.
+    ///
+    /// Never returns [`Tail::NeedMore`]: once the body has drained there is
+    /// nothing left to wait for and the tail is judged on what is there. The
+    /// wait is bounded by [`MAX_TRANSPORT_PADDING`] plus the two bytes of the
+    /// CRLF, so a hostile run of padding cannot grow the buffer.
+    async fn classify_at(&mut self, at: usize) -> Result<Tail> {
+        loop {
+            let after = at + self.delimiter.len();
+            let tail = delimiter_tail(&self.buffer[after..], self.drained);
+            if tail != Tail::NeedMore {
+                return Ok(tail);
+            }
+            self.fill().await?;
+        }
+    }
+
+    /// Discard everything up to and including the next delimiter line.
     async fn consume_through_delimiter(&mut self) -> Result<()> {
         loop {
             if let Some(at) = find(&self.buffer, &self.delimiter) {
-                let _ = self.buffer.split_to(at + self.delimiter.len());
-                self.phase = Phase::AfterDelimiter;
-                return Ok(());
+                match self.classify_at(at).await? {
+                    Tail::Part(skip) => {
+                        let _ = self.buffer.split_to(at + self.delimiter.len() + skip);
+                        self.phase = Phase::AfterDelimiter;
+                        return Ok(());
+                    }
+                    Tail::Close => {
+                        self.phase = Phase::Done;
+                        return Ok(());
+                    }
+                    // A boundary-looking run that is not a delimiter line is
+                    // preamble like everything else before the first real one,
+                    // so it can simply be dropped. Dropping one byte rather
+                    // than the whole match keeps a genuine delimiter that
+                    // overlaps it findable.
+                    Tail::Content | Tail::NeedMore => {
+                        let _ = self.buffer.split_to(at + 1);
+                        continue;
+                    }
+                }
             }
             // Keep only what could still be the start of a delimiter, so a long
             // preamble cannot grow the buffer without bound.
@@ -524,12 +676,40 @@ impl MultipartStream {
         if self.phase != Phase::InPart {
             return Ok(None);
         }
+        // How far into the buffer the search may start: everything before it has
+        // already been judged not to open a delimiter line. Only ever advances
+        // within one call, and `fill` appends, so the offset stays valid.
+        let mut from = 0;
         loop {
-            if let Some(at) = find(&self.buffer, &self.delimiter) {
-                let data = self.buffer.split_to(at).freeze();
-                let _ = self.buffer.split_to(self.delimiter.len());
-                self.phase = Phase::AfterDelimiter;
-                return Ok((!data.is_empty()).then_some(data));
+            if let Some(rel) = find(&self.buffer[from..], &self.delimiter) {
+                let at = from + rel;
+                // A boundary match only ends the part if a well-formed
+                // delimiter line follows it. Deciding that here rather than in
+                // `next_field` is what makes the decision act on the content:
+                // by the time the handler has been handed these bytes it is too
+                // late to take them back and call them a delimiter, or to call
+                // a delimiter content.
+                match self.classify_at(at).await? {
+                    Tail::Part(skip) => {
+                        let data = self.buffer.split_to(at).freeze();
+                        let _ = self.buffer.split_to(self.delimiter.len() + skip);
+                        self.phase = Phase::AfterDelimiter;
+                        return Ok((!data.is_empty()).then_some(data));
+                    }
+                    Tail::Close => {
+                        let data = self.buffer.split_to(at).freeze();
+                        self.phase = Phase::Done;
+                        return Ok((!data.is_empty()).then_some(data));
+                    }
+                    // Not a delimiter, so these bytes are this part's content
+                    // and will be handed out with the rest of it. Resuming one
+                    // byte in keeps a real delimiter overlapping the false one
+                    // findable.
+                    Tail::Content | Tail::NeedMore => {
+                        from = at + 1;
+                        continue;
+                    }
+                }
             }
 
             // Nothing but a possible partial delimiter is safe to emit, so hold
@@ -675,28 +855,31 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
-fn split_on<'a>(data: &'a [u8], sep: &[u8]) -> Vec<&'a [u8]> {
-    let mut out = Vec::new();
-    let mut rest = data;
-    while let Some(i) = find(rest, sep) {
-        out.push(&rest[..i]);
-        rest = &rest[i + sep.len()..];
-    }
-    out.push(rest);
-    out
-}
-
-fn strip_prefix<'a>(data: &'a [u8], p: &[u8]) -> Option<&'a [u8]> {
-    data.starts_with(p).then(|| &data[p.len()..])
-}
-
-fn strip_suffix<'a>(data: &'a [u8], p: &[u8]) -> Option<&'a [u8]> {
-    data.ends_with(p).then(|| &data[..data.len() - p.len()])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_delimiter_line_admits_only_spaces_and_tabs_before_its_crlf() {
+        assert_eq!(delimiter_tail(b"\r\nnext", true), Tail::Part(2));
+        assert_eq!(delimiter_tail(b" \t \r\nnext", true), Tail::Part(5));
+        assert_eq!(delimiter_tail(b"--\r\n", true), Tail::Close);
+        // The forged-part case: any other byte means the boundary-looking run
+        // was content.
+        assert_eq!(delimiter_tail(b"z\r\nnext", true), Tail::Content);
+        assert_eq!(delimiter_tail(b"-z", true), Tail::Content);
+        assert_eq!(delimiter_tail(b"\rx", true), Tail::Content);
+        // Padding past the ceiling is refused the same way, since a parser that
+        // buffers unbounded padding is a parser with an unbounded buffer.
+        let over = vec![b' '; MAX_TRANSPORT_PADDING + 1];
+        assert_eq!(delimiter_tail(&over, true), Tail::Content);
+        // A truncation is only undecidable while more bytes may still arrive.
+        assert_eq!(delimiter_tail(b"", false), Tail::NeedMore);
+        assert_eq!(delimiter_tail(b"\r", false), Tail::NeedMore);
+        assert_eq!(delimiter_tail(b"-", false), Tail::NeedMore);
+        assert_eq!(delimiter_tail(b"", true), Tail::Content);
+        assert_eq!(delimiter_tail(b"\r", true), Tail::Content);
+    }
 
     #[test]
     fn reads_the_boundary() {

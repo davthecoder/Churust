@@ -68,6 +68,22 @@ released together, so every entry below applies to the whole set.
   `HEAD` reply, describing an error the matching `GET` does not report. Such a
   reply now keeps its empty body and corrects only its headers, so it describes
   the representation `GET` would return.
+- **A `multipart/form-data` delimiter line admits only spaces and tabs before
+  its CRLF, in both parsers.** RFC 2046 §5.1.1 allows nothing but
+  `transport-padding` there, and both `Multipart` and `MultipartStream` accepted
+  arbitrary bytes instead — so a part whose content held `\r\n--boundaryZ\r\n…`
+  opened a part of its own. Go, Python and every other conforming parser read
+  those bytes as content, which makes this a parser differential rather than a
+  leniency: a proxy or gateway filtering on a field name sees one part that
+  merely mentions it and passes the body on, while the origin parses out the
+  field the filter exists to reject and acts on it. A boundary match whose tail
+  is not a well-formed delimiter line is now content in both parsers and the
+  scan continues through it; padding is capped at 64 bytes, since the streaming
+  parser must buffer it before it can judge the line. Two consequences of the
+  buffered parser scanning rather than splitting: a body with no delimiter at
+  all is `400`, as it always was through `MultipartStream`, rather than `200`
+  with no parts; and a body ending with a part still open is likewise `400`
+  instead of yielding a silently truncated part.
 - **A saturated connection budget no longer blocks shutdown.** The accept loop
   awaited a `max_connections` permit *outside* the shutdown race, so once every
   slot was held the shutdown signal was never polled — `serve()` did not return

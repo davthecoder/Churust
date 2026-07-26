@@ -142,6 +142,79 @@ async fn content_containing_the_boundary_text_is_not_split_early() {
 }
 
 #[tokio::test]
+async fn a_delimiter_followed_by_anything_but_padding_is_content() {
+    // RFC 2046 §5.1.1 allows only transport padding — SP and HTAB — between a
+    // delimiter and the CRLF that ends its line, so `\r\n--Xz` is content and
+    // not a delimiter. A parser that accepts it frames the body differently
+    // from every conforming one in front of it, which is how a field-level
+    // filter in a proxy comes to pass a body whose forged field the origin then
+    // acts on.
+    let body = [
+        "--X\r\n",
+        "Content-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\n\r\n",
+        "BEGIN\r\n",
+        "--Xz\r\n",
+        "Content-Disposition: form-data; name=\"role\"\r\n\r\n",
+        "admin\r\n",
+        "--X--\r\n",
+    ]
+    .concat();
+
+    let app = Churust::server()
+        .routing(|r| {
+            r.post("/upload", |mut form: MultipartStream| async move {
+                let mut out = Vec::new();
+                while let Some(mut field) = form.next_field().await? {
+                    let name = field.name().to_string();
+                    out.push(format!("{name}={}", field.text().await?));
+                }
+                Ok::<_, Error>(out.join(","))
+            });
+        })
+        .build();
+
+    let res = TestClient::new(app)
+        .post("/upload")
+        .header("content-type", "multipart/form-data; boundary=X")
+        .body(body)
+        .send()
+        .await;
+
+    let text = res.text();
+    assert!(
+        text.starts_with("file=BEGIN"),
+        "the one part must own everything from BEGIN onward: {text}"
+    );
+    assert!(
+        !text.contains("role="),
+        "the padded delimiter forged a field: {text}"
+    );
+}
+
+#[tokio::test]
+async fn real_transport_padding_after_a_delimiter_is_still_accepted() {
+    // Spaces and tabs before the CRLF are legal and ignorable, so requiring the
+    // CRLF must not mean refusing what precedes it.
+    let body = [
+        "--X \t\r\n",
+        "Content-Disposition: form-data; name=\"note\"\r\n\r\n",
+        "hi\r\n",
+        "--X--\r\n",
+    ]
+    .concat();
+
+    let res = TestClient::new(summing_app())
+        .post("/upload")
+        .header("content-type", "multipart/form-data; boundary=X")
+        .body(body)
+        .send()
+        .await;
+
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.text(), "note=2");
+}
+
+#[tokio::test]
 async fn a_body_that_stops_inside_a_part_is_a_400() {
     let truncated = [
         "--X\r\n",
