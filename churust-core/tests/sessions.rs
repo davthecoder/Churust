@@ -191,7 +191,7 @@ mod expiry {
         // cookie ignores it. Without a deadline inside the signature, a captured
         // session stayed valid for as long as the signing key did.
         let issuer = CookieStore::new(b"k".to_vec()).with_max_age(-1);
-        let raw = issuer.store(&data(), None).await.unwrap();
+        let raw = issuer.store(&data(), None).await.unwrap().unwrap();
         let reader = CookieStore::new(b"k".to_vec()).with_max_age(3600);
         assert!(
             reader.load(&raw).await.is_none(),
@@ -202,7 +202,7 @@ mod expiry {
     #[tokio::test]
     async fn a_cookie_inside_its_deadline_still_loads() {
         let store = CookieStore::new(b"k".to_vec()).with_max_age(3600);
-        let raw = store.store(&data(), None).await.unwrap();
+        let raw = store.store(&data(), None).await.unwrap().unwrap();
         let back = store.load(&raw).await.expect("a live session must load");
         assert_eq!(back.get("user").map(String::as_str), Some("ana"));
     }
@@ -212,7 +212,7 @@ mod expiry {
         // The reserved key is an implementation detail, not something a handler
         // should see in its session map.
         let store = CookieStore::new(b"k".to_vec()).with_max_age(3600);
-        let raw = store.store(&data(), None).await.unwrap();
+        let raw = store.store(&data(), None).await.unwrap().unwrap();
         let back = store.load(&raw).await.unwrap();
         assert_eq!(back.len(), 1, "{back:?}");
         assert!(back.keys().all(|k| !k.starts_with("__churust")), "{back:?}");
@@ -225,7 +225,7 @@ mod expiry {
         let store = CookieStore::new(b"k".to_vec()).with_max_age(3600);
         let mut m = data();
         m.insert("__churust_exp".into(), "99999999999".into());
-        let raw = store.store(&m, None).await.unwrap();
+        let raw = store.store(&m, None).await.unwrap().unwrap();
         let back = store.load(&raw).await.unwrap();
         assert_eq!(back.len(), 1, "the forged key survived: {back:?}");
     }
@@ -234,7 +234,7 @@ mod expiry {
     async fn without_a_max_age_a_cookie_does_not_expire() {
         // Unchanged behaviour when no deadline was asked for.
         let store = CookieStore::new(b"k".to_vec());
-        let raw = store.store(&data(), None).await.unwrap();
+        let raw = store.store(&data(), None).await.unwrap().unwrap();
         assert!(store.load(&raw).await.is_some());
     }
 
@@ -242,12 +242,78 @@ mod expiry {
     async fn the_deadline_is_covered_by_the_signature() {
         // Editing the expiry must invalidate the cookie rather than extend it.
         let store = CookieStore::new(b"k".to_vec()).with_max_age(-1);
-        let raw = store.store(&data(), None).await.unwrap();
+        let raw = store.store(&data(), None).await.unwrap().unwrap();
         let (sig, payload) = raw.split_once('.').unwrap();
         let tampered = format!(
             "{sig}.{}",
             payload.replace("__churust_exp=", "__churust_exp=9")
         );
         assert!(store.load(&tampered).await.is_none());
+    }
+}
+
+mod revocation {
+    use async_trait::async_trait;
+    use churust_core::session::SessionStore;
+    use churust_core::{Churust, Session, Sessions, TestClient};
+    use std::collections::BTreeMap;
+
+    /// A server-side store whose backing state has gone away at the worst
+    /// possible moment: it can still recognise the cookie it issued, but it
+    /// cannot withdraw the record behind it.
+    ///
+    /// This is what a Redis outage looks like from the middleware's side, and
+    /// the case the store trait has to be able to describe: the alternative is
+    /// a logout that returns `200` while the session it was supposed to destroy
+    /// is still valid.
+    struct CannotRevoke;
+
+    #[async_trait]
+    impl SessionStore for CannotRevoke {
+        async fn load(&self, _raw: &str) -> Option<BTreeMap<String, String>> {
+            let mut data = BTreeMap::new();
+            data.insert("user".to_string(), "ana".to_string());
+            Some(data)
+        }
+
+        async fn store(
+            &self,
+            data: &BTreeMap<String, String>,
+            _previous: Option<&str>,
+        ) -> churust_core::Result<Option<String>> {
+            if data.is_empty() {
+                return Err(churust_core::Error::internal("session was not revoked"));
+            }
+            Ok(Some("live".to_string()))
+        }
+    }
+
+    fn app() -> churust_core::App {
+        Churust::server()
+            .install(Sessions::with_store(CannotRevoke))
+            .routing(|r| {
+                r.get("/logout", |s: Session| async move {
+                    s.clear();
+                    "bye".to_string()
+                });
+            })
+            .build()
+    }
+
+    #[tokio::test]
+    async fn a_logout_the_store_could_not_carry_out_is_not_answered_with_success() {
+        let res = TestClient::new(app())
+            .get("/logout")
+            .header("cookie", "churust_session=whatever")
+            .send()
+            .await;
+
+        assert_eq!(
+            res.status(),
+            500,
+            "a revocation that did not happen must not be reported as a logout, got {:?}",
+            res.text()
+        );
+        assert_ne!(res.text(), "bye", "the handler's answer must not stand");
     }
 }

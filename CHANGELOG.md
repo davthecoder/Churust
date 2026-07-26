@@ -22,6 +22,25 @@ released together, so every entry below applies to the whole set.
   no server-side record. Implementors add `#[async_trait]`, mark both methods
   `async`, and take `previous: Option<&str>` on `store`.
 
+- **`SessionStore::store` returns `Result<Option<String>>`, and a revocation
+  that did not happen is no longer answered as a logout.** `Option<String>` gave
+  a store no way to say "I did not do that", so a logout whose Redis `DEL` never
+  landed was indistinguishable from one that worked: `RedisStore` discarded the
+  error, returned `None` for "no new cookie", and the middleware let the
+  handler's cheerful `200` stand. The record at `churust:session:<id>` then
+  survived for its full TTL, and since sliding expiry is on by default, a cookie
+  copied before the logout both authenticated *and* pushed the deadline out
+  again on every replay — for as long as the holder cared to keep using it.
+  Being able to withdraw a session is the entire reason to keep one server-side,
+  so failing to do so must be loud. `RedisStore` now reports a delete that did
+  not get through, both on logout and on the rotation `Identity::login`
+  performs, and the session middleware answers with that error in place of the
+  handler's response, setting no cookie: the visitor is told they are still
+  signed in and can try again. A failed *write* is still swallowed on purpose —
+  that costs the visitor a sign-in, which beats a `500` on every route while
+  Redis is unwell. Implementors wrap what they returned before in `Ok`; direct
+  callers of `store` add a `?`.
+
 - **`//a` and `/a//b` no longer serve `/a/b`.** Interior empty segments were
   collapsed silently, so one resource had several URLs. Two things follow from
   that: any middleware, guard or proxy rule keyed on a literal prefix

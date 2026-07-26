@@ -29,7 +29,7 @@ use crate::cookie::Cookie;
 use crate::error::Result;
 use crate::extract::FromCallParts;
 use crate::pipeline::{Middleware, Next};
-use crate::response::Response;
+use crate::response::{IntoResponse, Response};
 use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -144,19 +144,34 @@ pub trait SessionStore: Send + Sync + 'static {
     /// Recover a session from the cookie value, if it is intact.
     async fn load(&self, raw: &str) -> Option<BTreeMap<String, String>>;
 
-    /// Persist the session and return the new cookie value, or `None` to leave
-    /// the visitor's cookie untouched.
+    /// Persist the session and return the new cookie value, or `Ok(None)` to
+    /// leave the visitor's cookie untouched.
     ///
     /// `previous` is the cookie value this request arrived with, if any. A
     /// server-side store needs it to delete the record it is replacing: without
     /// it, logging out would leave the old record readable until its own TTV
     /// elapsed, which is exactly the revocation a server-side store exists to
     /// provide. A client-side store ignores it.
+    ///
+    /// # Errors
+    ///
+    /// Return an `Err` when something the caller is entitled to assume happened
+    /// did not, and the case that matters is a withdrawal: an emptied `data` is
+    /// a logout, and a logout that never reached the backing store is not a
+    /// logout. The middleware then answers with that error instead of the
+    /// handler's response, because a `200` and a farewell page, sent while the
+    /// cookie the visitor just asked to be rid of still authenticates, is worse
+    /// than an honest failure they can retry.
+    ///
+    /// Failing to *save* is a different question and is usually better
+    /// swallowed with `Ok`: the visitor signs in again, which beats a `500` on
+    /// every route while the backing store is unwell. Which failures are worth
+    /// a response is therefore the store's judgement, not a blanket rule.
     async fn store(
         &self,
         data: &BTreeMap<String, String>,
         previous: Option<&str>,
-    ) -> Option<String>;
+    ) -> Result<Option<String>>;
 
     /// Adopt the session lifetime configured on [`Sessions::max_age`].
     ///
@@ -287,12 +302,14 @@ impl SessionStore for CookieStore {
     }
 
     /// `previous` is unused: the whole session lives in the cookie, so there is
-    /// no server-side record to withdraw.
+    /// no server-side record to withdraw. Nothing here can fail either, for the
+    /// same reason — signing a payload asks nothing of anybody — so this never
+    /// returns `Err`, and an emptied session simply re-signs an empty payload.
     async fn store(
         &self,
         data: &BTreeMap<String, String>,
         _previous: Option<&str>,
-    ) -> Option<String> {
+    ) -> Result<Option<String>> {
         let mut pairs: Vec<String> = data
             .iter()
             // Never let an application key masquerade as the deadline.
@@ -303,7 +320,7 @@ impl SessionStore for CookieStore {
             pairs.push(format!("{}={}", esc(EXPIRY_KEY), now + age));
         }
         let payload = pairs.join("&");
-        Some(format!("{}.{}", self.sign(&payload), payload))
+        Ok(Some(format!("{}.{}", self.sign(&payload), payload)))
     }
 }
 
@@ -406,16 +423,30 @@ impl Middleware for SessionMiddleware {
         // on every response is noise, and it would extend the expiry of a
         // session the visitor is not actually using.
         if session.changed() {
-            if let Some(value) = self
+            match self
                 .store
                 .store(&session.snapshot(), arrived_with.as_deref())
                 .await
             {
-                let mut c = Cookie::new(self.cookie_name.clone(), value).secure(self.secure);
-                if let Some(age) = self.max_age {
-                    c = c.max_age(age);
+                Ok(Some(value)) => {
+                    let mut c = Cookie::new(self.cookie_name.clone(), value).secure(self.secure);
+                    if let Some(age) = self.max_age {
+                        c = c.max_age(age);
+                    }
+                    res = res.with_cookie(c);
                 }
-                res = res.with_cookie(c);
+                Ok(None) => {}
+                // The handler has already written what it thinks happened, and
+                // on the path that matters — a logout the store could not carry
+                // out — what it thinks happened is wrong. Its response is
+                // therefore discarded rather than decorated: answering `200`
+                // while the cookie the visitor asked to be rid of still
+                // authenticates is exactly the outcome this branch exists to
+                // prevent, and the visitor would have no reason to try again.
+                // No cookie is set either, because none should be: the session
+                // is still live, and clearing the client's copy would only make
+                // the survivor harder to notice.
+                Err(e) => return e.into_response(),
             }
         }
         res

@@ -27,6 +27,10 @@
 //! live in Redis, and logging out deletes the record, so a stolen cookie stops
 //! working the moment its owner signs out.
 //!
+//! That promise is only worth having if a broken one is audible, so a delete
+//! that does not reach Redis fails the request instead of returning a farewell
+//! page over a session that is still alive.
+//!
 //! The cost is an ordinary one: a network round trip per request that touches
 //! the session, and a Redis to keep running.
 //!
@@ -45,7 +49,7 @@
 use async_trait::async_trait;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use churust_core::{SessionStore, SESSION_ID_KEY};
+use churust_core::{Error, SessionStore, SESSION_ID_KEY};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -68,7 +72,9 @@ trait Backend: Send + Sync + 'static {
     async fn get(&self, key: &str) -> Option<String>;
     async fn set(&self, key: &str, value: &str, ttl: u64);
     async fn touch(&self, key: &str, ttl: u64);
-    async fn del(&self, key: &str);
+    /// Whether the key is known to be gone. `false` means the command did not
+    /// get through, which the store must not mistake for a revocation.
+    async fn del(&self, key: &str) -> bool;
 }
 
 /// A [`SessionStore`] that keeps session contents in Redis.
@@ -215,15 +221,17 @@ impl SessionStore for RedisStore {
         &self,
         data: &BTreeMap<String, String>,
         previous: Option<&str>,
-    ) -> Option<String> {
+    ) -> Result<Option<String>, Error> {
         // An emptied session is a logout. Delete the record rather than writing
         // an empty one: the point of a server-side store is that the withdrawal
         // is real, not advisory.
         if data.is_empty() {
             if let Some(old) = previous.filter(|raw| is_well_formed(raw)) {
-                self.backend.del(&self.key(old)).await;
+                if !self.backend.del(&self.key(old)).await {
+                    return Err(revocation_failed());
+                }
             }
-            return None;
+            return Ok(None);
         }
 
         let carried = data.get(SESSION_ID_KEY).filter(|id| is_well_formed(id));
@@ -237,18 +245,41 @@ impl SessionStore for RedisStore {
         // The record it came from is withdrawn here, which is what stops a
         // planted session id from surviving a privilege change.
         if let Some(old) = previous.filter(|raw| is_well_formed(raw) && *raw != id) {
-            self.backend.del(&self.key(old)).await;
+            // Same reasoning as the logout above, and the same consequence if
+            // it is ignored: the planted identifier keeps resolving, so the
+            // fixation defence this delete *is* did not happen. Better to fail
+            // the privilege change than to complete it and leave the attacker
+            // holding a session the victim's browser has already moved on from.
+            if !self.backend.del(&self.key(old)).await {
+                return Err(revocation_failed());
+            }
         }
 
         // The identifier is the key; storing it in the value as well would be
         // one more thing that can disagree with itself.
         let mut payload = data.clone();
         payload.remove(SESSION_ID_KEY);
-        let encoded = serde_json::to_string(&payload).ok()?;
+        let Ok(encoded) = serde_json::to_string(&payload) else {
+            return Ok(None);
+        };
 
+        // A failed write is deliberately not an error: the visitor signs in
+        // again, which is the degradation this store promises when Redis is
+        // unwell. Only a failed *withdrawal* is worth a response, because that
+        // one leaves a credential alive that somebody asked to have killed.
         self.backend.set(&self.key(&id), &encoded, self.ttl).await;
-        Some(id)
+        Ok(Some(id))
     }
+}
+
+/// The error a caller sees when a session could not be withdrawn.
+///
+/// Deliberately says nothing about Redis. The message is the response body, and
+/// which backing store an application uses, or that it is having a bad day, is
+/// not the visitor's business; what they need to know is that they are still
+/// signed in and should try again.
+fn revocation_failed() -> Error {
+    Error::internal("the session could not be ended; please try again")
 }
 
 /// The real backend: one multiplexed connection, reconnected on failure.
@@ -266,6 +297,12 @@ impl RedisBackend {
     /// cannot be read is an anonymous visitor, and a session that cannot be
     /// written is a visitor who has to sign in again. Both are worse than
     /// working and much better than a 500 on every route.
+    ///
+    /// A delete is the exception, and it is why [`Backend::del`] reports its
+    /// outcome while the others do not. Degrading a read or a write costs the
+    /// visitor a sign-in; degrading a delete hands an attacker the session the
+    /// visitor was trying to destroy, so that one is raised rather than
+    /// shrugged off.
     async fn run<T: redis::FromRedisValue>(&self, cmd: &redis::Cmd) -> Option<T> {
         for attempt in 0..2 {
             let mut guard = self.connection.lock().await;
@@ -313,8 +350,13 @@ impl Backend for RedisBackend {
         let _ = self.run::<()>(redis::cmd("EXPIRE").arg(key).arg(ttl)).await;
     }
 
-    async fn del(&self, key: &str) {
-        let _ = self.run::<()>(redis::cmd("DEL").arg(key)).await;
+    async fn del(&self, key: &str) -> bool {
+        // `run` already retried once and redialled in between, so a `None` here
+        // means the key's fate is genuinely unknown, not merely that the socket
+        // blinked. Redis answers `DEL` with the number of keys removed and zero
+        // is a perfectly good answer — the record had already expired — so it
+        // is the command failing, not the count, that this reports.
+        self.run::<()>(redis::cmd("DEL").arg(key)).await.is_some()
     }
 }
 
@@ -368,8 +410,9 @@ mod tests {
             }
         }
 
-        async fn del(&self, key: &str) {
+        async fn del(&self, key: &str) -> bool {
             self.entries.lock().unwrap().remove(key);
+            true
         }
     }
 
@@ -377,6 +420,44 @@ mod tests {
         let backend = Arc::new(MemoryBackend::default());
         let store = RedisStore {
             backend: Arc::new(backend.clone()),
+            prefix: DEFAULT_PREFIX.to_string(),
+            ttl: DEFAULT_TTL,
+            sliding: true,
+        };
+        (store, backend)
+    }
+
+    /// A backend that reads and writes happily but never manages a delete.
+    ///
+    /// It is not merely a broken `del`: it is the shape of the interesting
+    /// failure, where everything looks healthy right up to the moment a
+    /// visitor asks to be signed out and the one operation that matters is the
+    /// one that does not happen.
+    struct RefusesDeletes(Arc<MemoryBackend>);
+
+    #[async_trait]
+    impl Backend for RefusesDeletes {
+        async fn get(&self, key: &str) -> Option<String> {
+            self.0.get(key).await
+        }
+
+        async fn set(&self, key: &str, value: &str, ttl: u64) {
+            self.0.set(key, value, ttl).await
+        }
+
+        async fn touch(&self, key: &str, ttl: u64) {
+            self.0.touch(key, ttl).await
+        }
+
+        async fn del(&self, _key: &str) -> bool {
+            false
+        }
+    }
+
+    fn refusing_store() -> (RedisStore, Arc<MemoryBackend>) {
+        let backend = Arc::new(MemoryBackend::default());
+        let store = RedisStore {
+            backend: Arc::new(RefusesDeletes(backend.clone())),
             prefix: DEFAULT_PREFIX.to_string(),
             ttl: DEFAULT_TTL,
             sliding: true,
@@ -397,6 +478,7 @@ mod tests {
         let id = store
             .store(&data(&[("user", "ana")]), None)
             .await
+            .expect("the write must succeed")
             .expect("a new session gets an id");
 
         let back = store.load(&id).await.expect("it must load again");
@@ -409,6 +491,7 @@ mod tests {
         let id = store
             .store(&data(&[("user", "ana"), ("secret", "hunter2")]), None)
             .await
+            .unwrap()
             .unwrap();
 
         assert!(is_well_formed(&id));
@@ -425,7 +508,11 @@ mod tests {
         let (store, _) = store();
         let mut seen = std::collections::HashSet::new();
         for _ in 0..256 {
-            let id = store.store(&data(&[("k", "v")]), None).await.unwrap();
+            let id = store
+                .store(&data(&[("k", "v")]), None)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(id.len(), ID_CHARS);
             assert!(seen.insert(id), "a session id was reused");
         }
@@ -434,12 +521,19 @@ mod tests {
     #[tokio::test]
     async fn logging_out_deletes_the_record() {
         let (store, backend) = store();
-        let id = store.store(&data(&[("user", "ana")]), None).await.unwrap();
+        let id = store
+            .store(&data(&[("user", "ana")]), None)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(backend.len(), 1);
 
         // An emptied session is what `Session::clear` produces.
         let reissued = store.store(&BTreeMap::new(), Some(&id)).await;
-        assert_eq!(reissued, None, "there is no new cookie to set on logout");
+        assert!(
+            matches!(reissued, Ok(None)),
+            "a completed logout has no new cookie to set"
+        );
         assert_eq!(
             backend.len(),
             0,
@@ -452,16 +546,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_logout_the_backend_refused_is_not_reported_as_a_logout() {
+        let (store, backend) = refusing_store();
+        let id = store
+            .store(&data(&[("user", "ana")]), None)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let outcome = store.store(&BTreeMap::new(), Some(&id)).await;
+
+        assert!(
+            store.load(&id).await.is_some(),
+            "the stand-in must have kept the record, or this proves nothing"
+        );
+        assert_eq!(backend.len(), 1, "the record survived the failed delete");
+        assert!(
+            outcome.is_err(),
+            "a session that is still valid must not be reported as withdrawn"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rotation_whose_withdrawal_failed_is_refused_too() {
+        // `Session::rotate`, which `Identity::login` calls, is the session
+        // fixation defence: the planted identifier must stop resolving. If the
+        // delete does not happen the defence did not happen either, so the
+        // request must not be answered as though it had.
+        let (store, _) = refusing_store();
+        let first = store
+            .store(&data(&[("cart", "3")]), None)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mut rotated = store.load(&first).await.unwrap();
+        rotated.remove(SESSION_ID_KEY);
+        rotated.insert("user".into(), "ana".into());
+
+        assert!(
+            store.store(&rotated, Some(&first)).await.is_err(),
+            "the pre-login identifier still resolves, so the rotation failed"
+        );
+        assert!(
+            store.load(&first).await.is_some(),
+            "the stand-in must have kept the record, or this proves nothing"
+        );
+    }
+
+    #[tokio::test]
     async fn rotating_mints_a_new_id_and_withdraws_the_old_one() {
         let (store, backend) = store();
-        let first = store.store(&data(&[("cart", "3")]), None).await.unwrap();
+        let first = store
+            .store(&data(&[("cart", "3")]), None)
+            .await
+            .unwrap()
+            .unwrap();
 
         // What `Session::rotate` leaves behind: the contents, minus the id.
         let mut rotated = store.load(&first).await.unwrap();
         rotated.remove(SESSION_ID_KEY);
         rotated.insert("user".into(), "ana".into());
 
-        let second = store.store(&rotated, Some(&first)).await.unwrap();
+        let second = store.store(&rotated, Some(&first)).await.unwrap().unwrap();
         assert_ne!(first, second, "a rotated session must change identifier");
         assert!(
             store.load(&first).await.is_none(),
@@ -476,11 +623,15 @@ mod tests {
     #[tokio::test]
     async fn an_unchanged_session_keeps_its_identifier() {
         let (store, backend) = store();
-        let id = store.store(&data(&[("user", "ana")]), None).await.unwrap();
+        let id = store
+            .store(&data(&[("user", "ana")]), None)
+            .await
+            .unwrap()
+            .unwrap();
 
         let mut loaded = store.load(&id).await.unwrap();
         loaded.insert("theme".into(), "dark".into());
-        let again = store.store(&loaded, Some(&id)).await.unwrap();
+        let again = store.store(&loaded, Some(&id)).await.unwrap().unwrap();
 
         assert_eq!(id, again, "an ordinary write must not rotate the session");
         assert_eq!(backend.len(), 1);
@@ -511,7 +662,11 @@ mod tests {
     #[tokio::test]
     async fn the_stored_value_does_not_repeat_the_identifier() {
         let (store, backend) = store();
-        let id = store.store(&data(&[("user", "ana")]), None).await.unwrap();
+        let id = store
+            .store(&data(&[("user", "ana")]), None)
+            .await
+            .unwrap()
+            .unwrap();
         let raw = backend.live(&format!("{DEFAULT_PREFIX}{id}")).unwrap();
         assert!(
             !raw.contains(SESSION_ID_KEY),
@@ -523,7 +678,11 @@ mod tests {
     async fn expiry_removes_a_session() {
         let (mut store, _) = store();
         store.ttl = 1;
-        let id = store.store(&data(&[("user", "ana")]), None).await.unwrap();
+        let id = store
+            .store(&data(&[("user", "ana")]), None)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(store.load(&id).await.is_some());
 
         tokio::time::sleep(Duration::from_millis(1100)).await;
@@ -537,7 +696,11 @@ mod tests {
     async fn sliding_expiry_extends_on_read() {
         let (mut store, backend) = store();
         store.ttl = 2;
-        let id = store.store(&data(&[("user", "ana")]), None).await.unwrap();
+        let id = store
+            .store(&data(&[("user", "ana")]), None)
+            .await
+            .unwrap()
+            .unwrap();
 
         // Read across more than the original ttl, in steps shorter than it.
         for _ in 0..3 {
@@ -552,7 +715,11 @@ mod tests {
         let (mut store, _) = store();
         store.ttl = 1;
         store.sliding = false;
-        let id = store.store(&data(&[("user", "ana")]), None).await.unwrap();
+        let id = store
+            .store(&data(&[("user", "ana")]), None)
+            .await
+            .unwrap()
+            .unwrap();
 
         tokio::time::sleep(Duration::from_millis(600)).await;
         assert!(store.load(&id).await.is_some());
@@ -567,7 +734,11 @@ mod tests {
     async fn a_custom_prefix_is_applied() {
         let (mut store, backend) = store();
         store.prefix = "app:sess:".into();
-        let id = store.store(&data(&[("user", "ana")]), None).await.unwrap();
+        let id = store
+            .store(&data(&[("user", "ana")]), None)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(backend.live(&format!("app:sess:{id}")).is_some());
     }
 
