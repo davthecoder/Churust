@@ -214,6 +214,37 @@ released together, so every entry below applies to the whole set.
   probe now awaits `tokio::fs::metadata` and reads any error as "no index here",
   exactly as `is_file` did, so the behaviour is unchanged and only the blocking
   is gone.
+- **`churust-client` follows a relative redirect whose query carries a URL.**
+  `resolve` decided whether a `Location` was absolute by searching the whole
+  value for `://`, and that substring is perfectly ordinary *inside a query*. So
+  `Location: /login?next=https://api.example.com/dashboard` — the return-to
+  parameter every login flow uses, and therefore exactly the redirect an HTTP
+  client meets most — was read as an absolute target and handed to `http`
+  verbatim, which parsed it as a scheme-less origin-form URI; `check_scheme`
+  then refused it and `send()` returned `ClientError::Url("no scheme in url")`.
+  A redirect the client should simply have followed became a hard failure of the
+  whole request. Absoluteness is now decided structurally, as RFC 3986 §4.2
+  does: only when the segment before the first `/`, `?` or `#` is a colon
+  preceded by a well-formed scheme. Two behaviours follow from doing it
+  properly. A `Location` that is nothing but a query (`?page=2`) now replaces
+  the query and keeps the path, per §5.3, instead of being joined on as a path
+  segment. And a target naming a scheme without a `//`, such as
+  `mailto:ops@example.com`, is taken whole and refused by `check_scheme` rather
+  than pasted onto the current origin, where it had been producing a real
+  request for `http://host/mailto:ops@example.com`.
+- **A redirect that turns a request into a `GET` drops the headers describing
+  the body it just discarded.** On a `301`, `302` or `303` the loop cleared the
+  method and the body but left the caller's headers untouched, and they are
+  re-applied on every hop — so a `POST` built with `json()` continued as a `GET`
+  still announcing `Content-Type: application/json` for a payload that no longer
+  existed. That is a request contradicting itself, and it is not what anything
+  else on the wire sends: the Fetch standard deletes the
+  request-body-header-names on precisely this transition, as curl, reqwest and
+  tower-http all do. `Content-Type`, `Content-Length`, `Content-Encoding` and
+  `Transfer-Encoding` are now removed when the method flips, and recorded
+  alongside the cross-origin credential strip so a client-wide default header
+  cannot put one back on the next hop. `307` and `308` keep the body and so keep
+  these headers, which is the whole reason those codes exist.
 - **A saturated connection budget no longer blocks shutdown.** The accept loop
   awaited a `max_connections` permit *outside* the shutdown race, so once every
   slot was held the shutdown signal was never polled — `serve()` did not return

@@ -40,8 +40,8 @@
 
 use bytes::Bytes;
 use http::header::{
-    HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE, COOKIE, LOCATION, PROXY_AUTHORIZATION,
-    USER_AGENT,
+    HeaderName, HeaderValue, AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, COOKIE,
+    LOCATION, PROXY_AUTHORIZATION, TRANSFER_ENCODING, USER_AGENT,
 };
 use http::{HeaderMap, Method, Request, StatusCode, Uri};
 use http_body_util::{BodyExt, Full, Limited};
@@ -382,9 +382,11 @@ impl RequestBuilder {
         let mut body = body;
         let mut hops = 0usize;
 
-        // Header names dropped for the remainder of this exchange because a
-        // redirect crossed an origin. Recorded rather than merely removed,
-        // since the default headers are re-applied on every hop.
+        // Header names dropped for the remainder of this exchange: a
+        // credential once a redirect crossed an origin, an entity header once
+        // a redirect flipped the method and emptied the body. Recorded rather
+        // than merely removed, since the default headers are re-applied on
+        // every hop and would otherwise put back whatever was taken out.
         let mut stripped: std::collections::HashSet<http::HeaderName> =
             std::collections::HashSet::new();
 
@@ -399,8 +401,9 @@ impl RequestBuilder {
 
             let target = request.headers_mut();
             for (name, value) in &client.default_headers {
-                // A default header is still a credential if it is one, and the
-                // loop re-applies these on every hop.
+                // A default header is still a credential if it is one, and
+                // still describes a body if it is one, so anything this
+                // exchange has decided to drop stays dropped here too.
                 if stripped.contains(name) {
                     continue;
                 }
@@ -472,6 +475,24 @@ impl RequestBuilder {
                     {
                         method = Method::GET;
                         body = Bytes::new();
+                        // The headers that described the body have to leave
+                        // with it. `json()` and `form()` set `Content-Type`,
+                        // and re-applying it on the next hop sends a `GET`
+                        // that announces `application/json` for a payload that
+                        // no longer exists — a request contradicting itself,
+                        // and one no other client sends: the Fetch standard
+                        // deletes the request-body-header-names on precisely
+                        // this transition, which is what curl, reqwest and
+                        // tower-http all implement.
+                        for name in [
+                            CONTENT_TYPE,
+                            CONTENT_LENGTH,
+                            CONTENT_ENCODING,
+                            TRANSFER_ENCODING,
+                        ] {
+                            headers.remove(&name);
+                            stripped.insert(name);
+                        }
                     }
                     hops += 1;
                     continue;
@@ -534,13 +555,45 @@ fn check_scheme(uri: &Uri) -> Result<(), ClientError> {
     }
 }
 
+/// Whether a `Location` value opens with a scheme of its own, and is therefore
+/// an absolute target to be taken whole rather than joined onto the current one.
+///
+/// This used to be `location.contains("://")`, which searches the entire value
+/// for a substring that is perfectly ordinary *inside a query*. The return-to
+/// parameter that every login flow carries — `/login?next=https://host/page` —
+/// was therefore read as absolute, handed to `http` as-is, and parsed into a
+/// scheme-less origin-form URI, which `check_scheme` then rejected with "no
+/// scheme in url". A redirect the client should simply have followed became a
+/// hard error, and it did so on exactly the shape a client meets most.
+///
+/// RFC 3986 §4.2 decides this structurally instead: a reference is absolute
+/// only when its first segment, everything before the first `/`, `?` or `#`,
+/// is a scheme followed by a colon. A leading delimiter means there is no
+/// scheme at all, and a colon appearing after one belongs to the path, the
+/// query or the fragment and says nothing about this reference.
+fn names_its_own_scheme(location: &str) -> bool {
+    let Some(boundary) = location.find([':', '/', '?', '#']) else {
+        return false;
+    };
+    if location.as_bytes()[boundary] != b':' {
+        return false;
+    }
+    // RFC 3986 §3.1: scheme = ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ). The
+    // leading-ALPHA rule is what keeps a bare `8080:...` from being read as a
+    // scheme, and it is why the grammar is worth spelling out rather than just
+    // testing for a colon.
+    let mut scheme = location[..boundary].chars();
+    scheme.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && scheme.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
 /// Resolve a `Location` value against the URL it came from.
 ///
 /// Relative targets are joined onto the current origin. A target that names its
 /// own scheme is taken as-is and then re-checked by [`check_scheme`], so a
 /// redirect cannot walk an `https` request down to `http`, or into `file:`.
 fn resolve(current: &Uri, location: &str) -> Result<Uri, ClientError> {
-    if location.contains("://") {
+    if names_its_own_scheme(location) {
         return location
             .parse()
             .map_err(|e| ClientError::Url(format!("bad redirect target: {e}")));
@@ -553,6 +606,13 @@ fn resolve(current: &Uri, location: &str) -> Result<Uri, ClientError> {
 
     let joined = if location.starts_with('/') {
         format!("{scheme}://{authority}{location}")
+    } else if location.starts_with('?') {
+        // RFC 3986 §5.3: a reference that is only a query replaces the query
+        // and keeps the path whole. Falling through to the relative-path arm
+        // below would drop the last path segment instead, which used to be
+        // masked for the `?next=https://...` case because the old `://` scan
+        // sent it down the absolute branch and failed the request outright.
+        format!("{scheme}://{authority}{}{location}", current.path())
     } else {
         let base = current
             .path()
@@ -662,6 +722,48 @@ mod tests {
                 .unwrap()
                 .to_string(),
             "http://other.test/x"
+        );
+    }
+
+    #[test]
+    fn a_relative_redirect_whose_query_contains_a_url_still_resolves() {
+        // The `next=` return-to parameter is how every login flow remembers
+        // where the visitor was going, and its value is a whole URL. Deciding
+        // absoluteness by scanning the entire `Location` for `://` mistook this
+        // for an absolute target and then failed the request outright.
+        let current: Uri = "http://api.example.com/dashboard".parse().unwrap();
+        assert_eq!(
+            resolve(&current, "/login?next=https://api.example.com/dashboard")
+                .unwrap()
+                .to_string(),
+            "http://api.example.com/login?next=https://api.example.com/dashboard"
+        );
+    }
+
+    #[test]
+    fn a_redirect_naming_a_scheme_without_a_double_slash_is_not_joined_onto_the_origin() {
+        // `mailto:` carries no `//`, so the old `://` scan called it relative
+        // and pasted it onto the current origin, turning a target the client
+        // must refuse into a genuine request for
+        // `http://example.com/mailto:ops@example.com`. Structurally it is
+        // absolute, so it is now taken whole; `http` parses it as the
+        // scheme-less, authority-only URI it is, and `check_scheme` refuses it
+        // — which is the outcome a non-HTTP redirect target should have.
+        let current: Uri = "http://example.com/a".parse().unwrap();
+        let target = resolve(&current, "mailto:ops@example.com").unwrap();
+        assert_eq!(target.to_string(), "mailto:ops@example.com");
+        assert!(matches!(check_scheme(&target), Err(ClientError::Url(_))));
+    }
+
+    #[test]
+    fn a_query_only_redirect_keeps_the_path_it_came_from() {
+        // RFC 3986 §5.3: a reference that is nothing but a query replaces the
+        // query and leaves the path whole, rather than being treated as the
+        // last segment of a relative path.
+        let current: Uri = "http://example.com/a/b".parse().unwrap();
+        assert_eq!(
+            resolve(&current, "?page=2").unwrap().to_string(),
+            "http://example.com/a/b?page=2"
         );
     }
 

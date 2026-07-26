@@ -52,6 +52,17 @@ async fn serve() -> String {
                 Response::new(StatusCode::SEE_OTHER)
                     .with_header(LOCATION, HeaderValue::from_static("/method"))
             });
+            r.get("/entity", |call: Call| async move {
+                format!(
+                    "{} content-type={:?}",
+                    call.method(),
+                    call.header("content-type")
+                )
+            });
+            r.post("/see-other-entity", |_c: Call| async {
+                Response::new(StatusCode::SEE_OTHER)
+                    .with_header(LOCATION, HeaderValue::from_static("/entity"))
+            });
             r.get("/agent", |call: Call| async move {
                 call.header("user-agent").unwrap_or("none").to_string()
             });
@@ -230,6 +241,28 @@ async fn a_303_turns_a_post_into_a_get() {
         res.text().unwrap(),
         "GET",
         "RFC 9110 §15.4.4 makes the follow-up a GET"
+    );
+}
+
+#[tokio::test]
+async fn a_303_drops_the_entity_headers_along_with_the_body() {
+    // Flipping the method empties the body, so the headers that described that
+    // body describe nothing. A `GET` still announcing `Content-Type:
+    // application/json` is a request that contradicts itself, and it is not
+    // what any other client sends: the Fetch standard deletes the
+    // request-body-header-names on exactly this transition.
+    let base = serve().await;
+    let res = Client::new()
+        .post(format!("{base}/see-other-entity"))
+        .json(&serde_json::json!({"k": "v"}))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(
+        res.text().unwrap(),
+        "GET content-type=None",
+        "the entity headers outlived the body they described"
     );
 }
 
