@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/davthecoder/Churust/main/img/churust_tumb_logo.png" alt="Churust logo — a churro spiral inside a gear" width="400" />
+  <img src="https://raw.githubusercontent.com/davthecoder/Churust/main/img/churust_thumb_logo.png" alt="Churust logo — a churro spiral inside a gear" width="400" />
 </p>
 
 <h1 align="center">Churust 🌀</h1>
