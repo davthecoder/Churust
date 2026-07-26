@@ -146,6 +146,14 @@ pub use churust_core::http3;
 /// feature.
 #[cfg(feature = "auth")]
 pub use churust_auth as auth;
+/// The outbound HTTP client (`Client`). Enabled by the `client` feature, with
+/// HTTPS behind `client-tls`.
+#[cfg(feature = "client")]
+pub use churust_client as client;
+/// Response compression plugin crate (`Compression`). Enabled by the
+/// `compression` feature.
+#[cfg(feature = "compression")]
+pub use churust_compression as compression;
 /// CORS plugin crate (`Cors`). Enabled by the `cors` feature.
 #[cfg(feature = "cors")]
 pub use churust_cors as cors;
@@ -157,6 +165,21 @@ pub use churust_json as json;
 /// feature.
 #[cfg(feature = "logging")]
 pub use churust_logging as logging;
+/// OpenAPI 3.1 description generation (`OpenApi`). Enabled by the `openapi`
+/// feature.
+#[cfg(feature = "openapi")]
+pub use churust_openapi as openapi;
+/// Rate limiting plugin crate (`RateLimit`). Enabled by the `ratelimit`
+/// feature.
+#[cfg(feature = "ratelimit")]
+pub use churust_ratelimit as ratelimit;
+/// Redis-backed session storage (`RedisStore`). Enabled by the `redis` feature.
+#[cfg(feature = "redis")]
+pub use churust_redis as redis;
+/// Server-rendered templating crate (`Templates`, `Renderer`). Enabled by the
+/// `templates` feature.
+#[cfg(feature = "templates")]
+pub use churust_templates as templates;
 
 /// Common imports for everyday Churust apps.
 ///
@@ -175,6 +198,8 @@ pub mod prelude {
 
     #[cfg(feature = "auth")]
     pub use churust_auth::{Auth, Principal};
+    #[cfg(feature = "compression")]
+    pub use churust_compression::Compression;
     #[cfg(feature = "fs")]
     pub use churust_core::fs::StaticFiles;
     #[cfg(feature = "multipart")]
@@ -187,4 +212,10 @@ pub mod prelude {
     pub use churust_json::{CallJson, ContentNegotiation, Json};
     #[cfg(feature = "logging")]
     pub use churust_logging::{CallLogging, RequestId};
+    #[cfg(feature = "ratelimit")]
+    pub use churust_ratelimit::RateLimit;
+    #[cfg(feature = "redis")]
+    pub use churust_redis::RedisStore;
+    #[cfg(feature = "templates")]
+    pub use churust_templates::{context, Renderer, Templates};
 }

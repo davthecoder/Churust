@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["churust-core", "churust-macros", "churust", "examples/hello", "churust-json", "churust-logging", "churust-cors", "churust-auth", "churust-lab", "examples/api", "examples/chat", "examples/static"]
+members = ["churust-core", "churust-macros", "churust", "examples/hello", "churust-json", "churust-logging", "churust-cors", "churust-auth", "churust-ratelimit", "churust-compression", "churust-templates", "churust-redis", "churust-client", "churust-openapi", "churust-lab", "examples/api", "examples/chat", "examples/static"]
 
 [workspace.package]
 # Every Churust crate releases in lockstep on this single version.
@@ -26,6 +26,12 @@ churust-json = { path = "churust-json", version = "0.2.0" }
 churust-logging = { path = "churust-logging", version = "0.2.0" }
 churust-cors = { path = "churust-cors", version = "0.2.0" }
 churust-auth = { path = "churust-auth", version = "0.2.0" }
+churust-ratelimit = { path = "churust-ratelimit", version = "0.2.0" }
+churust-compression = { path = "churust-compression", version = "0.2.0" }
+churust-templates = { path = "churust-templates", version = "0.2.0" }
+churust-redis = { path = "churust-redis", version = "0.2.0" }
+churust-client = { path = "churust-client", version = "0.2.0" }
+churust-openapi = { path = "churust-openapi", version = "0.2.0" }
 # Shares the workspace version despite never promising 1.0 — see the crate docs
 # for why, and for when that must be revisited.
 churust-lab = { path = "churust-lab", version = "0.2.0" }
