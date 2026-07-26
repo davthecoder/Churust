@@ -326,19 +326,35 @@ impl Router {
         let segments: Vec<&str> = decoded.iter().map(String::as_str).collect();
         let mut params = crate::call::Params::new();
 
-        // 1. Exact walk. Static beats param, unchanged.
-        let exact = Self::walk(&self.root, &segments, 0, &mut params);
-        if let Some(node) = exact {
-            if let Some(h) = node.handlers.pick(method, call) {
-                return Match::Found {
-                    handler: h.clone(),
-                    params,
-                };
-            }
+        // 1. Exact search. Static beats param, and a leaf that cannot serve
+        //    this request is passed over rather than settled for.
+        let found = Self::walk_matching(&self.root, &segments, 0, &mut params, &mut |node, p| {
+            node.handlers
+                .pick(method, call)
+                .map(|h| (h.clone(), p.clone()))
+        });
+        if let Some((handler, params)) = found {
+            return Match::Found { handler, params };
         }
-        let exact_allow: Vec<Method> = exact
-            .map(|n| n.handlers.methods_matching(call))
-            .unwrap_or_default();
+
+        //    Nothing served it. `Allow` then has to describe every leaf that
+        //    matched structurally, not just the first — they are all the same
+        //    resource as far as the client is concerned.
+        let mut exact_allow: Vec<Method> = Vec::new();
+        params.clear();
+        Self::walk_matching(&self.root, &segments, 0, &mut params, &mut |node,
+                                                                         _|
+         -> Option<
+            (),
+        > {
+            for m in node.handlers.methods_matching(call) {
+                if !exact_allow.contains(&m) {
+                    exact_allow.push(m);
+                }
+            }
+            // Never accept: visiting every matching leaf is the point.
+            None
+        });
 
         // 2. Wildcard fallback. Reaching a node that has no handler for this
         //    method is not the end of the search — a trailing `{name...}` at a
@@ -464,9 +480,22 @@ impl Router {
         };
         let segments: Vec<&str> = decoded.iter().map(String::as_str).collect();
         let mut params = crate::call::Params::new();
-        let mut out: Vec<Method> = Self::walk(&self.root, &segments, 0, &mut params)
-            .map(|n| n.handlers.methods())
-            .unwrap_or_default();
+        // Every structurally-matching leaf, not just the first: `OPTIONS`
+        // describes the resource, and two routes of different shapes matching
+        // one path are one resource to the client.
+        let mut out: Vec<Method> = Vec::new();
+        Self::walk_matching(&self.root, &segments, 0, &mut params, &mut |node,
+                                                                         _|
+         -> Option<
+            (),
+        > {
+            for m in node.handlers.methods() {
+                if !out.contains(&m) {
+                    out.push(m);
+                }
+            }
+            None
+        });
 
         // TRACE is a probe: nothing registers it, so `walk_wildcard` reports
         // MethodNotAllowed carrying the wildcard's full method list.
@@ -559,27 +588,48 @@ impl Router {
         }
     }
 
-    fn walk<'a>(
+    /// Visit every leaf whose *shape* matches, in precedence order, and return
+    /// the first result `accept` produces.
+    ///
+    /// The visitor is what makes this a search rather than a lookup. Returning
+    /// the first structurally-matching leaf regardless of whether it could
+    /// serve meant a second registered route that *did* match was unreachable:
+    /// with `POST /a/{x}` and `GET /{y}/b` registered, `GET /a/b` committed to
+    /// the first and answered `405`. A failing guard had the same effect, so a
+    /// guard on one route silently disabled an unrelated one.
+    ///
+    /// Static still beats param at each step — that is a preference, and it
+    /// survives; it just no longer ends the search. `params` is restored on the
+    /// way out of a branch that is abandoned, so captures never leak from a
+    /// route that did not serve into one that did.
+    fn walk_matching<'a, T>(
         node: &'a Node,
         segs: &[&str],
         i: usize,
         params: &mut crate::call::Params,
-    ) -> Option<&'a Node> {
+        accept: &mut impl FnMut(&'a Node, &crate::call::Params) -> Option<T>,
+    ) -> Option<T> {
         if i == segs.len() {
-            return Some(node);
+            return accept(node, params);
         }
         let seg = segs[i];
         if let Some(child) = node.statics.get(seg) {
-            if let Some(n) = Self::walk(child, segs, i + 1, params) {
-                return Some(n);
+            if let Some(found) = Self::walk_matching(child, segs, i + 1, params, accept) {
+                return Some(found);
             }
         }
         if let Some((name, child)) = &node.param {
+            // Remember any value this name already held: a repeated name at
+            // different depths must not be clobbered by an abandoned branch.
+            let previous = params.get(name).map(str::to_string);
             params.insert(name.clone(), seg.to_string());
-            if let Some(n) = Self::walk(child, segs, i + 1, params) {
-                return Some(n);
+            if let Some(found) = Self::walk_matching(child, segs, i + 1, params, accept) {
+                return Some(found);
             }
-            params.remove(name);
+            match previous {
+                Some(v) => params.insert(name.clone(), v),
+                None => params.remove(name),
+            }
         }
         None
     }
