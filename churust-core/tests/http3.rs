@@ -349,6 +349,104 @@ async fn a_stream_that_never_sends_headers_does_not_kill_the_connection() {
 }
 
 #[tokio::test]
+async fn a_request_body_cut_short_by_a_reset_is_not_served_as_complete() {
+    // The mirror image of the response case below, and the more dangerous
+    // direction: here the truncation is in what the *handler* is given. A
+    // client announced 5000 bytes, sent 1200, and reset the stream. h3 reports
+    // that as `StreamError::RemoteTerminate` from `recv_data`, but the read
+    // loop was `while let Ok(Some(..))`, which cannot tell an error from the
+    // clean `Ok(None)` end of body — both just end the loop. So the partial
+    // payload was handed to the route as if it were the whole request, the
+    // handler ran on it, and a 200 went back. Anything with a side effect —
+    // an upload stored, a batch of records imported — committed 1200 bytes of
+    // a 5000-byte body and told the client it had all arrived.
+    //
+    // A reset request cannot be answered with a 400 either: a client that
+    // resets its request stream is cancelling, and the status would be thrown
+    // away even if it arrived. The only report the peer can actually observe
+    // is the server refusing to complete the stream, so that is what this
+    // asserts, and it holds whether or not the 1200 bytes were delivered
+    // before the reset overtook them.
+    let cert = self_signed();
+    let addr = serve(app(), &cert).await;
+
+    let mut roots = rustls::RootCertStore::empty();
+    for der in &cert.chain {
+        roots.add(der.clone()).expect("trust the test certificate");
+    }
+    let mut tls = rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+
+    let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("quic client config");
+    let mut endpoint =
+        quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("a client socket");
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic)));
+
+    let connection = endpoint
+        .connect(addr, "localhost")
+        .expect("a connect attempt")
+        .await
+        .expect("a completed handshake");
+
+    let (mut driver, mut send) = h3::client::new(h3_quinn::Connection::new(connection))
+        .await
+        .expect("an h3 client");
+    let drive = tokio::spawn(async move { std::future::poll_fn(|cx| driver.poll_close(cx)).await });
+
+    let uri: http::Uri = "https://localhost/echo".parse().unwrap();
+    let req = http::Request::builder()
+        .method(http::Method::POST)
+        .uri(uri)
+        .header("content-length", "5000")
+        .body(())
+        .unwrap();
+    let mut stream = send.send_request(req).await.expect("a request stream");
+    stream
+        .send_data(Bytes::from(vec![b'x'; 1200]))
+        .await
+        .expect("send the first 1200 bytes");
+
+    // Long enough for the 1200 bytes to be read on the far side, so the case
+    // under test is the interesting one: a server that has real content in
+    // hand and has to decide it is not a request.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Not `finish`: the remaining 3800 bytes are abandoned, which is
+    // RESET_STREAM on the wire.
+    stream.stop_stream(h3::error::Code::H3_REQUEST_CANCELLED);
+
+    let answered = match stream.recv_response().await {
+        // Refused before the head reached us.
+        Err(_) => None,
+        Ok(response) => {
+            let mut out = Vec::new();
+            loop {
+                match stream.recv_data().await {
+                    Ok(Some(mut chunk)) => {
+                        out.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()))
+                    }
+                    // A complete-looking answer to an incomplete request.
+                    Ok(None) => break Some((response.status(), out.len())),
+                    // Refused mid-response, which is also a refusal.
+                    Err(_) => break None,
+                }
+            }
+        }
+    };
+
+    assert!(
+        answered.is_none(),
+        "a body cut short at 1200 of 5000 bytes was answered as a complete request: \
+         status and echoed length were {answered:?}"
+    );
+
+    drop(send);
+    let _ = drive.await;
+}
+
+#[tokio::test]
 async fn a_streamed_body_that_fails_partway_does_not_look_complete() {
     // Once the head is on the wire the status cannot be taken back, so the
     // only honest report of a body that died partway is a stream the peer can

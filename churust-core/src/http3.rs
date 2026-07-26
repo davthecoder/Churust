@@ -339,12 +339,38 @@ where
 
     let body = match read {
         Ok(body) => body,
-        Err(TooLarge) => {
+        Err(BodyRefused::TooLarge) => {
             let response = http::Response::builder()
                 .status(http::StatusCode::PAYLOAD_TOO_LARGE)
                 .body(())?;
             stream.send_response(response).await?;
             stream.finish().await?;
+            return Ok(());
+        }
+        // Reset rather than a 400, and the reason is what can actually reach
+        // the peer. The stream failed while we were reading it, so in the
+        // common case the peer has already reset its side — and a client that
+        // resets a request stream is cancelling it, which under RFC 9114 §4.1
+        // means it also stops reading the response. A status written into that
+        // is discarded, and when the failure was a `ConnectionError` there is
+        // no connection left to write it to at all. A 400 would therefore be a
+        // status this server believes it sent and the client never saw.
+        //
+        // Returning without resetting is not an option either, for the reason
+        // spelled out on the streamed-response arm below: the `RequestStream`
+        // is dropped on the way out and quinn finishes a stream when it drops,
+        // so the peer would get a clean FIN. Resetting first is what wins that
+        // race, and H3_REQUEST_INCOMPLETE is the code RFC 9114 defines for
+        // exactly this — "the client's stream terminated without containing a
+        // fully-formed request".
+        //
+        // The part that matters most is above this line rather than in it: we
+        // return before `process_with_extensions`, so the handler never runs
+        // and never commits half a payload. Refusing the stream is the report;
+        // not dispatching is the fix.
+        Err(BodyRefused::Incomplete(e)) => {
+            tracing::debug!(error = %e, "http3 request body ended before it was complete");
+            stream.stop_stream(h3::error::Code::H3_REQUEST_INCOMPLETE);
             return Ok(());
         }
     };
@@ -374,10 +400,16 @@ where
     send_response(&mut stream, response, parts.method == Method::HEAD).await
 }
 
-/// The request body exceeded the server's cap.
-struct TooLarge;
+/// Why a request body was not handed to the pipeline.
+enum BodyRefused {
+    /// The request body exceeded the server's cap.
+    TooLarge,
+    /// The stream failed before the body was whole, so what was read is a
+    /// fragment of a request rather than a request.
+    Incomplete(h3::error::StreamError),
+}
 
-/// Read a request body, refusing one past `max_body`.
+/// Read a request body, refusing one past `max_body` and one cut short.
 ///
 /// Counted as it arrives rather than collected and then measured, so an
 /// oversized body is refused at the chunk that crosses the line instead of
@@ -385,19 +417,35 @@ struct TooLarge;
 async fn read_body<S>(
     stream: &mut h3::server::RequestStream<S, Bytes>,
     max_body: usize,
-) -> Result<Bytes, TooLarge>
+) -> Result<Bytes, BodyRefused>
 where
     S: h3::quic::BidiStream<Bytes>,
 {
     let mut buf = bytes::BytesMut::new();
-    while let Ok(Some(mut chunk)) = stream.recv_data().await {
-        let piece = chunk.copy_to_bytes(chunk.remaining());
-        if buf.len() + piece.len() > max_body {
-            return Err(TooLarge);
+    // `recv_data` has three outcomes and they have to stay three. This was a
+    // `while let Ok(Some(..))`, which is only two: a chunk, or the loop ends.
+    // The clean end of body and a stream that failed both fell into "the loop
+    // ends", so a body cut short — a peer that announced 5000 bytes, sent
+    // 1200, then RESET_STREAM, which surfaces here as
+    // `StreamError::RemoteTerminate` — was returned as `Ok` and dispatched as
+    // if the whole request had arrived. The handler ran, committed whatever
+    // side effect it has on a fragment of the payload, and answered 200. That
+    // is the failure mode the caller cannot detect afterwards, because a
+    // truncated body is a well-formed shorter body.
+    loop {
+        match stream.recv_data().await {
+            Ok(Some(mut chunk)) => {
+                let piece = chunk.copy_to_bytes(chunk.remaining());
+                if buf.len() + piece.len() > max_body {
+                    return Err(BodyRefused::TooLarge);
+                }
+                buf.extend_from_slice(&piece);
+            }
+            // The peer finished its side of the stream: the body is whole.
+            Ok(None) => return Ok(buf.freeze()),
+            Err(e) => return Err(BodyRefused::Incomplete(e)),
         }
-        buf.extend_from_slice(&piece);
     }
-    Ok(buf.freeze())
 }
 
 /// HTTP/3 always carries an absolute-form target, TCP requests usually do not.

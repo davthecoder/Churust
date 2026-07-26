@@ -68,6 +68,22 @@ released together, so every entry below applies to the whole set.
   `HEAD` reply, describing an error the matching `GET` does not report. Such a
   reply now keeps its empty body and corrects only its headers, so it describes
   the representation `GET` would return.
+- **An HTTP/3 request body cut short is no longer handed to the handler as a
+  whole one.** The read loop was `while let Ok(Some(chunk))`, which has two
+  outcomes where `recv_data` has three: a clean end of body and a failed stream
+  both simply ended the loop, and whatever had been read so far was returned as
+  `Ok`. A client that announced 5000 bytes, sent 1200 and then RESET_STREAM —
+  reported by h3 as `StreamError::RemoteTerminate` — had its fragment dispatched
+  as if the request were complete. The handler ran on it, so an upload was
+  stored or a batch of records imported at 1200 bytes of 5000, and a `200` said
+  everything had arrived. Nothing downstream could detect it afterwards, because
+  a truncated body is indistinguishable from a well-formed shorter one. The
+  three outcomes are now matched separately and a failed read returns before
+  dispatch, so the handler never sees a partial payload; the stream is reset
+  with H3_REQUEST_INCOMPLETE rather than answered with a `400`, since a peer
+  that reset its request stream is cancelling and stops reading the response, so
+  a status would be a report this server believed it sent and the client never
+  saw. This is the request-side mirror of the entry below.
 - **A `multipart/form-data` delimiter line admits only spaces and tabs before
   its CRLF, in both parsers.** RFC 2046 §5.1.1 allows nothing but
   `transport-padding` there, and both `Multipart` and `MultipartStream` accepted
