@@ -145,6 +145,50 @@ released together, so every entry below applies to the whole set.
   in registration order, and its `# Panics` section lists the two panics it
   omitted: the duplicate route, and a `{name}` conflicting with a differently
   spelled parameter already registered at that position.
+- **A `HEAD` no longer describes the identity representation of a URL whose
+  `GET` is compressed.** The body of a synthesized `HEAD` is dropped at the
+  endpoint, which sits inside the plugin phase, so `Compression` saw an empty
+  buffer, failed its own size floor and returned the response untouched. For the
+  same `Accept-Encoding: gzip`, `HEAD /file` then answered with the identity
+  `Content-Length`, `Accept-Ranges: bytes` and a strong `ETag`, while `GET /file`
+  answered `Content-Encoding: gzip` with the ranges withdrawn and the tag
+  weakened — one URL, one negotiation, two contradictory descriptions. RFC 9111
+  §4.3.5 has a shared cache use a `HEAD` to update the stored `GET` and
+  invalidate it when the two lengths disagree, so every `HEAD` evicted the
+  compressed `GET` the cache was holding, and a downloader that sized a resource
+  with `HEAD` was told it could resume a body that arrives without ranges. The
+  plugin now remembers the request method and applies the encoded metadata to a
+  `HEAD` reply as well: `Content-Encoding` is set, `Accept-Ranges` and the stale
+  `Content-Length` are removed, and a strong `ETag` is weakened. No body is
+  invented and no length is guessed — the encoded size cannot be known without
+  doing the work the client declined to ask for, and RFC 9110 §9.3.2 permits
+  omitting a field that is only determined while generating the content. The
+  size floor is applied to the `Content-Length` the strip left behind, so a
+  `HEAD` and its `GET` also agree about *whether* the resource is compressed.
+- **Compressing a large buffered body no longer holds the runtime worker for the
+  whole encode.** The comment on `CHUNK` claimed that feeding the encoder in
+  pieces "puts an await point between them"; it did not.
+  `futures_util::stream::iter` is unconditionally `Ready`, async-compression's
+  bufread encoders are pure state machines, and tokio's cooperative budget only
+  fires for tokio's own resources — none of which are in this path — so the
+  entire encode ran inside a single poll. At the default level, which is brotli
+  quality 11, a body of a few megabytes is seconds of CPU during which nothing
+  else scheduled on that worker runs, timers and the accept loop included. There
+  is now a real `yield_now` on each side of the encoder, and both are needed:
+  async-compression turns a `Pending` from its input into `Ready` whenever it
+  already has output bytes to hand back, so the input-side yield is the one that
+  works while the encoder is eating input without emitting, and the output-side
+  yield is the one that works in the ordinary case where it emits on every
+  piece. Neither fires before the first piece, so a small body still costs no
+  scheduler round trip. This does not make the encode cheaper, only
+  interruptible.
+- **`Accept-Encoding: gzip;Q=0` is read as the refusal it is.** RFC 9110 §5.6.6
+  makes a parameter name case-insensitive, but the quality parameter was matched
+  against the literal prefix `q=`. An uppercase `Q` fell through, the coding kept
+  the default weight of 1.0, and the server compressed with the very coding the
+  client had just said it could not decode; by the same slip `deflate;Q=0.1`
+  could not lose a tie it should lose. The parameter name is now folded to lower
+  case before the match, which is safe because a qvalue has no letters in it.
 - **A saturated connection budget no longer blocks shutdown.** The accept loop
   awaited a `max_connections` permit *outside* the shutdown race, so once every
   slot was held the shutdown signal was never polled — `serve()` did not return

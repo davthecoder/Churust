@@ -49,6 +49,15 @@
 //! only compressed ones. A cache that stored one variant without it would serve
 //! a brotli body to a client that never asked for one.
 //!
+//! A `HEAD` reply is a case of its own. Its body is already gone by the time the
+//! plugin runs, so there is nothing to encode, but the headers are still
+//! rewritten exactly as they would be for the matching `GET`:
+//! `Content-Encoding` set, the identity `Content-Length` and any
+//! `Accept-Ranges` removed, a strong `ETag` weakened. RFC 9110 §9.3.2 asks a
+//! `HEAD` to answer with the fields its `GET` would send, and a client or cache
+//! that sizes a resource with `HEAD` before fetching it must not be told about
+//! a representation the server will not deliver.
+//!
 //! # Should this live in the application at all
 //!
 //! Often it should not. A reverse proxy in front of the service can compress
@@ -70,7 +79,7 @@ use http::header::{
     HeaderValue, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
     ETAG, VARY,
 };
-use http::StatusCode;
+use http::{Method, StatusCode};
 use std::sync::Arc;
 use tokio::io::AsyncRead;
 use tokio_util::io::{ReaderStream, StreamReader};
@@ -78,8 +87,23 @@ use tokio_util::io::{ReaderStream, StreamReader};
 /// Pieces a buffered body is cut into before being fed to the encoder.
 ///
 /// Compressing a large buffer in one call would occupy the runtime worker for
-/// the whole of it. Feeding the same encoder in chunks puts an await point
-/// between them without changing the output.
+/// the whole of it, and the default level is brotli quality 11 — seconds of CPU
+/// for a body of a few megabytes, during which nothing else scheduled on that
+/// worker runs, timers and the accept loop included. Yielding does not make the
+/// encode any cheaper; it makes it interruptible, so the cost lands on one task
+/// rather than on everything sharing the worker with it.
+///
+/// The slicing alone did not achieve that, which is what this comment used to
+/// claim. The pieces were handed to `futures_util::stream::iter`, whose
+/// `poll_next` is unconditionally `Ready`, and nothing below it returns
+/// `Pending` either: async-compression's bufread encoders are pure state
+/// machines, and tokio's cooperative budget only fires for tokio's own
+/// resources, none of which are in this path. Awaiting a future that is always
+/// ready never reaches the scheduler, so the whole encode ran inside a single
+/// poll and the await point described here did not exist.
+///
+/// It now does, at both ends of the encoder, because neither end covers the
+/// other's case. See [`encode`].
 const CHUNK: usize = 16 * 1024;
 
 /// A supported content coding.
@@ -300,7 +324,15 @@ impl Compression {
             let token = bits.next().unwrap_or("").trim().to_ascii_lowercase();
             let mut q = 1.0f32;
             for param in bits {
-                let param = param.trim();
+                // RFC 9110 §5.6.6 makes a parameter name case-insensitive, so
+                // `gzip;Q=0` is exactly the refusal `gzip;q=0` is. Testing the
+                // literal prefix `q=` missed the uppercase spelling: the
+                // parameter fell through, `q` kept its 1.0 initialiser, and the
+                // coding the client had just refused was picked and sent — to a
+                // client that wrote `Q=0` precisely because it cannot decode it.
+                // Lowercasing the whole parameter is safe because the value is a
+                // qvalue, which has no letters in it.
+                let param = param.trim().to_ascii_lowercase();
                 if let Some(value) = param.strip_prefix("q=") {
                     q = value.trim().parse().unwrap_or(0.0);
                 }
@@ -342,7 +374,11 @@ impl Compression {
     }
 
     /// Whether this response may be compressed at all.
-    fn should_compress(&self, res: &Response) -> bool {
+    ///
+    /// `is_head` says the request was a `HEAD`, in which case the body has
+    /// already been dropped and the size test has to be read off the headers
+    /// instead — see the call site in [`Middleware::handle`].
+    fn should_compress(&self, res: &Response, is_head: bool) -> bool {
         // A body-less status has nothing to encode, and a `304` must keep the
         // headers of the response it revalidates.
         if res.status.is_informational()
@@ -369,6 +405,19 @@ impl Compression {
             return false;
         }
         match res.body.as_bytes() {
+            // A `HEAD` reply arrives here already emptied, so its own body
+            // says nothing about the size of the representation. The engine
+            // wrote that size into `Content-Length` before discarding the
+            // bytes, and that is the number the floor has to be compared
+            // against: the decision must come out the same as it does for the
+            // `GET` this `HEAD` is answering, or the two disagree about
+            // whether the resource is compressed at all. With no
+            // `Content-Length` there is nothing to compare — a streamed `GET`
+            // that never announced a length — and the response is left as it
+            // is rather than guessed at.
+            Some(bytes) if is_head && bytes.is_empty() => {
+                head_identity_len(res).is_some_and(|len| len >= self.min_size)
+            }
             // A buffered body's length is known, so the floor applies.
             Some(bytes) => bytes.len() >= self.min_size,
             // A stream's is not, so it is compressed on the assumption that a
@@ -378,21 +427,71 @@ impl Compression {
     }
 }
 
+/// The identity length a `HEAD` reply is quoting, if it quotes one.
+///
+/// The endpoint records the `GET` body's length in `Content-Length` before it
+/// drops the bytes, so on a synthesized `HEAD` that header is the only
+/// surviving statement of how large the representation is.
+fn head_identity_len(res: &Response) -> Option<usize> {
+    res.headers
+        .get(CONTENT_LENGTH)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// Wrap `body` in the encoder for `encoding`, keeping it a stream throughout.
+///
+/// There is a [`yield_now`](tokio::task::yield_now) on each side of the
+/// encoder, and both are needed, because the encoder absorbs one of them
+/// exactly when the other is unnecessary. async-compression's bufread encoder
+/// ends its poll with
+///
+/// ```text
+/// if is_pending {
+///     if output.written().is_empty() { return Poll::Pending } else { return Poll::Ready(Ok(())) }
+/// }
+/// ```
+///
+/// — the right thing for an `AsyncRead`, and it means a `Pending` raised while
+/// pulling the *next* input piece is swallowed whenever the encoder already has
+/// bytes to hand back. So:
+///
+/// - The yield between input pieces is what reaches the scheduler while the
+///   encoder is eating input without emitting anything, which is the case that
+///   actually pins a worker: brotli at quality 11 buffers a large window, so a
+///   compressible body can be consumed for a long time before a byte comes out.
+/// - The yield between output chunks is what reaches the scheduler in the
+///   ordinary case, where the encoder emits on every input piece and therefore
+///   swallows every input-side yield. Nothing above it can absorb it: the
+///   consumer is either the collect loop in [`Middleware::handle`] or hyper's
+///   body writer, and a `Pending` there goes straight to the runtime.
+///
+/// Neither yield fires before the first piece, so a small body — the common
+/// case, and the one where the encode is over in microseconds — costs no
+/// scheduler round trip at all.
 fn encode(body: Body, encoding: Encoding, level: Level) -> Body {
     let source = match body {
+        // `unfold` rather than `iter`: `iter` is unconditionally ready, so the
+        // state machine has to be one that can await. See [`CHUNK`].
         Body::Bytes(bytes) => {
-            let mut rest = bytes;
-            let chunks = std::iter::from_fn(move || {
+            futures_util::stream::unfold((bytes, false), |(mut rest, started)| async move {
                 if rest.is_empty() {
-                    None
-                } else {
-                    let take = CHUNK.min(rest.len());
-                    Some(Ok::<Bytes, std::io::Error>(rest.split_to(take)))
+                    return None;
                 }
-            });
-            futures_util::stream::iter(chunks).boxed()
+                if started {
+                    tokio::task::yield_now().await;
+                }
+                let take = CHUNK.min(rest.len());
+                let chunk = rest.split_to(take);
+                Some((Ok::<Bytes, std::io::Error>(chunk), (rest, true)))
+            })
+            .boxed()
         }
+        // A streamed body already has real await points in it — the handler
+        // producing it — so it needs nothing added on the input side.
         Body::Stream(stream) => stream
             .map(|chunk| chunk.map_err(|e| std::io::Error::other(e.to_string())))
             .boxed(),
@@ -413,7 +512,16 @@ fn encode(body: Body, encoding: Encoding, level: Level) -> Body {
         }
     };
 
-    Body::from_stream(ReaderStream::new(encoded))
+    Body::from_stream(futures_util::stream::unfold(
+        (ReaderStream::new(encoded), false),
+        |(mut out, started)| async move {
+            if started {
+                tokio::task::yield_now().await;
+            }
+            let chunk = out.next().await?;
+            Some((chunk, (out, true)))
+        },
+    ))
 }
 
 /// Append `Accept-Encoding` to `Vary` without disturbing what is already there.
@@ -464,6 +572,12 @@ impl Middleware for Compression {
             .header(ACCEPT_ENCODING.as_str())
             .unwrap_or_default()
             .to_string();
+        // A `HEAD` with no handler of its own is answered by running the `GET`
+        // route and then discarding the body, and that discarding happens at
+        // the endpoint — inside this middleware, not outside it. So a `HEAD`
+        // comes back here already emptied. The method has to be remembered now,
+        // because the rest of the chain consumes `call`.
+        let is_head = call.method() == Method::HEAD;
 
         let mut res = next.run(call).await;
 
@@ -477,30 +591,52 @@ impl Middleware for Compression {
         let Some(encoding) = self.negotiate(&accept) else {
             return res;
         };
-        if !self.should_compress(&res) {
+        if !self.should_compress(&res, is_head) {
             return res;
         }
 
-        // Keep the buffered original: compressing it cannot normally fail, and
-        // if it somehow does, sending it uncompressed beats sending a 500.
-        let original = res.body.as_bytes().cloned();
-        let was_buffered = original.is_some();
-        let body = std::mem::take(&mut res.body);
-        let encoded = encode(body, encoding, self.level);
+        // A `HEAD` reply has no bytes left to encode, but its headers must
+        // still describe the representation the matching `GET` would return.
+        // Skipping it entirely left the two contradicting each other for the
+        // same `Accept-Encoding`: `HEAD /file` answered the identity
+        // `Content-Length`, `Accept-Ranges: bytes` and a strong `ETag`, while
+        // `GET /file` answered `Content-Encoding: gzip` with the ranges
+        // withdrawn and the tag weakened. RFC 9110 §9.3.2 asks a `HEAD` for the
+        // header fields its `GET` would send, and RFC 9111 §4.3.5 has a cache
+        // use a `HEAD` to update the stored `GET` and invalidate it when the
+        // lengths disagree — so every `HEAD` evicted the compressed `GET` a
+        // shared cache was holding. So the metadata below is applied either
+        // way, and only the body work is skipped.
+        //
+        // Dropping `Content-Length` rather than correcting it is the whole
+        // answer here: the encoded length cannot be known without doing the
+        // work the client declined to ask for, and §9.3.2 permits omitting a
+        // field that is only determined while generating the content. hyper
+        // writes no implicit `content-length: 0` for a `HEAD`, so the field
+        // comes out absent rather than replaced by a different wrong number.
+        // This is what nginx's gzip filter does with a header-only request too.
+        if !is_head {
+            // Keep the buffered original: compressing it cannot normally fail,
+            // and if it somehow does, sending it uncompressed beats a 500.
+            let original = res.body.as_bytes().cloned();
+            let was_buffered = original.is_some();
+            let body = std::mem::take(&mut res.body);
+            let encoded = encode(body, encoding, self.level);
 
-        res.body = if was_buffered {
-            // Collect back so `Content-Length` stays exact for a body that had
-            // one before.
-            match encoded.into_bytes().await {
-                Ok(bytes) => Body::Bytes(bytes),
-                Err(_) => {
-                    res.body = Body::Bytes(original.unwrap_or_default());
-                    return res;
+            res.body = if was_buffered {
+                // Collect back so `Content-Length` stays exact for a body that
+                // had one before.
+                match encoded.into_bytes().await {
+                    Ok(bytes) => Body::Bytes(bytes),
+                    Err(_) => {
+                        res.body = Body::Bytes(original.unwrap_or_default());
+                        return res;
+                    }
                 }
-            }
-        } else {
-            encoded
-        };
+            } else {
+                encoded
+            };
+        }
 
         res.headers
             .insert(CONTENT_ENCODING, HeaderValue::from_static(encoding.token()));
@@ -559,6 +695,16 @@ mod tests {
     }
 
     #[test]
+    fn a_quality_parameter_is_matched_case_insensitively() {
+        // RFC 9110 §5.6.6: a parameter name is case-insensitive, so `Q=0` is
+        // the same refusal as `q=0` and must lose the same way.
+        let c = plugin();
+        assert_eq!(c.negotiate("gzip;Q=0, deflate"), Some(Encoding::Deflate));
+        assert_eq!(c.negotiate("br;Q=0, gzip;Q=0, deflate;Q=0"), None);
+        assert_eq!(c.negotiate("gzip;Q=1.0, br;Q=0.1"), Some(Encoding::Gzip));
+    }
+
+    #[test]
     fn an_explicit_coding_beats_the_wildcard() {
         let c = plugin();
         // `*` would give brotli 1.0; the explicit gzip entry is what the client
@@ -608,6 +754,35 @@ mod tests {
         assert_eq!(Bytes::from(decoded), input);
     }
 
+    #[tokio::test]
+    async fn a_buffered_body_yields_the_worker_between_chunks() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // `#[tokio::test]` runs a current-thread runtime, where a spawned task
+        // gets a turn only once the task doing the encoding returns `Pending`.
+        // So the flag is a direct reading of whether the buffered path reaches
+        // the scheduler at all: with the encode running to completion inside
+        // one poll it is still false when the collect returns.
+        let ran = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&ran);
+        tokio::spawn(async move { flag.store(true, Ordering::SeqCst) });
+
+        let input = Bytes::from(vec![b'x'; CHUNK * 4]);
+        let encoded = encode(Body::Bytes(input), Encoding::Gzip, Level::Fastest)
+            .into_bytes()
+            .await
+            .unwrap();
+
+        assert!(
+            !encoded.is_empty(),
+            "the encode still has to produce output"
+        );
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "a multi-chunk encode must let the runtime run something else"
+        );
+    }
+
     #[test]
     fn vary_is_appended_not_replaced() {
         let mut res = Response::text("x");
@@ -647,7 +822,7 @@ mod tests {
     fn partial_content_is_never_compressed() {
         let mut res = Response::text("x".repeat(4096));
         res.status = StatusCode::PARTIAL_CONTENT;
-        assert!(!plugin().should_compress(&res));
+        assert!(!plugin().should_compress(&res, false));
     }
 
     #[test]
@@ -655,15 +830,15 @@ mod tests {
         let mut res = Response::text("x".repeat(4096));
         res.headers
             .insert(CONTENT_ENCODING, HeaderValue::from_static("gzip"));
-        assert!(!plugin().should_compress(&res));
+        assert!(!plugin().should_compress(&res, false));
     }
 
     #[test]
     fn small_bodies_are_left_alone() {
         let res = Response::text("small");
-        assert!(!plugin().should_compress(&res));
+        assert!(!plugin().should_compress(&res, false));
         assert!(
-            plugin().min_size(1).should_compress(&res),
+            plugin().min_size(1).should_compress(&res, false),
             "lowering the floor should admit it"
         );
     }

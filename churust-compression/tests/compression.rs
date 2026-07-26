@@ -377,18 +377,21 @@ mod range_consistency {
 
     use churust_compression::Compression;
     use churust_core::{Churust, Response, TestClient};
-    use http::header::{ACCEPT_ENCODING, ACCEPT_RANGES};
-    use http::HeaderValue;
+    use http::header::{ACCEPT_ENCODING, ACCEPT_RANGES, ETAG};
+    use http::{HeaderValue, Method};
 
     fn app() -> churust_core::App {
         Churust::server()
             .install(Compression::new())
             .routing(|r| {
                 // Stands in for StaticFiles: a body worth compressing, with the
-                // range advertisement a file response carries.
+                // range advertisement and the strong validator a file response
+                // carries. Only `get` is registered, so a `HEAD` is synthesized
+                // from it — which is what the last test here is about.
                 r.get("/file", |_c: churust_core::Call| async {
                     Response::bytes("text/plain", "x".repeat(4096))
                         .with_header(ACCEPT_RANGES, HeaderValue::from_static("bytes"))
+                        .with_header(ETAG, HeaderValue::from_static("\"v1\""))
                 });
             })
             .build()
@@ -418,6 +421,87 @@ mod range_consistency {
             res.header("accept-ranges"),
             Some("bytes"),
             "an identity response is genuinely resumable"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_head_reply_matches_the_headers_a_get_would_send() {
+        // The engine strips a synthesized `HEAD`'s body at the endpoint, which
+        // is inside the plugin phase, so what reaches this plugin is an empty
+        // body still carrying the identity `Content-Length`. Doing nothing with
+        // it made `HEAD` and `GET` describe different representations of the
+        // same URL for the same `Accept-Encoding`, which is the one thing
+        // RFC 9110 §9.3.2 asks a `HEAD` reply not to do.
+        let client = TestClient::new(app());
+        let get = client
+            .get("/file")
+            .header(ACCEPT_ENCODING.as_str(), "gzip")
+            .send()
+            .await;
+        let head = client
+            .request(Method::HEAD, "/file")
+            .header(ACCEPT_ENCODING.as_str(), "gzip")
+            .send()
+            .await;
+
+        assert_eq!(get.header("content-encoding"), Some("gzip"));
+        assert_eq!(
+            head.header("content-encoding"),
+            get.header("content-encoding"),
+            "HEAD must name the coding the GET it answers for would use"
+        );
+        assert_eq!(
+            head.header("accept-ranges"),
+            get.header("accept-ranges"),
+            "HEAD must not offer ranges the compressed GET withdraws"
+        );
+        assert_eq!(
+            head.header("etag"),
+            get.header("etag"),
+            "one representation, one validator"
+        );
+        assert_eq!(
+            head.header("content-length"),
+            None,
+            "the identity length describes bytes the GET will not send, and the \
+             encoded length cannot be known without encoding"
+        );
+        assert!(
+            head.body_bytes().is_empty(),
+            "a HEAD reply still carries no body"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_head_reply_below_the_floor_is_left_alone_like_its_get() {
+        // The mirror of the case above: the size test has to come out the same
+        // for both, and on a `HEAD` the only surviving statement of size is the
+        // `Content-Length` the strip left behind.
+        let app = Churust::server()
+            .install(Compression::new())
+            .routing(|r| {
+                r.get("/tiny", |_c: churust_core::Call| async { "tiny" });
+            })
+            .build();
+        let client = TestClient::new(app);
+
+        let get = client
+            .get("/tiny")
+            .header(ACCEPT_ENCODING.as_str(), "gzip")
+            .send()
+            .await;
+        let head = client
+            .request(Method::HEAD, "/tiny")
+            .header(ACCEPT_ENCODING.as_str(), "gzip")
+            .send()
+            .await;
+
+        assert_eq!(get.header("content-encoding"), None);
+        assert_eq!(head.header("content-encoding"), None);
+        assert_eq!(
+            head.header("content-length"),
+            Some("4"),
+            "an uncompressed HEAD still sizes the resource for the client"
         );
     }
 }
