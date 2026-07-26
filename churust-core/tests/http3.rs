@@ -58,6 +58,22 @@ async fn request(
     path: &str,
     body: Option<Bytes>,
 ) -> (StatusCode, String) {
+    let (head, body) = request_head(addr, cert, method, path, body).await;
+    (head.status(), body)
+}
+
+/// As [`request`], but hands back the whole response head.
+///
+/// Most tests here care only about the status and the body; the ones that check
+/// what a response is *decorated* with need the header map, and reading it off
+/// a discarded head is not possible.
+async fn request_head(
+    addr: SocketAddr,
+    cert: &Cert,
+    method: http::Method,
+    path: &str,
+    body: Option<Bytes>,
+) -> (http::Response<()>, String) {
     let mut roots = rustls::RootCertStore::empty();
     for der in &cert.chain {
         roots.add(der.clone()).expect("trust the test certificate");
@@ -108,10 +124,7 @@ async fn request(
     drop(send);
     let _ = drive.await;
 
-    (
-        response.status(),
-        String::from_utf8(out).expect("a utf-8 body"),
-    )
+    (response, String::from_utf8(out).expect("a utf-8 body"))
 }
 
 fn app() -> churust_core::App {
@@ -527,4 +540,94 @@ async fn a_streamed_body_that_fails_partway_does_not_look_complete() {
 
     drop(send);
     let _ = drive.await;
+}
+
+#[tokio::test]
+async fn a_response_over_h3_carries_hsts_without_a_tls_section() {
+    // `SecurityHeaders` gates HSTS on whether the *builder* was given a
+    // certificate, because over TCP that is the only way to know the client is
+    // talking TLS to this process rather than plaintext to a proxy in front of
+    // it. QUIC removes the doubt: there is no plaintext HTTP/3, and
+    // `server_config_from_pem` pins TLS 1.3 outright — yet `http3::serve` takes
+    // its cert and key as arguments and never touches `config.tls`, so the gate
+    // read `false` and the one transport that *cannot* be plaintext was the one
+    // that never announced HSTS. The module's own example builds the app with
+    // no `AppBuilder::tls` call at all, so this was the documented way to use
+    // it.
+    let cert = self_signed();
+    let addr = serve(app(), &cert).await;
+
+    let (head, _) = request_head(addr, &cert, http::Method::GET, "/hello", None).await;
+    assert_eq!(
+        head.headers()
+            .get("strict-transport-security")
+            .map(|v| v.to_str().unwrap()),
+        Some("max-age=31536000"),
+        "an h3 response is TLS 1.3 by construction and must be pinned as such"
+    );
+}
+
+#[tokio::test]
+async fn a_server_that_disables_hsts_is_still_obeyed_over_h3() {
+    // The other half of the one above: h3 knowing it is TLS must widen the
+    // gate, not bypass the setting behind it.
+    let app = Churust::server()
+        .security_headers(churust_core::SecurityHeaders::new().hsts(None))
+        .routing(|r| {
+            r.get("/hello", |_c: Call| async { "hello over quic" });
+        })
+        .build();
+    let cert = self_signed();
+    let addr = serve(app, &cert).await;
+
+    let (head, _) = request_head(addr, &cert, http::Method::GET, "/hello", None).await;
+    assert!(
+        head.headers().get("strict-transport-security").is_none(),
+        "hsts(None) was overridden by the transport"
+    );
+}
+
+#[tokio::test]
+async fn a_refusal_before_dispatch_over_h3_carries_the_security_headers() {
+    // The h3 mirror of the engine's
+    // `a_refusal_before_dispatch_still_carries_the_security_headers`: an
+    // oversized body is refused in `serve_request` before the pipeline runs, so
+    // the middleware that adds these never saw the response.
+    let app = Churust::server()
+        .max_body_bytes(16)
+        .routing(|r| {
+            r.post("/echo", |body: String| async move { body });
+        })
+        .build();
+    let cert = self_signed();
+    let addr = serve(app, &cert).await;
+
+    let (head, _) = request_head(
+        addr,
+        &cert,
+        http::Method::POST,
+        "/echo",
+        Some(Bytes::from(vec![b'x'; 4096])),
+    )
+    .await;
+
+    assert_eq!(head.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    let headers = head.headers();
+    assert_eq!(
+        headers
+            .get("x-content-type-options")
+            .map(|v| v.to_str().unwrap()),
+        Some("nosniff"),
+        "the h3 refusal shipped bare"
+    );
+    assert_eq!(
+        headers.get("x-frame-options").map(|v| v.to_str().unwrap()),
+        Some("DENY")
+    );
+    assert_eq!(
+        headers
+            .get("strict-transport-security")
+            .map(|v| v.to_str().unwrap()),
+        Some("max-age=31536000")
+    );
 }

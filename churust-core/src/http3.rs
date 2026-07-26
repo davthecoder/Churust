@@ -326,12 +326,7 @@ where
         Some(at) => match tokio::time::timeout_at(at, read).await {
             Ok(r) => r,
             Err(_) => {
-                let response = http::Response::builder()
-                    .status(http::StatusCode::REQUEST_TIMEOUT)
-                    .body(())?;
-                stream.send_response(response).await?;
-                stream.finish().await?;
-                return Ok(());
+                return send_status(&app, &mut stream, http::StatusCode::REQUEST_TIMEOUT).await;
             }
         },
         None => read.await,
@@ -340,12 +335,7 @@ where
     let body = match read {
         Ok(body) => body,
         Err(BodyRefused::TooLarge) => {
-            let response = http::Response::builder()
-                .status(http::StatusCode::PAYLOAD_TOO_LARGE)
-                .body(())?;
-            stream.send_response(response).await?;
-            stream.finish().await?;
-            return Ok(());
+            return send_status(&app, &mut stream, http::StatusCode::PAYLOAD_TOO_LARGE).await;
         }
         // Reset rather than a 400, and the reason is what can actually reach
         // the peer. The stream failed while we were reading it, so in the
@@ -397,7 +387,29 @@ where
         },
     };
 
-    send_response(&mut stream, response, parts.method == Method::HEAD).await
+    send_response(&app, &mut stream, response, parts.method == Method::HEAD).await
+}
+
+/// Answer with a bare status and nothing else, hardened like any other reply.
+///
+/// The refusals above are composed here rather than in the pipeline, which is
+/// why they need their own call to `apply_security_headers`: the middleware
+/// that would otherwise add them never runs for a request that was never
+/// dispatched. Funnelled through one function so the next refusal added to
+/// `serve_request` cannot forget.
+async fn send_status<S>(
+    app: &App,
+    stream: &mut h3::server::RequestStream<S, Bytes>,
+    status: http::StatusCode,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: h3::quic::BidiStream<Bytes>,
+{
+    let mut response = http::Response::builder().status(status).body(())?;
+    app.apply_security_headers(response.headers_mut(), true);
+    stream.send_response(response).await?;
+    stream.finish().await?;
+    Ok(())
 }
 
 /// Why a request body was not handed to the pipeline.
@@ -470,6 +482,7 @@ fn normalise_uri(uri: &Uri, method: &Method) -> Uri {
 
 /// Write a [`Response`](crate::Response) out over an h3 stream.
 async fn send_response<S>(
+    app: &App,
     stream: &mut h3::server::RequestStream<S, Bytes>,
     response: crate::Response,
     head_only: bool,
@@ -480,6 +493,27 @@ where
     let mut builder = http::Response::builder().status(response.status);
     if let Some(headers) = builder.headers_mut() {
         *headers = sanitise(response.headers);
+        // `true`, which only this module is in a position to assert.
+        // QUIC has no plaintext mode — `server_config_from_pem` pins TLS 1.3,
+        // and a connection that negotiated anything but `h3` never gets here —
+        // so a response written to this stream is encrypted whatever
+        // `AppBuilder::tls` was told. The pipeline cannot know that: it runs
+        // the same code on every transport and reads a builder field that
+        // `http3::serve` has no way to set, since it is handed the certificate
+        // as an argument and the `App` is already built. The result was that
+        // the one transport where TLS is mandatory was the one that never sent
+        // HSTS.
+        //
+        // Widening the gate, not bypassing what is behind it: `hsts(None)` and
+        // `without_security_headers` are still obeyed, and a handler that set
+        // the header keeps its own value.
+        //
+        // Most of what this adds is already there — the pipeline's own
+        // middleware ran for anything routed — but a response the pipeline
+        // never produced (the `408` from an expired deadline just above)
+        // arrives with nothing, and that is the second reason this is here
+        // rather than in `serve_request`'s happy path.
+        app.apply_security_headers(headers, true);
     }
     stream.send_response(builder.body(())?).await?;
 

@@ -530,11 +530,22 @@ impl AppBuilder {
 
     /// Render error responses yourself — v1 design §5.3's "StatusPages-lite".
     ///
-    /// The closure runs for any response with a `4xx` or `5xx` status, whether
-    /// it came from a handler returning `Err`, a `404` for an unmatched path,
-    /// or a `405`. Return `Some(response)` to replace it, or `None` to keep the
-    /// default rendering — so a hook can take over just the statuses it cares
-    /// about.
+    /// The closure runs for any response the pipeline produces with a `4xx` or
+    /// `5xx` status, whether it came from a handler returning `Err`, a `404`
+    /// for an unmatched path, or a `405`. Return `Some(response)` to replace
+    /// it, or `None` to keep the default rendering — so a hook can take over
+    /// just the statuses it cares about.
+    ///
+    /// It does **not** run for a request the server refused to admit: an
+    /// oversized `Content-Length`, a message framed both by `Transfer-Encoding`
+    /// and `Content-Length`, or a deadline that expired before the pipeline
+    /// returned anything. Those are answered by the transport as `413`, `400`
+    /// and `408` in plain text, and deliberately so — running the pipeline
+    /// would mean inventing a `Call` for a request that was never accepted, and
+    /// every middleware with a side effect (a rate-limit counter, an audit
+    /// entry, a session touch) would then record a request the server declined
+    /// to dispatch. Security headers *are* applied to them, because those are
+    /// added by the transport on the way out rather than by the pipeline.
     ///
     /// It receives the status rather than the `Error` because by the time a
     /// response exists the error has already been rendered; this is the same
@@ -658,6 +669,13 @@ impl AppBuilder {
             ));
         }
 
+        // Kept as well as installed. The middleware covers everything the
+        // pipeline produces, but a transport also answers on its own — a body
+        // refused on its declared length, a deadline that expired before the
+        // pipeline returned anything — and those responses have to be given the
+        // same set by the transport itself. It cannot ask the middleware,
+        // because by then it is an opaque `Arc<dyn Middleware>` in a list.
+        let security = self.security.clone();
         if let Some(headers) = self.security {
             let tls_enabled = self.config.tls.is_some();
             mw.push((
@@ -675,6 +693,7 @@ impl AppBuilder {
                 config: self.config,
                 state: Arc::new(self.state),
                 extra_binds: self.extra_binds,
+                security,
             }),
         }
     }
@@ -691,6 +710,11 @@ struct AppInner {
     /// The extra addresses are serve-time state rather than request-time state,
     /// but so are `host` and `port`, which already ride along in `config`.
     extra_binds: Vec<String>,
+    /// The same set the pipeline middleware was built from, for the responses
+    /// a transport writes without going through the pipeline. `None` when the
+    /// application called `without_security_headers`, so the opt-out reaches
+    /// those responses too.
+    security: Option<crate::security::SecurityHeaders>,
 }
 
 /// An assembled, immutable, cheaply-cloneable application.
@@ -722,6 +746,27 @@ impl App {
     /// The resolved [`ServerConfig`] this app was built with.
     pub fn config(&self) -> &ServerConfig {
         &self.inner.config
+    }
+
+    /// Decorate a response with the configured
+    /// [`SecurityHeaders`](crate::SecurityHeaders).
+    ///
+    /// For the transports to call on the way out, on every response — not only
+    /// on the ones they synthesised. Sorting those two apart would mean a new
+    /// refusal added later is bare until someone notices, which is exactly how
+    /// the pre-dispatch `413` and the h3 `413` came to be bare. Calling it on a
+    /// response the pipeline already decorated costs a handful of header
+    /// lookups and changes nothing, since a header already present is kept.
+    ///
+    /// `over_tls` is the transport asserting that this response is encrypted
+    /// regardless of what the builder was told — true for HTTP/3, which has no
+    /// plaintext mode. Over TCP the builder's own certificate is the only
+    /// evidence available, so the flag is false there and
+    /// `config.tls.is_some()` decides.
+    pub(crate) fn apply_security_headers(&self, headers: &mut HeaderMap, over_tls: bool) {
+        if let Some(security) = &self.inner.security {
+            security.apply_to(headers, over_tls || self.inner.config.tls.is_some());
+        }
     }
 
     /// The single request entry point: run one request through the full
@@ -1086,7 +1131,8 @@ impl Middleware for AltSvc {
 }
 
 /// Runs the application's [`on_error`](AppBuilder::on_error) renderer over any
-/// error response.
+/// error response the pipeline produces. A connection-level refusal is answered
+/// before there is a pipeline to run — see the note on `on_error`.
 struct ErrorPages {
     render: ErrorRenderer,
 }

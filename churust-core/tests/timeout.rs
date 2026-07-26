@@ -43,6 +43,15 @@ async fn slow_handler_times_out() {
         text.starts_with("HTTP/1.1 408"),
         "expected 408, got: {text}"
     );
+    // The third response the pipeline never produced. `process` timed out, so
+    // there was nothing for the `SecurityHeaders` middleware to decorate and
+    // the `408` was composed by the engine instead — bare, where the `500` the
+    // same handler would have produced by panicking is not.
+    assert!(
+        text.to_lowercase()
+            .contains("x-content-type-options: nosniff"),
+        "the timeout response shipped without the default headers: {text}"
+    );
 
     let _ = tx.send(());
     let _ = tokio::time::timeout(Duration::from_secs(2), server).await;

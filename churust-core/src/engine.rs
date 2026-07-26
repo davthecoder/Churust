@@ -387,6 +387,13 @@ impl Drain {
 /// deliberately far below any sane value of it.
 const GOAWAY_LINGER: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// The `Content-Type` of the refusals this module composes itself.
+///
+/// Spelled the same way [`Response::text`](crate::Response::text) spells it, so
+/// a `413` the engine wrote and a `413` a handler returned are indistinguishable
+/// to a client parsing the header.
+const TEXT_PLAIN: &str = "text/plain; charset=utf-8";
+
 /// A connection's share of the connection budget, held for as long as the
 /// connection is served. `None` when the budget is unlimited.
 type ConnSlot = Option<tokio::sync::OwnedSemaphorePermit>;
@@ -1291,7 +1298,43 @@ fn tracing_drain_timeout(ms: u64) {
     );
 }
 
+/// Serve one request, and harden whatever comes back on the way out.
+///
+/// The hardening is here rather than only inside `respond` because `respond`
+/// has several exits and two of them never reach the pipeline: a refusal is
+/// composed and returned before `process_call` is ever called, so the
+/// `SecurityHeaders` middleware — which is a pipeline middleware — could not
+/// see it. A `413` for an oversized upload therefore went out with nothing but
+/// `Connection: close`, while every other status the same server produced,
+/// including a plain `404`, carried the full set.
+///
+/// Wrapping the whole function rather than patching each refusal is what keeps
+/// that from happening again: any exit added later passes through here. It is
+/// safe to run over a pipeline response too, because a header already present
+/// is left alone, so the second application is a no-op.
 async fn handle(
+    app: App,
+    req: HyperRequest<Incoming>,
+    max_body: usize,
+    timeout_ms: u64,
+    peer: std::net::SocketAddr,
+    conn_guard: ConnGuard,
+) -> Result<HyperResponse<UnsyncBoxBody<Bytes, std::io::Error>>, Infallible> {
+    let mut res = respond(app.clone(), req, max_body, timeout_ms, peer, conn_guard).await?;
+    // `false`: this transport cannot tell TLS from plaintext by itself — the
+    // stream arrives already decrypted, or never was — so the builder's own
+    // certificate is the only evidence, and `apply_security_headers` consults
+    // it. HTTP/3 is the case that can say `true`.
+    app.apply_security_headers(res.headers_mut(), false);
+    Ok(res)
+}
+
+/// Turn one hyper request into one hyper response.
+///
+/// Everything below is about *whether* to dispatch: the two refusals return
+/// without ever reaching the pipeline. `handle` above is what makes the answer
+/// look the same either way.
+async fn respond(
     app: App,
     req: HyperRequest<Incoming>,
     max_body: usize,
@@ -1322,6 +1365,12 @@ async fn handle(
                 // reused: whatever the client is still sending would be read as
                 // the next request.
                 .header(http::header::CONNECTION, "close")
+                // Every response this server composes says what its body is,
+                // and this one did not: it went out as seventeen unlabelled
+                // bytes, leaving the client's own sniffing to decide. Naming
+                // the type is what the accompanying `nosniff` is there to
+                // enforce, and the pair only means something together.
+                .header(http::header::CONTENT_TYPE, TEXT_PLAIN)
                 .body(into_boxed_body(Body::Bytes(bytes::Bytes::from_static(
                     b"Payload Too Large",
                 ))))
@@ -1371,6 +1420,9 @@ async fn handle(
             // Closing is the point: leaving the connection open would let
             // whatever the peer framed differently be read as a new request.
             .header(http::header::CONNECTION, "close")
+            // As above: a body with no declared type is one the recipient has
+            // to guess at.
+            .header(http::header::CONTENT_TYPE, TEXT_PLAIN)
             .body(into_boxed_body(Body::Bytes(bytes::Bytes::from_static(
                 b"Bad Request",
             ))))

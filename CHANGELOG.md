@@ -518,6 +518,58 @@ fn address_bucket(ip: IpAddr) -> String {
   calling if the node's own mode matters. No behaviour changed; tightening the
   mode after bind would be racy, since the socket accepts from the moment it
   exists.
+- **The responses a transport writes without dispatching now carry the default
+  security headers.** `SecurityHeaders` is installed as a `Phase::Setup`
+  middleware, so it only ever saw what came back out of the pipeline — and four
+  responses never go in. A body refused on its declared `Content-Length`, the
+  RFC 9112 §6.3 refusal of a message framed by both `Transfer-Encoding` and
+  `Content-Length`, and the h3 `413` are all composed before dispatch; the `408`
+  is composed when `request_timeout_ms` expires, so the pipeline never produced
+  anything to decorate. All four went out with no `X-Content-Type-Options`, no
+  `X-Frame-Options` and no `Referrer-Policy`, while `security.rs` promised them
+  on "every response" and a plain `404` from the same server carried the full
+  set. Nothing was exploitable — every one of those bodies is a fixed ASCII
+  literal with no markup and no attacker-controlled content, so the missing
+  `nosniff` had nothing to protect — but the module's claim was not true, and
+  the largest 4xx an operator will actually meet in production was the one that
+  arrived bare. The header set is now applied by each transport on the way out,
+  over every response rather than only the synthesised ones, so an exit added
+  later cannot forget; applying it twice is a no-op, because a header already
+  present is kept, which is the same rule that lets a handler override a
+  default. `without_security_headers` and a disabled individual header are
+  honoured on these paths too.
+- **HTTP/3 responses announce HSTS.** `Strict-Transport-Security` is gated on
+  the server knowing its responses are encrypted, and that was read solely from
+  `AppBuilder::tls` — a builder field `http3::serve` has no way to set, since it
+  is handed the certificate and key as arguments and the `App` reaching it is
+  already built. QUIC has no plaintext mode and `server_config_from_pem` pins
+  TLS 1.3, so the one transport where TLS is mandatory was the only one that
+  never pinned its clients to HTTPS, and the module's own documented example —
+  `http3::serve(app, addr, "cert.pem", "key.pem")` over an app built without
+  `.tls(..)` — produced exactly that. It only bit a deployment reachable over h3
+  but not over TLS through the builder, since otherwise the same `App` sends the
+  header on both; the reasoning behind the gate does not apply to h3 either way,
+  because the "we might be behind a proxy serving plaintext" doubt it exists to
+  respect cannot hold for a response written onto a QUIC stream. The h3 path now
+  asserts the transport is encrypted rather than consulting the builder. This
+  widens the gate and does not bypass what is behind it: `hsts(None)`,
+  `without_security_headers` and a handler that set the header itself all still
+  win. Note that it is a real change on the wire — an h3-only deployment that
+  was silently not sending HSTS will now pin its clients for a year, which is
+  the documented default but is not trivially undone.
+- **A refusal issued before dispatch says what its body is.** The pre-dispatch
+  `413` and the `Transfer-Encoding`-plus-`Content-Length` `400` were written
+  with a `Connection: close` and a literal body and no `Content-Type` at all,
+  leaving seventeen unlabelled bytes for the recipient to sniff at — where the
+  same statuses from a handler are `text/plain; charset=utf-8`. Both now declare
+  it, spelled the way `Response::text` spells it, which is also what makes the
+  accompanying `nosniff` mean anything. The refusals themselves still happen
+  before `process_call` and still bypass `on_error`, deliberately: rendering
+  them through the pipeline would mean inventing a `Call` for a request the
+  server declined to accept, and every middleware with a side effect — a
+  rate-limit counter, an audit entry, a session touch — would then record a
+  request that was never dispatched. `on_error` and `SecurityHeaders` now
+  document which responses each of them reaches.
 - **A saturated connection budget no longer blocks shutdown.** The accept loop
   awaited a `max_connections` permit *outside* the shutdown race, so once every
   slot was held the shutdown signal was never polled — `serve()` did not return
