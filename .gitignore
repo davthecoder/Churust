@@ -2,10 +2,15 @@
 /target
 **/target
 
-# Cargo.lock is not committed: this workspace publishes libraries, so consumers
-# resolve their own dependency versions. An application repository should commit
-# it instead.
-Cargo.lock
+# Cargo.lock *is* committed, and it changes nothing for consumers: cargo ignores
+# a dependency's lockfile, so every downstream application still resolves its
+# own versions. What it buys is CI testing the dependency set the author tested,
+# rather than a second one. Without it CI re-resolved to the newest crates on
+# every run, and hyper 1.11 — which
+# strips a request's Content-Length when a Transfer-Encoding is present — turned
+# a green branch red with no commit behind it. Upstream drift is still tested,
+# by ci-float.yml on a schedule, where it is the subject rather than the
+# ambush.
 
 # rustc / rustfmt leftovers
 **/*.rs.bk

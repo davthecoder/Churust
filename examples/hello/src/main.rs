@@ -21,7 +21,7 @@
 //!
 //! ```toml
 //! [dependencies]
-//! churust = "0.2"
+//! churust = "0.3"
 //! serde = { version = "1", features = ["derive"] }
 //! ```
 //!

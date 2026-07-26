@@ -35,7 +35,7 @@ use hyper::upgrade::OnUpgrade;
 use hyper_util::rt::TokioIo;
 use std::future::Future;
 use std::sync::{Arc, Mutex};
-use tokio_tungstenite::tungstenite::protocol::Role;
+use tokio_tungstenite::tungstenite::protocol::{Role, WebSocketConfig};
 use tokio_tungstenite::WebSocketStream;
 
 /// A cloneable, takeable holder for hyper's pending connection upgrade. The
@@ -43,6 +43,20 @@ use tokio_tungstenite::WebSocketStream;
 /// handshake requests; [`WebSocketUpgrade`] takes it back out.
 #[derive(Clone)]
 pub struct OnUpgradeHandle(Arc<Mutex<Option<OnUpgrade>>>);
+
+/// Frame and message size caps for an upgraded socket, seeded into the call by
+/// the engine so `on_upgrade` can apply them without reaching for global state.
+///
+/// The two are separate on purpose: a peer that respects the frame cap can
+/// still send an unbounded number of small continuation frames that reassemble
+/// into one enormous message.
+#[derive(Debug, Clone, Copy)]
+pub struct WsLimits {
+    /// Maximum size of a single frame, in bytes.
+    pub max_frame_bytes: usize,
+    /// Maximum size of a reassembled message, in bytes.
+    pub max_message_bytes: usize,
+}
 
 impl OnUpgradeHandle {
     /// Wrap a pending upgrade.
@@ -128,14 +142,59 @@ impl From<TMessage> for Message {
 
 /// An established WebSocket connection. Obtained inside the
 /// [`WebSocketUpgrade::on_upgrade`] callback.
+/// The configured WebSocket idle bound, seeded into the call by the engine.
+#[derive(Debug, Clone, Copy)]
+pub struct WsIdleTimeout(pub u64);
+
+/// An established WebSocket connection, handed to the `on_upgrade` callback.
 pub struct WebSocket {
     inner: WebSocketStream<TokioIo<hyper::upgrade::Upgraded>>,
+    /// Milliseconds since the socket opened, at the last frame in either
+    /// direction. Read by the idle reaper, which cannot see into the
+    /// application's callback and so has no other way to tell a busy socket
+    /// from a dead one.
+    activity: std::sync::Arc<WsActivity>,
+}
+
+/// When an upgraded socket last carried a frame.
+pub(crate) struct WsActivity {
+    last_ms: std::sync::atomic::AtomicU64,
+    origin: tokio::time::Instant,
+}
+
+impl WsActivity {
+    pub(crate) fn new() -> Self {
+        Self {
+            last_ms: std::sync::atomic::AtomicU64::new(0),
+            origin: tokio::time::Instant::now(),
+        }
+    }
+
+    fn touch(&self) {
+        self.last_ms.store(
+            self.origin.elapsed().as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+
+    /// `None` once the socket has been quiet for at least `idle_ms`, otherwise
+    /// how much longer to wait before asking again.
+    pub(crate) fn idle_for(&self, idle_ms: u64) -> Option<std::time::Duration> {
+        let last = self.last_ms.load(std::sync::atomic::Ordering::Relaxed);
+        let quiet = (self.origin.elapsed().as_millis() as u64).saturating_sub(last);
+        match idle_ms.checked_sub(quiet) {
+            Some(0) | None => None,
+            Some(remaining) => Some(std::time::Duration::from_millis(remaining)),
+        }
+    }
 }
 
 impl WebSocket {
     /// Receive the next message. `None` when the connection has closed.
     pub async fn recv(&mut self) -> Option<Result<Message>> {
-        match self.inner.next().await {
+        let got = self.inner.next().await;
+        self.activity.touch();
+        match got {
             Some(Ok(msg)) => Some(Ok(msg.into())),
             Some(Err(e)) => Some(Err(Error::internal(format!("websocket recv: {e}")))),
             None => None,
@@ -144,10 +203,13 @@ impl WebSocket {
 
     /// Send a message.
     pub async fn send(&mut self, msg: Message) -> Result<()> {
-        self.inner
+        let out = self
+            .inner
             .send(msg.into())
             .await
-            .map_err(|e| Error::internal(format!("websocket send: {e}")))
+            .map_err(|e| Error::internal(format!("websocket send: {e}")));
+        self.activity.touch();
+        out
     }
 
     /// Convenience: send a text message.
@@ -178,6 +240,12 @@ pub struct WebSocketUpgrade {
     on_upgrade: OnUpgrade,
     accept_key: HeaderValue,
     protocol: Option<HeaderValue>,
+    limits: WsLimits,
+    /// This connection's share of the accept budget, moved into the socket
+    /// task so the permit is held for as long as the WebSocket is open.
+    conn_guard: Option<crate::engine::ConnGuard>,
+    /// How long the socket may sit with no frame before it is closed.
+    idle_timeout_ms: u64,
 }
 
 #[async_trait]
@@ -217,10 +285,33 @@ impl FromCallParts for WebSocketUpgrade {
             .take()
             .ok_or_else(|| Error::internal("WebSocket upgrade already consumed"))?;
 
+        // Absent only when a call was built without the engine (unit tests);
+        // the conservative defaults then apply.
+        let limits = call.get::<WsLimits>().unwrap_or(WsLimits {
+            max_frame_bytes: 1 << 20,
+            max_message_bytes: 4 << 20,
+        });
+
+        // The connection's share of `max_connections` and of the drain. hyper
+        // resolves an upgraded connection as soon as it dispatches the `101`,
+        // so without carrying this into the socket task a live WebSocket held
+        // no permit at all and the cap bounded nothing for WebSocket traffic.
+        // Absent when a call was built without the engine (unit tests).
+        let conn_guard = call.get::<crate::engine::ConnGuard>();
+        // Absent when a call was built without the engine (unit tests); the
+        // default bound then applies.
+        let idle_timeout_ms = call
+            .get::<WsIdleTimeout>()
+            .map(|WsIdleTimeout(ms)| ms)
+            .unwrap_or(300_000);
+
         Ok(WebSocketUpgrade {
             on_upgrade,
+            limits,
             accept_key,
             protocol,
+            conn_guard,
+            idle_timeout_ms,
         })
     }
 }
@@ -238,14 +329,71 @@ impl WebSocketUpgrade {
             on_upgrade,
             accept_key,
             protocol,
+            limits,
+            conn_guard,
+            idle_timeout_ms,
         } = self;
 
         tokio::spawn(async move {
+            // Held for the socket's lifetime, so the budget is returned when
+            // the WebSocket ends rather than when the handshake finished.
+            let _conn_guard = conn_guard;
             if let Ok(upgraded) = on_upgrade.await {
-                let stream =
-                    WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, None)
-                        .await;
-                callback(WebSocket { inner: stream }).await;
+                // Bound both a single frame and a reassembled message: a peer
+                // respecting the frame cap can still stream unbounded
+                // continuation frames into one enormous message.
+                let mut ws_config = WebSocketConfig::default();
+                ws_config.max_frame_size = Some(limits.max_frame_bytes);
+                ws_config.max_message_size = Some(limits.max_message_bytes);
+
+                let stream = WebSocketStream::from_raw_socket(
+                    TokioIo::new(upgraded),
+                    Role::Server,
+                    Some(ws_config),
+                )
+                .await;
+
+                let activity = std::sync::Arc::new(WsActivity::new());
+                let socket = WebSocket {
+                    inner: stream,
+                    activity: activity.clone(),
+                };
+
+                // Race the application's callback against an idle reaper. No
+                // HTTP-level timeout survives the upgrade — `header_read_timeout`
+                // applies before there is a socket and `request_timeout_ms`
+                // wrapped a request that already completed — so without this a
+                // peer that finishes the handshake and then says nothing holds
+                // this connection's permit until the process restarts.
+                //
+                // Dropping the callback future closes the socket and releases
+                // the guard. That is abrupt by design: the peer is not
+                // answering, so there is nobody to negotiate a close with.
+                if idle_timeout_ms == 0 {
+                    callback(socket).await;
+                } else {
+                    let work = callback(socket);
+                    tokio::pin!(work);
+                    let reaper =
+                        tokio::time::sleep(std::time::Duration::from_millis(idle_timeout_ms));
+                    tokio::pin!(reaper);
+                    loop {
+                        tokio::select! {
+                            _ = &mut work => break,
+                            _ = reaper.as_mut() => match activity.idle_for(idle_timeout_ms) {
+                                // Quiet for the whole period: drop it.
+                                None => {
+                                    tracing::debug!("closing an idle WebSocket");
+                                    break;
+                                }
+                                // Traffic since the timer was armed.
+                                Some(remaining) => reaper
+                                    .as_mut()
+                                    .reset(tokio::time::Instant::now() + remaining),
+                            },
+                        }
+                    }
+                }
             }
         });
 

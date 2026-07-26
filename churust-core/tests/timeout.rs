@@ -3,9 +3,8 @@ use std::time::Duration;
 
 #[tokio::test]
 async fn slow_handler_times_out() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    drop(listener);
 
     let app = Churust::server()
         .host(addr.ip().to_string())
@@ -21,7 +20,7 @@ async fn slow_handler_times_out() {
 
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(async move {
-        app.start_with_shutdown(async move {
+        app.start_on(listener, async move {
             let _ = rx.await;
         })
         .await
@@ -43,6 +42,15 @@ async fn slow_handler_times_out() {
     assert!(
         text.starts_with("HTTP/1.1 408"),
         "expected 408, got: {text}"
+    );
+    // The third response the pipeline never produced. `process` timed out, so
+    // there was nothing for the `SecurityHeaders` middleware to decorate and
+    // the `408` was composed by the engine instead — bare, where the `500` the
+    // same handler would have produced by panicking is not.
+    assert!(
+        text.to_lowercase()
+            .contains("x-content-type-options: nosniff"),
+        "the timeout response shipped without the default headers: {text}"
     );
 
     let _ = tx.send(());

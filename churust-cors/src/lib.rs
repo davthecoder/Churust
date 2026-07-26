@@ -17,7 +17,7 @@
 //!
 //! # tokio::runtime::Runtime::new().unwrap().block_on(async {
 //! let app = Churust::server()
-//!     .install(Cors::permissive())
+//!     .install(Cors::allow_any_origin_insecure())
 //!     .routing(|r| {
 //!         r.get("/api/data", |_c: Call| async { "hello" });
 //!     })
@@ -122,7 +122,7 @@ impl Cors {
     ///
     /// > **Note:** Per the CORS specification, `Access-Control-Allow-Origin: *`
     /// > cannot be combined with `Access-Control-Allow-Credentials: true`.
-    /// > Therefore `permissive()` intentionally leaves credentials **disabled**.
+    /// > Therefore `allow_any_origin_insecure()` intentionally leaves credentials **disabled**.
     /// > If your application needs cookies or HTTP authentication on cross-origin
     /// > requests, use [`Cors::new`] with an explicit origin list and call
     /// > [`.allow_credentials(true)`](Cors::allow_credentials).
@@ -135,7 +135,7 @@ impl Cors {
     ///
     /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
     /// let app = Churust::server()
-    ///     .install(Cors::permissive())
+    ///     .install(Cors::allow_any_origin_insecure())
     ///     .routing(|r| {
     ///         r.get("/", |_c: Call| async { "hello" });
     ///     })
@@ -150,7 +150,26 @@ impl Cors {
     /// assert_eq!(res.header("access-control-allow-origin"), Some("*"));
     /// # });
     /// ```
+    #[deprecated(
+        since = "0.3.0",
+        note = "renamed to `allow_any_origin_insecure`, which says what it does. \
+                This reflects every origin, so any site can read authenticated \
+                responses from your API when credentials are not required."
+    )]
     pub fn permissive() -> Self {
+        Self::allow_any_origin_insecure()
+    }
+
+    /// Allow **every** origin, method and header.
+    ///
+    /// The name is deliberately uncomfortable. This reflects any origin, so if
+    /// your API answers requests based on an ambient credential — a cookie, a
+    /// bearer token a browser extension replays, an IP allowlist — any website
+    /// a user visits can read those responses.
+    ///
+    /// It is genuinely fine for a public, unauthenticated, read-only API, and
+    /// convenient in local development. It is not a default.
+    pub fn allow_any_origin_insecure() -> Self {
         Self {
             origin: AllowOrigin::Any,
             methods: vec![
@@ -480,14 +499,51 @@ impl Cors {
                 HeaderValue::from_static("true"),
             );
         }
-        // Vary: Origin so caches don't serve the wrong CORS headers.
-        res.headers.insert(VARY, HeaderValue::from_static("Origin"));
     }
 }
 
 impl Default for Cors {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Append `Origin` to `Vary` without disturbing what is already there.
+///
+/// This used to be a plain `insert` of `Vary: Origin` inside `apply_common`,
+/// which threw away whatever another layer had already put in the header.
+/// churust-compression merges `accept-encoding` into `Vary` as it unwinds, and
+/// CORS sits outside it, so the overwrite left a gzip-encoded response keyed on
+/// `Origin` alone: a shared cache would store those compressed bytes and hand
+/// them to the next same-origin client that sent no `Accept-Encoding` at all,
+/// which cannot decode them. The merge below is deliberately the same shape as
+/// `churust_compression`'s `vary_on_accept_encoding` so the two plugins agree
+/// on what a merged `Vary` looks like whichever order they are installed in:
+/// split the existing values on commas, compare case-insensitively because
+/// field names are case-insensitive, and leave the header alone when it is
+/// already `*` (which varies on everything) or already names the origin. The
+/// token is appended in lower case for the same reason — it matches the
+/// spelling the compression plugin emits, so a response passing through both
+/// reads as one consistent list rather than a mixture.
+fn vary_on_origin(res: &mut Response) {
+    let existing: Vec<String> = res
+        .headers
+        .get_all(VARY)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty())
+        .collect();
+
+    if existing.iter().any(|v| v == "*" || v == "origin") {
+        return;
+    }
+
+    let mut merged = existing;
+    merged.push("origin".to_string());
+    if let Ok(value) = HeaderValue::from_str(&merged.join(", ")) {
+        res.headers.insert(VARY, value);
     }
 }
 
@@ -537,6 +593,7 @@ impl Middleware for CorsMiddleware {
                     }
                 }
             }
+            vary_on_origin(&mut res);
             return res;
         }
 
@@ -545,6 +602,15 @@ impl Middleware for CorsMiddleware {
         if let Some(o) = origin.as_deref().and_then(|o| self.cfg.origin_allowed(o)) {
             self.cfg.apply_common(&mut res, &o);
         }
+        // Every response this middleware touches is marked, not only the ones
+        // that came out with an `Access-Control-Allow-Origin`. Whether that
+        // header is present at all is decided by the request's `Origin`: a
+        // same-origin request sends none and gets none back, a refused origin
+        // gets none either, an allowed one does. Marking only the allowed case
+        // left the other two freely cacheable, so a shared cache could store
+        // the header-less answer and replay it to an allowed origin, whose
+        // browser then blocks a response the server would have permitted.
+        vary_on_origin(&mut res);
         res
     }
 }
@@ -556,7 +622,7 @@ mod tests {
 
     fn app() -> App {
         Churust::server()
-            .install(Cors::permissive())
+            .install(Cors::allow_any_origin_insecure())
             .routing(|r| {
                 r.get("/", |_c: Call| async { "ok" });
             })
@@ -573,7 +639,11 @@ mod tests {
             .await;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(res.header("access-control-allow-origin"), Some("*"));
-        assert_eq!(res.header("vary"), Some("Origin"));
+        // Lower case because the merge normalises what it finds and appends in
+        // the same spelling churust-compression uses; `Vary` names fields, and
+        // field names are case-insensitive, so this is the same header as the
+        // `Origin` this test used to assert.
+        assert_eq!(res.header("vary"), Some("origin"));
     }
 
     #[tokio::test]
@@ -612,6 +682,81 @@ mod tests {
             res.header("access-control-allow-origin").is_some(),
             "CORS preflight was swallowed by the automatic OPTIONS handler"
         );
+    }
+
+    /// A `Vary` another layer already earned has to survive this one.
+    /// churust-compression merges `accept-encoding` into `Vary` on its way out
+    /// and the CORS middleware unwinds after it, so overwriting the header
+    /// would leave a gzip response keyed on `Origin` alone — a shared cache
+    /// would then hand those compressed bytes to the next client that sent no
+    /// `Accept-Encoding` at all.
+    #[tokio::test]
+    async fn a_pre_existing_vary_survives_the_cors_layer() {
+        let app = Churust::server()
+            .install(Cors::allow_any_origin_insecure())
+            .routing(|r| {
+                r.get("/report", |_c: Call| async {
+                    Response::text("ok")
+                        .with_header(VARY, HeaderValue::from_static("accept-encoding"))
+                });
+            })
+            .build();
+        let res = TestClient::new(app)
+            .get("/report")
+            .header("origin", "https://app.example.com")
+            .send()
+            .await;
+        assert_eq!(res.header("vary"), Some("accept-encoding, origin"));
+    }
+
+    /// Merging must not accumulate: a `Vary` that already names the origin is
+    /// left exactly as it is, and stays a single header line.
+    #[tokio::test]
+    async fn an_origin_already_named_in_vary_is_not_repeated() {
+        let app = Churust::server()
+            .install(Cors::allow_any_origin_insecure())
+            .routing(|r| {
+                r.get("/report", |_c: Call| async {
+                    Response::text("ok").with_header(VARY, HeaderValue::from_static("Origin"))
+                });
+            })
+            .build();
+        let res = TestClient::new(app)
+            .get("/report")
+            .header("origin", "https://app.example.com")
+            .send()
+            .await;
+        assert_eq!(res.header("vary"), Some("Origin"));
+    }
+
+    /// The refusal is itself origin-dependent: this response has no
+    /// `Access-Control-Allow-Origin` precisely because of who asked. Without
+    /// `Vary: Origin` a shared cache may store the header-less answer and
+    /// replay it to an allowed origin, which the browser then blocks.
+    #[tokio::test]
+    async fn a_response_to_a_disallowed_origin_still_varies_on_origin() {
+        let app = Churust::server()
+            .install(Cors::new().allow_origin("https://allowed.com"))
+            .routing(|r| {
+                r.get("/", |_c: Call| async { "ok" });
+            })
+            .build();
+        let res = TestClient::new(app)
+            .get("/")
+            .header("origin", "https://evil.com")
+            .send()
+            .await;
+        assert_eq!(res.header("access-control-allow-origin"), None);
+        assert_eq!(res.header("vary"), Some("origin"));
+    }
+
+    /// Same-origin requests carry no `Origin` at all, so they too get an answer
+    /// that differs from the cross-origin one. The cache key has to say so.
+    #[tokio::test]
+    async fn a_response_to_a_request_without_an_origin_still_varies_on_origin() {
+        let res = TestClient::new(app()).get("/").send().await;
+        assert_eq!(res.header("access-control-allow-origin"), None);
+        assert_eq!(res.header("vary"), Some("origin"));
     }
 
     #[tokio::test]

@@ -1,0 +1,636 @@
+//! HTTP/3 over QUIC (feature `http3`).
+//!
+//! HTTP/3 is a different transport, not a different framing of the same one:
+//! it runs over QUIC on UDP, so it needs its own socket and its own listener
+//! rather than an extra branch inside the TCP engine. That is why this is
+//! started separately from [`App::start`](crate::App::start), and why an
+//! application that wants both runs both.
+//!
+//! ```no_run
+//! use churust_core::{Call, Churust};
+//!
+//! # async fn run() -> std::io::Result<()> {
+//! let app = Churust::server()
+//!     // Tell HTTP/1.1 and HTTP/2 clients that h3 is available on the same
+//!     // port, so they can upgrade themselves on the next request.
+//!     .advertise_http3(8443)
+//!     .routing(|r| {
+//!         r.get("/", |_c: Call| async { "served over h3" });
+//!     })
+//!     .build();
+//!
+//! churust_core::http3::serve(
+//!     app,
+//!     "0.0.0.0:8443".parse().unwrap(),
+//!     "cert.pem",
+//!     "key.pem",
+//! )
+//! .await
+//! # }
+//! ```
+//!
+//! # How clients find it
+//!
+//! They do not, on their own. A browser reaches a new origin over TCP, and only
+//! moves to h3 if the response says h3 exists. That is the `Alt-Svc` header, and
+//! [`AppBuilder::advertise_http3`](crate::AppBuilder::advertise_http3) is what
+//! sets it. Serving h3 without advertising it means almost nothing will ever
+//! use it.
+//!
+//! # What is supported
+//!
+//! Request routing, headers, request bodies and response bodies, including
+//! streamed ones, through the same pipeline every other transport uses: a
+//! handler cannot tell which transport it is answering.
+//!
+//! WebSockets are not carried over h3. The upgrade mechanism there is Extended
+//! CONNECT from RFC 9220, which is a different handshake from the HTTP/1.1 one
+//! the `ws` feature implements, and pretending otherwise would produce a
+//! connection that fails at the first frame.
+
+#![cfg(feature = "http3")]
+
+use crate::app::App;
+use crate::body::Body;
+use bytes::{Buf, Bytes};
+use http::{HeaderMap, Method, Request, Uri};
+use std::io;
+use std::net::SocketAddr;
+use std::sync::Arc;
+
+/// How long a QUIC connection may sit idle before quinn closes it.
+///
+/// Matches the default `keep_alive_ms`, so an idle connection costs the same
+/// whichever transport it arrived on. `server_config_from_pem` is a free
+/// function with no access to the app config; a caller that needs a different
+/// value builds its own `quinn::ServerConfig` and uses `serve_with_config`.
+const DEFAULT_IDLE_MS: u64 = 75_000;
+
+/// Build a QUIC server configuration from a PEM certificate chain and key.
+///
+/// The ALPN protocol is `h3` and nothing else: a QUIC connection that
+/// negotiated anything else would not be HTTP/3, and there is nothing here to
+/// hand it to.
+///
+/// # Errors
+///
+/// If either file is missing or unreadable, if no private key is found, or if
+/// rustls rejects the pair.
+pub fn server_config_from_pem(cert_path: &str, key_path: &str) -> io::Result<quinn::ServerConfig> {
+    let certs = load_certs(cert_path)?;
+    let key = load_key(key_path)?;
+
+    let mut tls = rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+
+    let quic = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let mut config = quinn::ServerConfig::with_crypto(Arc::new(quic));
+
+    // Bound the connection's life, not just the request's. A permit is held for
+    // as long as the QUIC connection lives, and quinn's default idle timeout is
+    // negotiated with the peer — so a client that opens a connection and then
+    // says nothing at all, or answers one request and lingers, pinned a
+    // `max_connections` slot indefinitely. Neither case involves a request, so
+    // no request-level deadline can reach them.
+    //
+    // Set from the same knob that bounds an idle TCP connection, so one setting
+    // means one thing on both transports.
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(Some(
+        std::time::Duration::from_millis(DEFAULT_IDLE_MS)
+            .try_into()
+            .expect("idle timeout fits in a QUIC varint"),
+    ));
+    config.transport_config(Arc::new(transport));
+    Ok(config)
+}
+
+fn load_certs(path: &str) -> io::Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(file);
+    rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()
+}
+
+fn load_key(path: &str) -> io::Result<rustls::pki_types::PrivateKeyDer<'static>> {
+    let file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(file);
+    rustls_pemfile::private_key(&mut reader)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no private key found"))
+}
+
+/// Serve `app` over HTTP/3 on `addr` until the process ends.
+///
+/// # Errors
+///
+/// If the certificate or key cannot be loaded, or the UDP socket cannot be
+/// bound.
+pub async fn serve(app: App, addr: SocketAddr, cert_path: &str, key_path: &str) -> io::Result<()> {
+    let config = server_config_from_pem(cert_path, key_path)?;
+    serve_with_config(app, addr, config).await
+}
+
+/// Serve `app` over HTTP/3 with an already-built QUIC configuration.
+///
+/// # Errors
+///
+/// If the UDP socket cannot be bound.
+pub async fn serve_with_config(
+    app: App,
+    addr: SocketAddr,
+    config: quinn::ServerConfig,
+) -> io::Result<()> {
+    Http3Server::bind(addr, config)?.serve(app).await;
+    Ok(())
+}
+
+/// A bound QUIC listener, not yet serving.
+///
+/// Binding and serving are separate steps so the port can be read back before
+/// anything is accepted. That matters for the ordinary case of binding port 0
+/// and telling something else where to connect, and it is what lets a test know
+/// the address without racing the server.
+pub struct Http3Server {
+    endpoint: quinn::Endpoint,
+}
+
+impl std::fmt::Debug for Http3Server {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Http3Server")
+            .field("local_addr", &self.endpoint.local_addr().ok())
+            .finish_non_exhaustive()
+    }
+}
+
+impl Http3Server {
+    /// Bind a UDP socket for QUIC without serving yet.
+    ///
+    /// # Errors
+    ///
+    /// If the socket cannot be bound.
+    pub fn bind(addr: SocketAddr, config: quinn::ServerConfig) -> io::Result<Self> {
+        Ok(Self {
+            endpoint: quinn::Endpoint::server(config, addr)?,
+        })
+    }
+
+    /// The address actually bound, which is what resolves a port of 0.
+    ///
+    /// # Errors
+    ///
+    /// If the socket cannot report its address.
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.endpoint.local_addr()
+    }
+
+    /// Accept connections and serve them through `app` until the endpoint
+    /// closes.
+    pub async fn serve(self, app: App) {
+        accept_loop(app, self.endpoint).await;
+    }
+}
+
+/// Accept QUIC connections until the endpoint closes.
+async fn accept_loop(app: App, endpoint: quinn::Endpoint) {
+    // The same connection budget the TCP engine applies. Without it, enabling
+    // http3 opted a deployment out of `max_connections` entirely — and
+    // `advertise_http3` actively steers clients here.
+    let slots = (app.config().max_connections > 0)
+        .then(|| std::sync::Arc::new(tokio::sync::Semaphore::new(app.config().max_connections)));
+
+    while let Some(incoming) = endpoint.accept().await {
+        let app = app.clone();
+        // Taken before accepting, so excess load waits in QUIC's own queue
+        // rather than as memory in this process. Held for the connection's
+        // life by the task below.
+        let permit = match &slots {
+            Some(sem) => sem.clone().acquire_owned().await.ok(),
+            None => None,
+        };
+        // One task per connection, like the TCP engine: a slow peer must not
+        // hold up the accept loop.
+        tokio::spawn(async move {
+            let _permit = permit;
+            match incoming.await {
+                Ok(connection) => {
+                    if let Err(e) = serve_connection(app, connection).await {
+                        tracing::debug!(error = %e, "http3 connection ended");
+                    }
+                }
+                // A failed handshake on an internet-facing port is constant
+                // background noise, so debug rather than warn, matching how the
+                // TCP engine treats a failed TLS handshake.
+                Err(e) => tracing::debug!(error = %e, "http3 handshake failed"),
+            }
+        });
+    }
+}
+
+/// Run one QUIC connection's request streams through the pipeline.
+async fn serve_connection(
+    app: App,
+    connection: quinn::Connection,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // The peer address, which the TCP engine seeds and this path did not — so
+    // `Call::peer_addr` was `None` and anything keying on it (rate limiting,
+    // audit logs, IP allowlists) treated the entire h3 fleet as one client.
+    let peer = connection.remote_address();
+
+    // h3's default `max_field_section_size` is `VarInt::MAX`, i.e. no bound on
+    // a header block at all, where the TCP engine caps HTTP/1 headers by count
+    // and HTTP/2 by encoded size. Reuse the HTTP/2 knob: it asks the same
+    // question of the same kind of header block.
+    let mut h3 = h3::server::builder()
+        .max_field_section_size(app.config().h2_max_header_list_size as u64)
+        .build(h3_quinn::Connection::new(connection))
+        .await?;
+
+    loop {
+        match h3.accept().await {
+            Ok(Some(resolver)) => {
+                let app = app.clone();
+                // One task per request: h3 multiplexes streams on one
+                // connection, so serving them in sequence would make a slow
+                // handler block every other request on that connection.
+                //
+                // Resolving belongs inside the task for the same reason, and
+                // for a second one. `accept` returns as soon as a bidi stream
+                // exists, before any frame has been read, so awaiting
+                // `resolve_request` out here waited for one peer's HEADERS
+                // frame before the next stream could even be accepted — a
+                // stream whose headers never arrive head-of-line blocked every
+                // request behind it. And its error is a *stream* error:
+                // propagating it with `?` returned from this function, dropped
+                // the `h3::server::Connection`, and closed the whole QUIC
+                // connection, killing every other request multiplexed on it.
+                tokio::spawn(async move {
+                    let (request, stream) = match resolver.resolve_request().await {
+                        Ok(pair) => pair,
+                        // Scoped to this stream by construction. h3 has already
+                        // done whatever the stream needed — a `431` for an
+                        // oversized header block, a reset for one that ended
+                        // before its headers — and the connection is untouched.
+                        //
+                        // The genuinely connection-fatal case is not lost by
+                        // handling it here: h3 records it on the shared
+                        // connection state, so the next `accept` above returns
+                        // it and the `Err` arm ends the connection then. That
+                        // path is also *better* than the `?` was, because it
+                        // lets h3 emit the real code — H3_FRAME_UNEXPECTED,
+                        // say — where dropping the connection sent
+                        // H3_NO_ERROR for what was actually a protocol
+                        // violation.
+                        Err(e) => {
+                            tracing::debug!(error = %e, "http3 request headers failed");
+                            return;
+                        }
+                    };
+                    if let Err(e) = serve_request(app, request, stream, peer).await {
+                        tracing::debug!(error = %e, "http3 request failed");
+                    }
+                });
+            }
+            // The peer closed the connection cleanly.
+            Ok(None) => return Ok(()),
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// Answer one HTTP/3 request.
+async fn serve_request<S>(
+    app: App,
+    request: Request<()>,
+    mut stream: h3::server::RequestStream<S, Bytes>,
+    peer: SocketAddr,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: h3::quic::BidiStream<Bytes>,
+{
+    let (parts, _) = request.into_parts();
+    let max_body = app.config().max_body_bytes;
+
+    // The deadline has to start here, not after the body has arrived. Reading
+    // the body is the attacker-controlled phase — a client can dribble one byte
+    // and stop — and wrapping only the handler left exactly that phase
+    // unbounded, which the TCP path does not do.
+    let timeout_ms = app.config().request_timeout_ms;
+    let deadline = (timeout_ms > 0)
+        .then(|| tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms));
+
+    let read = async { read_body(&mut stream, max_body).await };
+    let read = match deadline {
+        Some(at) => match tokio::time::timeout_at(at, read).await {
+            Ok(r) => r,
+            Err(_) => {
+                return send_status(&app, &mut stream, http::StatusCode::REQUEST_TIMEOUT).await;
+            }
+        },
+        None => read.await,
+    };
+
+    let body = match read {
+        Ok(body) => body,
+        Err(BodyRefused::TooLarge) => {
+            return send_status(&app, &mut stream, http::StatusCode::PAYLOAD_TOO_LARGE).await;
+        }
+        // Reset rather than a 400, and the reason is what can actually reach
+        // the peer. The stream failed while we were reading it, so in the
+        // common case the peer has already reset its side — and a client that
+        // resets a request stream is cancelling it, which under RFC 9114 §4.1
+        // means it also stops reading the response. A status written into that
+        // is discarded, and when the failure was a `ConnectionError` there is
+        // no connection left to write it to at all. A 400 would therefore be a
+        // status this server believes it sent and the client never saw.
+        //
+        // Returning without resetting is not an option either, for the reason
+        // spelled out on the streamed-response arm below: the `RequestStream`
+        // is dropped on the way out and quinn finishes a stream when it drops,
+        // so the peer would get a clean FIN. Resetting first is what wins that
+        // race, and H3_REQUEST_INCOMPLETE is the code RFC 9114 defines for
+        // exactly this — "the client's stream terminated without containing a
+        // fully-formed request".
+        //
+        // The part that matters most is above this line rather than in it: we
+        // return before `process_with_extensions`, so the handler never runs
+        // and never commits half a payload. Refusing the stream is the report;
+        // not dispatching is the fix.
+        Err(BodyRefused::Incomplete(e)) => {
+            tracing::debug!(error = %e, "http3 request body ended before it was complete");
+            stream.stop_stream(h3::error::Code::H3_REQUEST_INCOMPLETE);
+            return Ok(());
+        }
+    };
+
+    let mut extensions = http::Extensions::new();
+    extensions.insert(crate::call::PeerAddr(peer));
+
+    let process = app.process_with_extensions(
+        parts.method.clone(),
+        normalise_uri(&parts.uri, &parts.method),
+        parts.headers.clone(),
+        body,
+        extensions,
+    );
+
+    // The remainder of the same budget, so the whole exchange is bounded once
+    // rather than the body and the handler each getting a full allowance.
+    let response = match deadline {
+        None => process.await,
+        Some(at) => match tokio::time::timeout_at(at, process).await {
+            Ok(res) => res,
+            Err(_) => crate::response::Response::text("Request Timeout")
+                .with_status(http::StatusCode::REQUEST_TIMEOUT),
+        },
+    };
+
+    send_response(&app, &mut stream, response, parts.method == Method::HEAD).await
+}
+
+/// Answer with a bare status and nothing else, hardened like any other reply.
+///
+/// The refusals above are composed here rather than in the pipeline, which is
+/// why they need their own call to `apply_security_headers`: the middleware
+/// that would otherwise add them never runs for a request that was never
+/// dispatched. Funnelled through one function so the next refusal added to
+/// `serve_request` cannot forget.
+async fn send_status<S>(
+    app: &App,
+    stream: &mut h3::server::RequestStream<S, Bytes>,
+    status: http::StatusCode,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: h3::quic::BidiStream<Bytes>,
+{
+    let mut response = http::Response::builder().status(status).body(())?;
+    app.apply_security_headers(response.headers_mut(), true);
+    stream.send_response(response).await?;
+    stream.finish().await?;
+    Ok(())
+}
+
+/// Why a request body was not handed to the pipeline.
+enum BodyRefused {
+    /// The request body exceeded the server's cap.
+    TooLarge,
+    /// The stream failed before the body was whole, so what was read is a
+    /// fragment of a request rather than a request.
+    Incomplete(h3::error::StreamError),
+}
+
+/// Read a request body, refusing one past `max_body` and one cut short.
+///
+/// Counted as it arrives rather than collected and then measured, so an
+/// oversized body is refused at the chunk that crosses the line instead of
+/// after all of it has been held in memory.
+async fn read_body<S>(
+    stream: &mut h3::server::RequestStream<S, Bytes>,
+    max_body: usize,
+) -> Result<Bytes, BodyRefused>
+where
+    S: h3::quic::BidiStream<Bytes>,
+{
+    let mut buf = bytes::BytesMut::new();
+    // `recv_data` has three outcomes and they have to stay three. This was a
+    // `while let Ok(Some(..))`, which is only two: a chunk, or the loop ends.
+    // The clean end of body and a stream that failed both fell into "the loop
+    // ends", so a body cut short — a peer that announced 5000 bytes, sent
+    // 1200, then RESET_STREAM, which surfaces here as
+    // `StreamError::RemoteTerminate` — was returned as `Ok` and dispatched as
+    // if the whole request had arrived. The handler ran, committed whatever
+    // side effect it has on a fragment of the payload, and answered 200. That
+    // is the failure mode the caller cannot detect afterwards, because a
+    // truncated body is a well-formed shorter body.
+    loop {
+        match stream.recv_data().await {
+            Ok(Some(mut chunk)) => {
+                let piece = chunk.copy_to_bytes(chunk.remaining());
+                if buf.len() + piece.len() > max_body {
+                    return Err(BodyRefused::TooLarge);
+                }
+                buf.extend_from_slice(&piece);
+            }
+            // The peer finished its side of the stream: the body is whole.
+            Ok(None) => return Ok(buf.freeze()),
+            Err(e) => return Err(BodyRefused::Incomplete(e)),
+        }
+    }
+}
+
+/// HTTP/3 always carries an absolute-form target, TCP requests usually do not.
+///
+/// The router matches on the path, and `Call::path` reads it off the URI, so
+/// both forms already work. What differs is what a handler sees when it prints
+/// the URI, and an absolute form there would be a gratuitous difference between
+/// transports. `CONNECT` and `OPTIONS *` are left alone: their target is not a
+/// path and rewriting it would destroy the request.
+fn normalise_uri(uri: &Uri, method: &Method) -> Uri {
+    if method == Method::CONNECT || uri.path() == "*" {
+        return uri.clone();
+    }
+    let Some(path_and_query) = uri.path_and_query() else {
+        return uri.clone();
+    };
+    path_and_query
+        .as_str()
+        .parse()
+        .unwrap_or_else(|_| uri.clone())
+}
+
+/// Write a [`Response`](crate::Response) out over an h3 stream.
+async fn send_response<S>(
+    app: &App,
+    stream: &mut h3::server::RequestStream<S, Bytes>,
+    response: crate::Response,
+    head_only: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    S: h3::quic::BidiStream<Bytes>,
+{
+    let mut builder = http::Response::builder().status(response.status);
+    if let Some(headers) = builder.headers_mut() {
+        *headers = sanitise(response.headers);
+        // `true`, which only this module is in a position to assert.
+        // QUIC has no plaintext mode — `server_config_from_pem` pins TLS 1.3,
+        // and a connection that negotiated anything but `h3` never gets here —
+        // so a response written to this stream is encrypted whatever
+        // `AppBuilder::tls` was told. The pipeline cannot know that: it runs
+        // the same code on every transport and reads a builder field that
+        // `http3::serve` has no way to set, since it is handed the certificate
+        // as an argument and the `App` is already built. The result was that
+        // the one transport where TLS is mandatory was the one that never sent
+        // HSTS.
+        //
+        // Widening the gate, not bypassing what is behind it: `hsts(None)` and
+        // `without_security_headers` are still obeyed, and a handler that set
+        // the header keeps its own value.
+        //
+        // Most of what this adds is already there — the pipeline's own
+        // middleware ran for anything routed — but a response the pipeline
+        // never produced (the `408` from an expired deadline just above)
+        // arrives with nothing, and that is the second reason this is here
+        // rather than in `serve_request`'s happy path.
+        app.apply_security_headers(headers, true);
+    }
+    stream.send_response(builder.body(())?).await?;
+
+    if !head_only {
+        match response.body {
+            Body::Bytes(bytes) => {
+                if !bytes.is_empty() {
+                    stream.send_data(bytes).await?;
+                }
+            }
+            Body::Stream(mut chunks) => {
+                use futures_util::StreamExt;
+                // Forwarded chunk by chunk, so a streamed response stays
+                // streamed over h3 instead of being collected to send it.
+                while let Some(chunk) = chunks.next().await {
+                    match chunk {
+                        Ok(bytes) => stream.send_data(bytes).await?,
+                        // The body failed partway. There is no status left to
+                        // change, so the honest signal is an incomplete
+                        // stream: reset it rather than finishing cleanly and
+                        // claiming the truncated body was the whole thing.
+                        //
+                        // Returning without resetting did the opposite of what
+                        // this comment promised. It skips the `finish` below,
+                        // but the `RequestStream` is owned by this task and is
+                        // dropped on the way out — and quinn's `SendStream`
+                        // finishes the stream when it drops. The peer got a
+                        // clean FIN and a truncated body it could not tell
+                        // apart from the whole one: three records of a hundred,
+                        // stored as the complete answer. Over HTTP/1.1 and
+                        // HTTP/2 the same handler surfaces the error to hyper,
+                        // which aborts.
+                        //
+                        // Resetting first is what wins the race: after
+                        // `stop_stream` the drop-time finish fails with
+                        // `ClosedStream`, which quinn ignores, so RESET_STREAM
+                        // is what reaches the peer.
+                        Err(e) => {
+                            tracing::debug!(error = %e, "http3 response body failed mid-stream");
+                            stream.stop_stream(h3::error::Code::H3_INTERNAL_ERROR);
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    stream.finish().await?;
+    Ok(())
+}
+
+/// Drop headers HTTP/3 forbids.
+///
+/// RFC 9114 §4.2 bans connection-specific fields, and a `Connection:
+/// keep-alive` copied from a handler written for HTTP/1.1 is enough for a
+/// conforming client to treat the whole response as malformed.
+fn sanitise(mut headers: HeaderMap) -> HeaderMap {
+    for name in [
+        "connection",
+        "keep-alive",
+        "proxy-connection",
+        "transfer-encoding",
+        "upgrade",
+    ] {
+        headers.remove(name);
+    }
+    headers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_absolute_target_becomes_origin_form() {
+        let uri: Uri = "https://example.com/a/b?x=1".parse().unwrap();
+        assert_eq!(
+            normalise_uri(&uri, &Method::GET).to_string(),
+            "/a/b?x=1",
+            "a handler should see the same target on every transport"
+        );
+    }
+
+    #[test]
+    fn an_origin_form_target_is_left_alone() {
+        let uri: Uri = "/a/b".parse().unwrap();
+        assert_eq!(normalise_uri(&uri, &Method::GET).to_string(), "/a/b");
+    }
+
+    #[test]
+    fn a_connect_target_is_left_alone() {
+        let uri: Uri = "example.com:443".parse().unwrap();
+        assert_eq!(
+            normalise_uri(&uri, &Method::CONNECT).to_string(),
+            "example.com:443"
+        );
+    }
+
+    #[test]
+    fn connection_specific_headers_are_dropped() {
+        let mut headers = HeaderMap::new();
+        headers.insert("connection", "keep-alive".parse().unwrap());
+        headers.insert("transfer-encoding", "chunked".parse().unwrap());
+        headers.insert("content-type", "text/plain".parse().unwrap());
+
+        let clean = sanitise(headers);
+        assert!(clean.get("connection").is_none());
+        assert!(clean.get("transfer-encoding").is_none());
+        assert_eq!(clean.get("content-type").unwrap(), "text/plain");
+    }
+
+    #[test]
+    fn a_missing_certificate_is_reported_rather_than_panicking() {
+        match server_config_from_pem("/nonexistent/cert.pem", "/nonexistent/key.pem") {
+            Ok(_) => panic!("expected an error for missing files"),
+            Err(e) => assert_eq!(e.kind(), io::ErrorKind::NotFound),
+        }
+    }
+}

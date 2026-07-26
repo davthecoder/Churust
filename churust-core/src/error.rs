@@ -204,6 +204,66 @@ impl std::error::Error for Error {
     }
 }
 
+/// Let a user error type be returned from a handler with `?`.
+///
+/// [`Result<T>`](Result) already flows through `?` for Churust's own [`Error`],
+/// but a handler holding a `Result<T, sqlx::Error>` previously needed a
+/// `map_err` at every call site. Implement this and the conversion is
+/// automatic.
+///
+/// ```
+/// use churust_core::IntoError;
+/// use http::StatusCode;
+///
+/// #[derive(Debug)]
+/// struct NotFound;
+/// impl std::fmt::Display for NotFound {
+///     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+///         write!(f, "no such row")
+///     }
+/// }
+/// impl IntoError for NotFound {
+///     fn status(&self) -> StatusCode { StatusCode::NOT_FOUND }
+/// }
+///
+/// fn find() -> Result<&'static str, NotFound> { Err(NotFound) }
+///
+/// fn handler() -> churust_core::Result<&'static str> {
+///     Ok(find()?)   // converts through IntoError
+/// }
+/// assert_eq!(handler().unwrap_err().status(), StatusCode::NOT_FOUND);
+/// ```
+///
+/// # Why `message` does not default to `Display`
+///
+/// It would be convenient and it would leak. Error types routinely render
+/// connection strings, file paths and query fragments in their `Display`, and a
+/// framework that forwarded those to clients by default would turn every
+/// adopter's first `?` into an information disclosure. The default is the
+/// status' canonical reason; opting *into* detail is safe, opting out of a leak
+/// is not.
+pub trait IntoError: std::fmt::Display {
+    /// The status this error should produce. Defaults to `500`.
+    fn status(&self) -> StatusCode {
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+
+    /// The client-facing message. Defaults to the status' canonical reason,
+    /// deliberately not `Display` — see the note on the trait.
+    fn message(&self) -> String {
+        self.status()
+            .canonical_reason()
+            .unwrap_or("error")
+            .to_string()
+    }
+}
+
+impl<E: IntoError> From<E> for Error {
+    fn from(e: E) -> Self {
+        Error::new(e.status(), e.message())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -50,32 +50,32 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Clippy (workspace, default features)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Clippy (umbrella, all plugins)
-        run: cargo clippy -p churust --all-targets --features full -- -D warnings
+        run: cargo clippy --locked -p churust --all-targets --features full -- -D warnings
 
       - name: Clippy (core, TLS feature)
-        run: cargo clippy -p churust-core --all-targets --features tls -- -D warnings
+        run: cargo clippy --locked -p churust-core --all-targets --all-features -- -D warnings
 
       - name: Test (workspace)
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
       - name: Test (umbrella, all plugins)
-        run: cargo test -p churust --features full
+        run: cargo test --locked -p churust --features full
 
       - name: Test (core, TLS feature)
-        run: cargo test -p churust-core --features tls
+        run: cargo test --locked -p churust-core --all-features
 
       - name: Build examples
-        run: cargo build -p hello -p api
+        run: cargo build --locked -p hello -p api
 
       - name: Docs
-        run: cargo doc --workspace --no-deps
+        run: cargo doc --locked --workspace --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"
 
-      # Packages and verifies the seven publishable crates without uploading,
+      # Packages and verifies the fourteen publishable crates without uploading,
       # catching a broken manifest before anything becomes permanent.
       #
       # `cargo package` rather than `publish --dry-run`, because the latter
@@ -89,7 +89,7 @@ jobs:
       # carrying their own tokio dependency.
       - name: Package check
         run: |
-          cargo package --workspace \
+          cargo package --locked --workspace \
             --exclude hello --exclude api --exclude chat --exclude static-example
 
       # Work out what is actually missing from the registry before touching
@@ -102,8 +102,23 @@ jobs:
         run: |
           set -euo pipefail
           pending=""
+          # Dependency order, and the single source of truth for what a release
+          # contains. It drifted once already: seven crates were added to the
+          # workspace while this list stayed at the original seven, and because
+          # `shared-version` bumps every crate, the umbrella's dependencies then
+          # named versions that were never published — the umbrella publish
+          # fails and the release lands half-done, which is exactly the
+          # unrecoverable state RELEASING.md forbids.
+          #
+          # Two levels: churust-core and churust-macros depend on nothing
+          # internal, every plugin depends on churust-core, and the umbrella
+          # depends on the plugins, so it goes last. Examples are
+          # `publish = false` and never appear here.
           for crate in churust-core churust-macros \
-                       churust-json churust-logging churust-cors churust-auth \
+                       churust-auth churust-client churust-compression \
+                       churust-cors churust-json churust-lab churust-logging \
+                       churust-openapi churust-ratelimit churust-redis \
+                       churust-templates \
                        churust; do
             code=$(curl -s -o /dev/null -w '%{http_code}' \
               -H 'User-Agent: churust-release-workflow' \
@@ -144,7 +159,7 @@ jobs:
           published=0
           for crate in $PENDING; do
             echo "publish  $crate"
-            cargo publish -p "$crate"
+            cargo publish --locked -p "$crate"
             published=$((published + 1))
           done
           echo "::notice::published $published crate(s)"
@@ -176,7 +191,7 @@ jobs:
             -f tag_name="$GITHUB_REF_NAME" --jq '.body' 2>/dev/null || true)
 
           {
-            echo "All seven Churust crates release together on \`$VERSION\`."
+            echo "All fourteen Churust crates release together on \`$VERSION\`."
             echo
             echo '```toml'
             echo '[dependencies]'
@@ -190,8 +205,13 @@ jobs:
 
             echo '### Crates'
             echo
-            for c in churust churust-core churust-macros churust-json \
-                     churust-logging churust-cors churust-auth; do
+            # Same list as the plan step above; keep them together.
+            for c in churust-core churust-macros \
+                       churust-auth churust-client churust-compression \
+                       churust-cors churust-json churust-lab churust-logging \
+                       churust-openapi churust-ratelimit churust-redis \
+                       churust-templates \
+                       churust; do
               echo "- [\`$c\`](https://crates.io/crates/$c/$VERSION) · [docs](https://docs.rs/$c/$VERSION)"
             done
             echo

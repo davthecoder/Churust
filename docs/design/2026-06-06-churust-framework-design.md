@@ -197,7 +197,12 @@ Churust::server()
 - rustls TLS opt-in (`.tls(cert, key)` or `[tls]` in config).
 - Graceful shutdown on SIGINT/SIGTERM: stop accepting, drain in-flight,
   configurable grace period.
-- HTTP/2 enabled via hyper (h2 over TLS / prior-knowledge).
+- HTTP/1.1 and HTTP/2. This document originally claimed HTTP/2 was enabled via
+  hyper, which was not true at the time — `Cargo.toml` requested only hyper's
+  `http1` feature and there was no ALPN or h2c code anywhere. Corrected
+  2026-07-25, and then made true: the engine now uses hyper-util's `auto`
+  builder, which negotiates h2 over TLS via ALPN and h2c by prior knowledge in
+  plaintext.
 
 ## 10. App state / DI
 

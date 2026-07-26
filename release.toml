@@ -17,7 +17,7 @@ shared-version = true
 # CI publishes, not your laptop. See the workflow.
 publish = false
 
-# One tag for the workspace instead of seven crate-prefixed ones.
+# One tag for the workspace instead of fourteen crate-prefixed ones.
 tag = true
 tag-prefix = ""
 tag-name = "v{{version}}"

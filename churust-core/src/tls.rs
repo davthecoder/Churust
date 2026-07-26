@@ -27,10 +27,17 @@ use tokio_rustls::TlsAcceptor;
 pub fn acceptor_from_pem(cert_path: &str, key_path: &str) -> io::Result<TlsAcceptor> {
     let certs = load_certs(cert_path)?;
     let key = load_key(key_path)?;
-    let config = ServerConfig::builder()
+    let mut config = ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+    // Advertise HTTP/2 first, then HTTP/1.1. ALPN is how h2 is negotiated over
+    // TLS at all — without it a client that supports HTTP/2 still falls back to
+    // HTTP/1.1, so the engine's h2 support would never be reached in practice.
+    // Order is the server's preference.
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 

@@ -12,6 +12,10 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
+# Every cargo invocation below passes `--locked`. Cargo.lock is committed, so
+# this job tests the tree the author tested and fails loudly if a manifest
+# change forgot to bring the lockfile with it. Testing against *newer*
+# dependencies is still done — deliberately, on a schedule, by ci-float.yml.
 jobs:
   test:
     name: Test & Lint
@@ -32,27 +36,68 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Clippy (workspace, default features)
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
-      - name: Clippy (umbrella, all plugins)
-        run: cargo clippy -p churust --all-targets --features full -- -D warnings
+      # `--all-features` rather than `--features full`. `full` is the plugin
+      # set and deliberately stops short of openapi, redis, client, client-tls,
+      # multipart and http3, so the re-exports those gate — `pub use
+      # churust_openapi as openapi;` and its neighbours in churust/src/lib.rs,
+      # plus the prelude's `RedisStore` and `multipart::{..}` — were compiled by
+      # no step in this matrix, while docs.rs builds the crate with
+      # `all-features = true`. Renaming a re-exported item stayed green here and
+      # broke for whoever turned the feature on. Widening this step rather than
+      # adding one keeps the bill near zero: the third-party half of that
+      # feature set is already in the cache from the workspace step above, so
+      # the widening re-checks sixteen crates — a couple of seconds — and the
+      # core and plugin-crate steps below then reuse what it built.
+      - name: Clippy (umbrella, every feature)
+        run: cargo clippy --locked -p churust --all-targets --all-features -- -D warnings
 
-      - name: Clippy (core, TLS feature)
-        run: cargo clippy -p churust-core --all-targets --features tls -- -D warnings
+      - name: Clippy (core, every feature)
+        run: cargo clippy --locked -p churust-core --all-targets --all-features -- -D warnings
 
       - name: Test (workspace)
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
       - name: Test (umbrella, all plugins)
-        run: cargo test -p churust --features full
+        run: cargo test --locked -p churust --features full
 
-      - name: Test (core, TLS feature)
-        run: cargo test -p churust-core --features tls
+      # Every optional feature, not just `tls`. `cargo test --workspace` builds
+      # churust-core with default features only, and `-p churust --features
+      # full` does not build churust-core's own test targets — so the
+      # multipart, tower, ws, fs and http3 suites compiled to zero test cases
+      # and the defects they cover shipped green. CONTRIBUTING.md requires new
+      # optional functionality to reach the matrix; this is that entry.
+      - name: Test (core, every feature)
+        run: cargo test --locked -p churust-core --all-features
+
+      # The plugin crates, each with its own optional surface.
+      - name: Test (plugin crates, every feature)
+        run: |
+          cargo test --locked -p churust-json -p churust-logging -p churust-cors \
+                     -p churust-auth -p churust-lab -p churust-ratelimit \
+                     -p churust-compression -p churust-templates \
+                     -p churust-redis -p churust-client -p churust-openapi \
+                     --all-features
+
+      # A release publishes crate by crate in dependency order; a crate absent
+      # from that list is silently never published, and the umbrella then
+      # depends on a version that does not exist.
+      - name: Release crate list is current
+        run: python3 .github/scripts/check-release-list.py
 
       - name: Build examples
-        run: cargo build -p hello -p api
+        run: cargo build --locked -p hello -p api
 
+      # Also `--all-features`, and for the same reason: every crate here carries
+      # `all-features = true` under `[package.metadata.docs.rs]`, so a default
+      # feature build documents something narrower than what readers are served.
+      # A broken intra-doc link or a missing-docs item behind an off-by-default
+      # feature is invisible to this step otherwise and turns up on the
+      # published page, where it can no longer be fixed without a release. By
+      # this point in the job every one of those features has been compiled
+      # already, so the wider build measures a few seconds.
       - name: Docs
-        run: cargo doc --workspace --no-deps
+        run: cargo doc --locked --workspace --all-features --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"

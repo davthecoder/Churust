@@ -1,0 +1,553 @@
+//! Rate limiting for the [Churust] web framework.
+//!
+//! [`RateLimit`] admits a bounded number of requests per key per period and
+//! answers everything above that with `429 Too Many Requests` and a
+//! `Retry-After` header. It is both a [`Plugin`] (server-wide) and a
+//! [`Middleware`] (scoped to part of the route tree with
+//! `RouteBuilder::intercept`).
+//!
+//! ```
+//! use churust_core::{Call, Churust, TestClient};
+//! use churust_ratelimit::RateLimit;
+//!
+//! # tokio::runtime::Runtime::new().unwrap().block_on(async {
+//! let app = Churust::server()
+//!     .install(RateLimit::per_minute(2))
+//!     .routing(|r| {
+//!         r.get("/", |_c: Call| async { "ok" });
+//!     })
+//!     .build();
+//!
+//! let client = TestClient::new(app);
+//! assert_eq!(client.get("/").send().await.status().as_u16(), 200);
+//! assert_eq!(client.get("/").send().await.status().as_u16(), 200);
+//! let limited = client.get("/").send().await;
+//! assert_eq!(limited.status().as_u16(), 429);
+//! assert!(limited.header("retry-after").is_some());
+//! # });
+//! ```
+//!
+//! # The algorithm
+//!
+//! A generic cell rate algorithm (GCRA), which is a leaky bucket expressed as
+//! one timestamp per key rather than a counter plus a timer. Each key stores a
+//! *theoretical arrival time*: the earliest moment at which the next request
+//! would be perfectly conforming. A request is admitted when it arrives no more
+//! than the burst tolerance ahead of that time, and the timestamp then advances
+//! by one emission interval.
+//!
+//! Two properties follow, and both are why this is preferred over a fixed
+//! window counter. Requests are smoothed rather than admitted in a stampede at
+//! the top of each window, and `Retry-After` is an exact figure that falls out
+//! of the arithmetic instead of an estimate.
+//!
+//! # Choosing a key
+//!
+//! The default key is the connection's peer address, without the port, so
+//! several connections from one client share a bucket. An IPv4 peer is keyed on
+//! the whole address; an IPv6 peer is keyed on its /64 prefix, because the low
+//! 64 bits of an IPv6 address are the interface identifier and the host picks
+//! those itself. Without the mask, a peer that walks its own subnet gets a
+//! fresh allowance per address and is never limited at all, and even an honest
+//! client rotating privacy addresses drifts out of its bucket. The cost of the
+//! mask is that hosts which genuinely share one /64 share a budget; if that is
+//! wrong for your deployment, key on the full address yourself:
+//!
+//! ```
+//! use churust_ratelimit::RateLimit;
+//!
+//! let limiter = RateLimit::per_minute(60)
+//!     .by(|call| call.peer_addr().map(|addr| addr.ip().to_string()));
+//! ```
+//!
+//! Behind a reverse proxy the peer address is the proxy, which would put every
+//! visitor in one bucket. Use [`RateLimit::by`] there too, and read a
+//! forwarding header only after checking
+//! [`Call::peer_addr`](churust_core::Call::peer_addr) against proxies you
+//! actually trust. `X-Forwarded-For` is caller-supplied and trivially spoofed.
+//!
+//! [Churust]: churust_core::Churust
+
+#![deny(missing_docs)]
+
+use async_trait::async_trait;
+use churust_core::{AppBuilder, Call, Error, Middleware, Next, Phase, Plugin, Response};
+use http::header::RETRY_AFTER;
+use http::{HeaderValue, StatusCode};
+use std::collections::hash_map::RandomState;
+use std::collections::HashMap;
+use std::hash::BuildHasher;
+use std::net::{IpAddr, Ipv6Addr};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// How many keys are tracked before the table is pruned.
+const DEFAULT_MAX_KEYS: usize = 100_000;
+
+/// A function that derives the bucket key for a call, or `None` to exempt it.
+type KeyFn = Arc<dyn Fn(&Call) -> Option<String> + Send + Sync>;
+
+/// The tracked timestamps, behind one lock.
+///
+/// A `HashMap` under a `Mutex` rather than a sharded or lock-free map: the
+/// critical section is a hash lookup and an insert, and a lock held that
+/// briefly is not the bottleneck in a pipeline that is about to do I/O.
+#[derive(Debug, Default)]
+struct Table {
+    /// Key digest to theoretical arrival time.
+    ///
+    /// The digest, not the key. `max_keys` bounds how many entries there are
+    /// and nothing bounds how long a [`KeyFn`] makes one, so storing the key
+    /// itself would let whoever supplies it choose what a bucket costs: a
+    /// header-derived key at a few hundred kilobytes apiece stays far under the
+    /// entry cap, never trips [`Table::prune`], and still pins gigabytes for
+    /// the life of the process. At a fixed width the documented bound holds by
+    /// construction, for every `KeyFn`, without the limiter having to have an
+    /// opinion about what a reasonable key looks like.
+    tat: HashMap<u64, Instant>,
+    /// The seed the digests are taken under.
+    ///
+    /// Two distinct keys that collide share one budget, so the seed is per
+    /// table and randomly chosen rather than fixed: a caller who could compute
+    /// a digest offline could hunt for a value colliding with somebody else's
+    /// key and spend it for them. Against a secret seed that costs the birthday
+    /// work on a 64-bit output with no way to observe a hit, while an accidental
+    /// collision across the default 100,000 live entries sits around one in four
+    /// billion. Truncating the key instead would have been cheaper and would
+    /// have handed that collision to anyone who can type a prefix.
+    seed: RandomState,
+}
+
+impl Table {
+    /// The fixed-width stand-in for a key.
+    fn digest(&self, key: &str) -> u64 {
+        self.seed.hash_one(key)
+    }
+
+    /// Drop keys that have gone idle, then, if the table is still over its cap,
+    /// evict the entries nearest to expiry until it is under.
+    ///
+    /// Evicting a live entry forgives whatever that key had spent, so this is a
+    /// memory bound rather than a security boundary. It only engages when the
+    /// key space is being flooded, which is the case where the alternative,
+    /// unbounded growth, is the more direct denial of service.
+    fn prune(&mut self, now: Instant, max_keys: usize) {
+        self.tat.retain(|_, tat| *tat > now);
+        if self.tat.len() < max_keys {
+            return;
+        }
+        let target = max_keys * 9 / 10;
+        let mut by_expiry: Vec<(u64, Instant)> = self.tat.iter().map(|(k, v)| (*k, *v)).collect();
+        by_expiry.sort_by_key(|(_, tat)| *tat);
+        for (key, _) in by_expiry.into_iter().take(self.tat.len() - target) {
+            self.tat.remove(&key);
+        }
+    }
+}
+
+/// A rate limiter, usable as a plugin or as scoped middleware.
+///
+/// Construct with [`per_second`](RateLimit::per_second),
+/// [`per_minute`](RateLimit::per_minute), [`per_hour`](RateLimit::per_hour) or
+/// [`per`](RateLimit::per), then refine with [`burst`](RateLimit::burst) and
+/// [`by`](RateLimit::by).
+///
+/// Cloning shares the underlying table, so the same limiter can be installed in
+/// several places and still count one budget.
+#[derive(Clone)]
+pub struct RateLimit {
+    /// The spacing between two perfectly conforming requests.
+    emission: Duration,
+    /// How far ahead of its schedule a key may run.
+    tolerance: Duration,
+    /// The advertised allowance, used only for the error message.
+    limit: u32,
+    /// The advertised period, used only for the error message.
+    period: Duration,
+    max_keys: usize,
+    key: KeyFn,
+    table: Arc<Mutex<Table>>,
+}
+
+impl std::fmt::Debug for RateLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RateLimit")
+            .field("limit", &self.limit)
+            .field("period", &self.period)
+            .field("emission", &self.emission)
+            .field("tolerance", &self.tolerance)
+            .field("max_keys", &self.max_keys)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RateLimit {
+    /// Allow `limit` requests per `period`, per key.
+    ///
+    /// The initial burst equals `limit`: a key that has been quiet may spend
+    /// its whole allowance at once and then refills at `limit / period`. Narrow
+    /// that with [`burst`](RateLimit::burst).
+    ///
+    /// # Panics
+    ///
+    /// If `limit` is zero, or `period` is zero. Both describe a limiter that
+    /// can never admit anything, which is a configuration mistake rather than a
+    /// policy, and failing at startup is the repo's rule for those.
+    pub fn per(limit: u32, period: Duration) -> Self {
+        assert!(limit > 0, "rate limit must admit at least one request");
+        assert!(
+            !period.is_zero(),
+            "rate limit period must be greater than zero"
+        );
+        let emission = period / limit;
+        Self {
+            emission,
+            tolerance: emission * (limit - 1),
+            limit,
+            period,
+            max_keys: DEFAULT_MAX_KEYS,
+            key: Arc::new(default_key),
+            table: Arc::new(Mutex::new(Table::default())),
+        }
+    }
+
+    /// Allow `limit` requests per second, per key.
+    pub fn per_second(limit: u32) -> Self {
+        Self::per(limit, Duration::from_secs(1))
+    }
+
+    /// Allow `limit` requests per minute, per key.
+    pub fn per_minute(limit: u32) -> Self {
+        Self::per(limit, Duration::from_secs(60))
+    }
+
+    /// Allow `limit` requests per hour, per key.
+    pub fn per_hour(limit: u32) -> Self {
+        Self::per(limit, Duration::from_secs(3600))
+    }
+
+    /// Cap the instantaneous burst at `burst` requests.
+    ///
+    /// The sustained rate is unchanged. `burst(1)` admits no burst at all:
+    /// requests must be spaced by a full emission interval.
+    ///
+    /// # Panics
+    ///
+    /// If `burst` is zero.
+    pub fn burst(mut self, burst: u32) -> Self {
+        assert!(burst > 0, "burst must be at least one request");
+        self.tolerance = self.emission * (burst - 1);
+        self
+    }
+
+    /// Derive the bucket key from the call instead of using the peer IP.
+    ///
+    /// Returning `None` exempts the request from limiting entirely, which is
+    /// how you let health checks or an authenticated internal caller through.
+    ///
+    /// The key is hashed and dropped rather than kept, so its length costs
+    /// nothing beyond the one call and a caller-supplied value needs no length
+    /// check of its own before it is handed over.
+    ///
+    /// ```
+    /// use churust_ratelimit::RateLimit;
+    ///
+    /// // Per API key, falling back to no limit for unauthenticated callers.
+    /// let limiter = RateLimit::per_minute(60)
+    ///     .by(|call| call.header("x-api-key").map(str::to_owned));
+    /// ```
+    pub fn by<F>(mut self, f: F) -> Self
+    where
+        F: Fn(&Call) -> Option<String> + Send + Sync + 'static,
+    {
+        self.key = Arc::new(f);
+        self
+    }
+
+    /// Set how many keys are tracked before the table is pruned.
+    ///
+    /// The table holds a 64-bit digest of the key and one timestamp per active
+    /// client, so an entry costs the same whatever the key is and the default of
+    /// 100,000 is a few megabytes for any [`by`](RateLimit::by) function. Raise
+    /// it for a large fleet, lower it for a memory-constrained deployment.
+    ///
+    /// # Panics
+    ///
+    /// If `n` is zero.
+    pub fn max_keys(mut self, n: usize) -> Self {
+        assert!(n > 0, "max_keys must be at least one");
+        self.max_keys = n;
+        self
+    }
+
+    /// Test one request against the limiter.
+    ///
+    /// `Ok(())` admits it. `Err(delay)` rejects it, where `delay` is how long
+    /// the caller must wait before a request would conform.
+    fn check(&self, key: &str) -> Result<(), Duration> {
+        let now = Instant::now();
+        let mut table = self.table.lock().unwrap_or_else(|p| p.into_inner());
+
+        if table.tat.len() >= self.max_keys {
+            table.prune(now, self.max_keys);
+        }
+
+        let digest = table.digest(key);
+        let tat = table.tat.get(&digest).copied().unwrap_or(now);
+        // The earliest arrival this key may make. `checked_sub` failing means
+        // the tolerance reaches back past the process's own clock origin, which
+        // can only mean the key is idle, so the request conforms.
+        let earliest = tat.checked_sub(self.tolerance).unwrap_or(now);
+        if now < earliest {
+            return Err(earliest - now);
+        }
+
+        // A key that has fallen behind schedule resumes from now rather than
+        // accumulating credit for the time it was quiet. That credit is what
+        // the burst tolerance already expresses.
+        let base = if tat > now { tat } else { now };
+        table.tat.insert(digest, base + self.emission);
+        Ok(())
+    }
+
+    /// The response for a rejected request.
+    ///
+    /// `Retry-After` is whole seconds per RFC 9110 §10.2.3, rounded up so the
+    /// advertised moment is never earlier than the conforming one, and floored
+    /// at one so a sub-second wait does not read as "retry immediately".
+    fn too_many(&self, delay: Duration) -> Response {
+        let secs = delay.as_secs_f64().ceil().max(1.0) as u64;
+        let message = format!(
+            "rate limit exceeded: {} requests per {} seconds",
+            self.limit,
+            self.period.as_secs_f64()
+        );
+        let mut error = Error::new(StatusCode::TOO_MANY_REQUESTS, message);
+        if let Ok(value) = HeaderValue::from_str(&secs.to_string()) {
+            error = error.with_response_header(RETRY_AFTER, value);
+        }
+        churust_core::IntoResponse::into_response(error)
+    }
+}
+
+/// The peer address without its port, so several connections from one client
+/// share a bucket.
+///
+/// A call with no peer address (the in-process test client, or a transport that
+/// does not carry one) falls into a single shared bucket rather than being
+/// exempted. Exempting would make "arrive without an address" the way around
+/// the limiter.
+fn default_key(call: &Call) -> Option<String> {
+    Some(match call.peer_addr() {
+        Some(addr) => address_bucket(addr.ip()),
+        None => "unknown".to_string(),
+    })
+}
+
+/// The bucket an address belongs to: the whole address for IPv4, the /64 prefix
+/// for IPv6.
+///
+/// Keying on the full IPv6 address was the obvious reading of "one bucket per
+/// client" and it was the wrong one, because an IPv6 address does not name a
+/// client the way an IPv4 address does. The smallest allocation anybody is
+/// delegated is a /64 — RFC 4291 §2.5.1 spends the low half of every unicast
+/// address on an interface identifier, and SLAAC has the host mint those itself
+/// — so the low 64 bits are chosen by the peer, for free, as often as it likes.
+/// That broke the limiter in both directions. An attacker took a fresh address
+/// per request and never met a 429, because every request missed the table,
+/// defaulted its arrival time to `now` and conformed; and an ordinary laptop
+/// running RFC 8981 temporary addresses silently earned a new allowance every
+/// time it rotated. Masking to the /64 keys on the part of the address that is
+/// routed to the peer rather than the part the peer writes itself, which is the
+/// only half that costs anything to change.
+///
+/// A /64 and no coarser. Aggregating to a /56 or /48 would bucket by delegation
+/// rather than by subnet, and delegation sizes are a matter of ISP taste, so it
+/// would fold strangers together at some providers to catch a rotation that a
+/// /64 already catches. The residual is that hosts sharing one provider's /64 —
+/// virtual machines handed single addresses out of a rack prefix, say — share a
+/// bucket; that is the trade IPv4 has always made behind NAT, and a deployment
+/// that cannot afford it keys on something else with [`RateLimit::by`].
+///
+/// IPv4-mapped addresses are unwrapped before any of that. A dual-stack
+/// listener reports IPv4 peers as `::ffff:a.b.c.d`, and every one of those sits
+/// in `::ffff:0:0/96` — inside a single /64 — so masking them would have put
+/// the entire IPv4 internet in one bucket and turned the fix into a far worse
+/// defect than the one it repairs.
+fn address_bucket(ip: IpAddr) -> String {
+    let v6 = match ip {
+        IpAddr::V4(v4) => return v4.to_string(),
+        IpAddr::V6(v6) => v6,
+    };
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return v4.to_string();
+    }
+    let mut octets = v6.octets();
+    octets[8..].fill(0);
+    Ipv6Addr::from(octets).to_string()
+}
+
+#[async_trait]
+impl Middleware for RateLimit {
+    async fn handle(&self, call: Call, next: Next) -> Response {
+        let Some(key) = (self.key)(&call) else {
+            return next.run(call).await;
+        };
+        match self.check(&key) {
+            Ok(()) => next.run(call).await,
+            Err(delay) => self.too_many(delay),
+        }
+    }
+}
+
+impl Plugin for RateLimit {
+    /// Installed in [`Phase::Plugins`], so a rejected request is still logged by
+    /// a `CallLogging` plugin sitting in [`Phase::Monitoring`] outside it.
+    fn install(self: Box<Self>, app: &mut AppBuilder) {
+        app.add_middleware_in(Phase::Plugins, Arc::new(*self));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_fresh_key_may_spend_the_whole_allowance_at_once() {
+        let limiter = RateLimit::per(3, Duration::from_secs(10));
+        assert!(limiter.check("a").is_ok());
+        assert!(limiter.check("a").is_ok());
+        assert!(limiter.check("a").is_ok());
+        assert!(limiter.check("a").is_err(), "the fourth exceeds the burst");
+    }
+
+    #[test]
+    fn keys_are_independent() {
+        let limiter = RateLimit::per(1, Duration::from_secs(10));
+        assert!(limiter.check("a").is_ok());
+        assert!(limiter.check("a").is_err());
+        assert!(limiter.check("b").is_ok(), "b has its own budget");
+    }
+
+    #[test]
+    fn burst_one_admits_a_single_request() {
+        let limiter = RateLimit::per(100, Duration::from_secs(1)).burst(1);
+        assert!(limiter.check("a").is_ok());
+        assert!(limiter.check("a").is_err());
+    }
+
+    #[test]
+    fn the_reported_delay_never_exceeds_the_period() {
+        let limiter = RateLimit::per(2, Duration::from_secs(4));
+        assert!(limiter.check("a").is_ok());
+        assert!(limiter.check("a").is_ok());
+        let delay = limiter.check("a").expect_err("should be limited");
+        assert!(
+            delay <= Duration::from_secs(4),
+            "waiting longer than the period would be wrong: {delay:?}"
+        );
+    }
+
+    #[test]
+    fn clones_share_one_budget() {
+        let limiter = RateLimit::per(1, Duration::from_secs(10));
+        let clone = limiter.clone();
+        assert!(limiter.check("a").is_ok());
+        assert!(
+            clone.check("a").is_err(),
+            "a clone must not reset the table"
+        );
+    }
+
+    #[test]
+    fn pruning_bounds_the_table() {
+        let limiter = RateLimit::per(1, Duration::from_millis(1)).max_keys(8);
+        for i in 0..64 {
+            let _ = limiter.check(&format!("key-{i}"));
+        }
+        let len = limiter.table.lock().unwrap().tat.len();
+        assert!(len <= 8, "table grew past its cap: {len}");
+    }
+
+    #[test]
+    fn a_long_key_is_stored_at_the_same_width_as_a_short_one() {
+        // A key that comes out of a header is chosen by the caller in length as
+        // well as in value, and `max_keys` counts entries rather than bytes, so
+        // nothing else in this file stops one client from deciding what a
+        // bucket costs. Debug renders precisely what an entry holds, which
+        // makes the rendered length a proxy for the entry's footprint that does
+        // not depend on knowing the key type.
+        let limiter = RateLimit::per(2, Duration::from_secs(30));
+        let long = "k".repeat(1 << 20);
+        assert!(limiter.check("k").is_ok());
+        assert!(limiter.check(&long).is_ok());
+
+        let table = limiter.table.lock().unwrap();
+        assert_eq!(table.tat.len(), 2, "the two keys are distinct");
+        let rendered = format!("{:?}", table.tat);
+        assert!(
+            rendered.len() < 256,
+            "the table retained the key's {} bytes instead of a fixed-width \
+             digest, so a caller picks the cost of its own bucket",
+            long.len()
+        );
+    }
+
+    #[test]
+    fn a_client_rotating_through_one_ipv6_subnet_gets_no_extra_budget() {
+        let limiter = RateLimit::per(2, Duration::from_secs(30));
+        let rotate = |suffix: &str| {
+            let ip: IpAddr = format!("2001:db8:1:2::{suffix}").parse().unwrap();
+            limiter.check(&address_bucket(ip))
+        };
+        assert!(rotate("1").is_ok());
+        assert!(rotate("2").is_ok());
+        assert!(
+            rotate("3").is_err(),
+            "a new address out of the same /64 is the same client and must not \
+             reset the budget"
+        );
+    }
+
+    #[test]
+    fn separate_ipv6_subnets_keep_separate_budgets() {
+        let one: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let other: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert_ne!(
+            address_bucket(one),
+            address_bucket(other),
+            "different /64s are different networks"
+        );
+    }
+
+    #[test]
+    fn an_ipv4_peer_keeps_every_octet() {
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        assert_eq!(address_bucket(ip), "203.0.113.7");
+    }
+
+    #[test]
+    fn an_ipv4_mapped_peer_is_bucketed_as_the_address_it_carries() {
+        let mapped: IpAddr = "::ffff:203.0.113.7".parse().unwrap();
+        let neighbour: IpAddr = "::ffff:203.0.113.8".parse().unwrap();
+        assert_eq!(address_bucket(mapped), "203.0.113.7");
+        assert_ne!(
+            address_bucket(mapped),
+            address_bucket(neighbour),
+            "a dual-stack socket reports IPv4 peers inside one /64, so masking \
+             them would put the whole IPv4 internet in a single bucket"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "at least one request")]
+    fn a_zero_limit_is_a_configuration_error() {
+        let _ = RateLimit::per(0, Duration::from_secs(1));
+    }
+
+    #[test]
+    #[should_panic(expected = "greater than zero")]
+    fn a_zero_period_is_a_configuration_error() {
+        let _ = RateLimit::per(1, Duration::ZERO);
+    }
+}

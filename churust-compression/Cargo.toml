@@ -1,0 +1,31 @@
+[package]
+name = "churust-compression"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+keywords.workspace = true
+categories.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+description = "Response compression plugin (gzip, deflate, brotli) for the Churust web framework."
+
+[package.metadata.docs.rs]
+all-features = true
+
+[dependencies]
+churust-core = { workspace = true }
+async-compression = { workspace = true }
+async-trait = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+http = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+# The decoders, so the tests assert on a round trip rather than on a length.
+async-compression = { workspace = true, features = ["tokio", "gzip", "zlib", "brotli"] }

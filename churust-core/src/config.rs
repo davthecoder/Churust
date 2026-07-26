@@ -47,10 +47,151 @@ pub struct ServerSection {
     pub port: u16,
     /// Maximum accepted request body size in bytes (default `1 MiB`). Larger
     /// bodies are rejected with `413 Payload Too Large`.
+    ///
+    /// A body whose `Content-Length` exceeds this is refused before the request
+    /// is dispatched, so a handler that never reads the body cannot serve one
+    /// anyway. A chunked body declares no length, so it is bounded as it is
+    /// read — which means a handler that ignores a chunked body will not notice
+    /// the cap. Reject on `Transfer-Encoding` explicitly if that matters.
+    ///
+    /// Raise [`request_timeout_ms`](Self::request_timeout_ms) alongside it: the
+    /// per-request timeout spans the upload, so a generous size cap paired with
+    /// a short timeout rejects large-but-legitimate transfers part-way through.
     pub max_body_bytes: usize,
     /// Per-request timeout in milliseconds (default `30000`). `0` disables the
     /// timeout.
+    ///
+    /// **It bounds the whole exchange, including reading the request body.**
+    /// Bodies stream, so they are read inside the handler rather than before
+    /// it, and a slow upload consumes this budget however small it is. Raising
+    /// [`max_body_bytes`](Self::max_body_bytes) therefore means raising this in
+    /// step: a 100 MiB cap with a 30-second timeout rejects any client slower
+    /// than ~3.4 MiB/s, mid-transfer, with `408`.
     pub request_timeout_ms: u64,
+    /// How long a connection may take to send its complete header block, in
+    /// milliseconds (default `10000`). `0` disables it.
+    ///
+    /// This is the slow-loris defence: without it a client can hold a
+    /// connection open indefinitely by dribbling one header byte at a time,
+    /// because the per-request timeout does not start until there is a request.
+    ///
+    /// It covers all three phases of a connection, by different means.
+    ///
+    /// Before either protocol exists, the server is still reading up to the 24
+    /// bytes of the HTTP/2 preface to find out which one to speak, and neither
+    /// mechanism below has been created yet. A connection that does not get as
+    /// far as choosing a protocol within this deadline is closed — which is
+    /// what bounds a peer that connects and then sends nothing at all.
+    ///
+    /// HTTP/1 then gets a literal deadline on the header block. HTTP/2 has no
+    /// equivalent — a header block arrives as frames on an already-open
+    /// connection — so the same value drives a keep-alive PING and the deadline
+    /// for its acknowledgement, which answers the equivalent question of
+    /// whether the peer is still there. A stalled h2 peer is therefore dropped
+    /// within roughly twice this value, and a live one with nothing to say
+    /// answers the ping and stays: once a protocol has been negotiated this
+    /// deadline no longer applies, so an idle-but-responsive client is not
+    /// bound by it.
+    pub header_read_timeout_ms: u64,
+    /// Maximum number of headers accepted on a request (default `100`).
+    pub max_headers: usize,
+    /// Maximum path segments accepted before a request is rejected with `414`
+    /// (default `64`).
+    ///
+    /// The router walks segments recursively with backtracking, so path depth
+    /// is a stack-depth question. hyper bounds the request line, which bounds
+    /// this in practice, but the bound should be Churust's own and stated
+    /// rather than inherited by accident.
+    pub max_path_segments: usize,
+    /// Maximum WebSocket frame size in bytes (default `1 MiB`). Requires the
+    /// `ws` feature.
+    pub ws_max_frame_bytes: usize,
+    /// How long an idle connection is kept open for reuse, in milliseconds
+    /// (default `75000`). `0` disables keep-alive: answer and close.
+    ///
+    /// Idle means *no request in flight* — a handler slower than this is busy,
+    /// not idle, and its connection is left alone. The timer restarts when a
+    /// request finishes.
+    pub keep_alive_ms: u64,
+    /// Listen backlog: connections the kernel may queue before the accept loop
+    /// reaches them (default `1024`).
+    pub backlog: u32,
+    /// How long graceful shutdown waits for in-flight requests to finish, in
+    /// milliseconds (default `30000`). `0` waits indefinitely.
+    ///
+    /// Without a bound, one slow request delays shutdown forever, which in a
+    /// container means being killed rather than exiting cleanly.
+    pub shutdown_timeout_ms: u64,
+    /// Maximum reassembled WebSocket message size in bytes (default `4 MiB`).
+    /// Requires the `ws` feature.
+    ///
+    /// Separate from the frame cap because a peer can send many small
+    /// continuation frames that reassemble into one enormous message.
+    pub ws_max_message_bytes: usize,
+    /// What to do with a non-canonical path spelling (default `"strict"`).
+    ///
+    /// One of `"strict"`, `"redirect"` or `"collapse"`. See
+    /// [`PathPolicy`](crate::PathPolicy).
+    pub path_policy: crate::path::PathPolicy,
+    /// Maximum size of a received HTTP/2 header block, in bytes (default
+    /// `16384`).
+    ///
+    /// The HTTP/2 counterpart of [`max_headers`](Self::max_headers), which
+    /// configures HTTP/1 only: h2 has no header *count*, it has an encoded
+    /// size. Exceeding it is refused at the protocol level.
+    pub h2_max_header_list_size: u32,
+    /// Maximum concurrent HTTP/2 streams per connection (default `200`). `0`
+    /// removes the limit.
+    ///
+    /// One h2 connection multiplexes many requests, so without this a single
+    /// connection is an unbounded amount of concurrent work — the shape behind
+    /// the HTTP/2 stream-flood denial-of-service family. hyper's own docs
+    /// encourage setting an explicit limit rather than inheriting its default.
+    pub h2_max_concurrent_streams: u32,
+    /// How long an upgraded WebSocket may sit with no traffic in either
+    /// direction before it is closed, in milliseconds (default `300000`, five
+    /// minutes). `0` disables the bound. Requires the `ws` feature.
+    ///
+    /// An upgraded socket holds a connection permit for its whole life, and
+    /// none of the HTTP-level bounds survive the upgrade —
+    /// [`header_read_timeout_ms`](Self::header_read_timeout_ms) applies before
+    /// there is a WebSocket and [`request_timeout_ms`](Self::request_timeout_ms)
+    /// wraps a request that has already completed. Without this, a peer that
+    /// completes the handshake and then says nothing pins a permit until the
+    /// process restarts.
+    pub ws_idle_timeout_ms: u64,
+    /// Maximum simultaneously served connections (default `25000`). `0` means
+    /// unlimited.
+    ///
+    /// The backlog bounds what the kernel queues; this bounds what the process
+    /// accepts. Without it, memory and file descriptors are limited only by
+    /// what the OS will hand out, and the failure mode is the whole process
+    /// dying rather than new connections waiting.
+    pub max_connections: usize,
+    /// Maximum TLS handshakes in progress at once (default `256`). `0` means
+    /// unlimited. Requires the `tls` feature.
+    ///
+    /// Much smaller than [`max_connections`](Self::max_connections) on purpose:
+    /// a handshake is asymmetric work — cheap to ask for, expensive to answer —
+    /// so it needs its own, tighter bound.
+    pub max_tls_handshakes: usize,
+    /// How long a TLS handshake may take before the connection is dropped, in
+    /// milliseconds (default `10000`). `0` disables the bound.
+    ///
+    /// [`header_read_timeout_ms`](Self::header_read_timeout_ms) cannot cover
+    /// this: before the handshake completes there is no HTTP layer to time out.
+    /// Without it, a client that completes the TCP handshake and then sends one
+    /// byte per minute holds a connection open indefinitely.
+    ///
+    /// The clock starts when the connection is accepted, so it covers waiting
+    /// for a [`max_tls_handshakes`](Self::max_tls_handshakes) permit as well as
+    /// the handshake itself. That is what makes it a bound on how long a peer
+    /// can hold a *connection* permit: timing only the handshake would let a
+    /// queue of stalled peers expire a permit's worth at a time while the rest
+    /// waited unbounded. A consequence worth knowing is that under genuine
+    /// handshake overload a legitimate client can be dropped while still
+    /// queued — the alternative is holding its connection slot instead.
+    pub tls_handshake_timeout_ms: u64,
 }
 
 /// The `[tls]` configuration table: paths to a PEM certificate chain and
@@ -73,6 +214,21 @@ impl Default for ServerSection {
             port: 8080,
             max_body_bytes: 1 << 20,
             request_timeout_ms: 30_000,
+            header_read_timeout_ms: 10_000,
+            max_headers: 100,
+            max_path_segments: 64,
+            ws_max_frame_bytes: 1 << 20,
+            ws_max_message_bytes: 4 << 20,
+            keep_alive_ms: 75_000,
+            backlog: 1024,
+            shutdown_timeout_ms: 30_000,
+            path_policy: crate::path::PathPolicy::Strict,
+            h2_max_header_list_size: 16 << 10,
+            h2_max_concurrent_streams: 200,
+            ws_idle_timeout_ms: 300_000,
+            max_connections: 25_000,
+            max_tls_handshakes: 256,
+            tls_handshake_timeout_ms: 10_000,
         }
     }
 }
@@ -93,7 +249,16 @@ impl Config {
     /// ```
     pub fn load(path: &str) -> Self {
         let mut cfg = match std::fs::read_to_string(path) {
-            Ok(text) => toml::from_str::<Config>(&text).unwrap_or_default(),
+            // A malformed file still falls back to defaults — but says so.
+            // Silently substituting defaults discards the operator's host,
+            // port, limits and TLS paths over a single typo, and a server that
+            // came up on 127.0.0.1:8080 with no TLS because of an unreported
+            // parse error is the hardest kind of misconfiguration to find.
+            Ok(text) => toml::from_str::<Config>(&text).unwrap_or_else(|e| {
+                tracing::warn!(path, error = %e, "config file could not be parsed; using defaults");
+                Config::default()
+            }),
+            // A missing file is the documented, ordinary case: defaults apply.
             Err(_) => Config::default(),
         };
         cfg.apply_env(|k| std::env::var(k).ok());
@@ -140,8 +305,64 @@ impl Config {
         if let Some(v) = get("CHURUST_SERVER_MAX_BODY_BYTES").and_then(|s| s.parse().ok()) {
             self.server.max_body_bytes = v;
         }
+        if let Some(v) = get("CHURUST_SERVER_HEADER_READ_TIMEOUT_MS").and_then(|s| s.parse().ok()) {
+            self.server.header_read_timeout_ms = v;
+        }
+        if let Some(v) = get("CHURUST_SERVER_MAX_HEADERS").and_then(|s| s.parse().ok()) {
+            self.server.max_headers = v;
+        }
+        if let Some(v) = get("CHURUST_SERVER_MAX_PATH_SEGMENTS").and_then(|s| s.parse().ok()) {
+            self.server.max_path_segments = v;
+        }
+        if let Some(v) = get("CHURUST_SERVER_WS_MAX_FRAME_BYTES").and_then(|s| s.parse().ok()) {
+            self.server.ws_max_frame_bytes = v;
+        }
+        if let Some(v) = get("CHURUST_SERVER_KEEP_ALIVE_MS").and_then(|s| s.parse().ok()) {
+            self.server.keep_alive_ms = v;
+        }
+        if let Some(v) = get("CHURUST_SERVER_BACKLOG").and_then(|s| s.parse().ok()) {
+            self.server.backlog = v;
+        }
+        if let Some(v) = get("CHURUST_SERVER_SHUTDOWN_TIMEOUT_MS").and_then(|s| s.parse().ok()) {
+            self.server.shutdown_timeout_ms = v;
+        }
+        if let Some(v) = get("CHURUST_SERVER_WS_MAX_MESSAGE_BYTES").and_then(|s| s.parse().ok()) {
+            self.server.ws_max_message_bytes = v;
+        }
         if let Some(v) = get("CHURUST_SERVER_REQUEST_TIMEOUT_MS").and_then(|s| s.parse().ok()) {
             self.server.request_timeout_ms = v;
+        }
+        if let Some(v) = get("CHURUST_SERVER_PATH_POLICY") {
+            match v.to_ascii_lowercase().as_str() {
+                "strict" => self.server.path_policy = crate::path::PathPolicy::Strict,
+                "redirect" => self.server.path_policy = crate::path::PathPolicy::Redirect,
+                "collapse" => self.server.path_policy = crate::path::PathPolicy::Collapse,
+                // An unrecognised value keeps the safer setting rather than
+                // silently loosening it on a typo.
+                _ => {}
+            }
+        }
+        if let Some(v) = get("CHURUST_SERVER_H2_MAX_HEADER_LIST_SIZE").and_then(|s| s.parse().ok())
+        {
+            self.server.h2_max_header_list_size = v;
+        }
+        if let Some(v) =
+            get("CHURUST_SERVER_H2_MAX_CONCURRENT_STREAMS").and_then(|s| s.parse().ok())
+        {
+            self.server.h2_max_concurrent_streams = v;
+        }
+        if let Some(v) = get("CHURUST_SERVER_WS_IDLE_TIMEOUT_MS").and_then(|s| s.parse().ok()) {
+            self.server.ws_idle_timeout_ms = v;
+        }
+        if let Some(v) = get("CHURUST_SERVER_MAX_CONNECTIONS").and_then(|s| s.parse().ok()) {
+            self.server.max_connections = v;
+        }
+        if let Some(v) = get("CHURUST_SERVER_MAX_TLS_HANDSHAKES").and_then(|s| s.parse().ok()) {
+            self.server.max_tls_handshakes = v;
+        }
+        if let Some(v) = get("CHURUST_SERVER_TLS_HANDSHAKE_TIMEOUT_MS").and_then(|s| s.parse().ok())
+        {
+            self.server.tls_handshake_timeout_ms = v;
         }
     }
 }
