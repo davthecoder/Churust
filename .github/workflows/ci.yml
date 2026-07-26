@@ -64,6 +64,12 @@ jobs:
                      -p churust-redis -p churust-client -p churust-openapi \
                      --all-features
 
+      # A release publishes crate by crate in dependency order; a crate absent
+      # from that list is silently never published, and the umbrella then
+      # depends on a version that does not exist.
+      - name: Release crate list is current
+        run: python3 .github/scripts/check-release-list.py
+
       - name: Build examples
         run: cargo build -p hello -p api
 

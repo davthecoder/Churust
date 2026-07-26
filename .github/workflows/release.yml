@@ -56,7 +56,7 @@ jobs:
         run: cargo clippy -p churust --all-targets --features full -- -D warnings
 
       - name: Clippy (core, TLS feature)
-        run: cargo clippy -p churust-core --all-targets --features tls -- -D warnings
+        run: cargo clippy -p churust-core --all-targets --all-features -- -D warnings
 
       - name: Test (workspace)
         run: cargo test --workspace
@@ -65,7 +65,7 @@ jobs:
         run: cargo test -p churust --features full
 
       - name: Test (core, TLS feature)
-        run: cargo test -p churust-core --features tls
+        run: cargo test -p churust-core --all-features
 
       - name: Build examples
         run: cargo build -p hello -p api
@@ -102,8 +102,23 @@ jobs:
         run: |
           set -euo pipefail
           pending=""
+          # Dependency order, and the single source of truth for what a release
+          # contains. It drifted once already: seven crates were added to the
+          # workspace while this list stayed at the original seven, and because
+          # `shared-version` bumps every crate, the umbrella's dependencies then
+          # named versions that were never published — the umbrella publish
+          # fails and the release lands half-done, which is exactly the
+          # unrecoverable state RELEASING.md forbids.
+          #
+          # Two levels: churust-core and churust-macros depend on nothing
+          # internal, every plugin depends on churust-core, and the umbrella
+          # depends on the plugins, so it goes last. Examples are
+          # `publish = false` and never appear here.
           for crate in churust-core churust-macros \
-                       churust-json churust-logging churust-cors churust-auth \
+                       churust-auth churust-client churust-compression \
+                       churust-cors churust-json churust-lab churust-logging \
+                       churust-openapi churust-ratelimit churust-redis \
+                       churust-templates \
                        churust; do
             code=$(curl -s -o /dev/null -w '%{http_code}' \
               -H 'User-Agent: churust-release-workflow' \
@@ -190,8 +205,13 @@ jobs:
 
             echo '### Crates'
             echo
-            for c in churust churust-core churust-macros churust-json \
-                     churust-logging churust-cors churust-auth; do
+            # Same list as the plan step above; keep them together.
+            for c in churust-core churust-macros \
+                       churust-auth churust-client churust-compression \
+                       churust-cors churust-json churust-lab churust-logging \
+                       churust-openapi churust-ratelimit churust-redis \
+                       churust-templates \
+                       churust; do
               echo "- [\`$c\`](https://crates.io/crates/$c/$VERSION) · [docs](https://docs.rs/$c/$VERSION)"
             done
             echo
