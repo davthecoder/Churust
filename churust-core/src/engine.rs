@@ -932,6 +932,12 @@ async fn handle(
     peer: std::net::SocketAddr,
     conn_guard: ConnGuard,
 ) -> Result<HyperResponse<UnsyncBoxBody<Bytes, std::io::Error>>, Infallible> {
+    // Only the WebSocket branch below consumes this. Discarded explicitly
+    // rather than silencing the whole function, which would also hide a
+    // genuinely unused variable.
+    #[cfg(not(feature = "ws"))]
+    let _ = &conn_guard;
+
     // RFC 9112 §6.3 rule 3: a request carrying both `Transfer-Encoding` and
     // `Content-Length` is framed by the transfer coding, and "ought to be
     // handled as an error" — no legitimate client sends both.

@@ -503,8 +503,38 @@ impl Call {
     /// prefer this so an oversized body becomes `413` rather than a confusing
     /// deserialization error.
     pub async fn try_receive_bytes(&mut self) -> Result<Bytes> {
+        // The per-route cap, when one is set, is the ceiling this collection
+        // must respect — see `try_receive_bytes_within`.
+        let cap = self
+            .get::<crate::extract::RouteBodyLimit>()
+            .map(|crate::extract::RouteBodyLimit(n)| n)
+            .unwrap_or(usize::MAX);
+        self.try_receive_bytes_within(cap).await
+    }
+
+    /// Collect the body, refusing it the moment it exceeds `max`.
+    ///
+    /// The distinction from checking afterwards is memory, not status. A body
+    /// gathered first and measured second has already been allocated: a 16 MiB
+    /// upload against a 64 KiB route cap peaked above 32 MiB — `BytesMut`
+    /// doubles — before anything refused it, and N concurrent requests
+    /// multiplied that. The `413` was correct and arrived far too late to be
+    /// the protection it looked like.
+    ///
+    /// Errors with `413 Payload Too Large` as soon as the accumulated length
+    /// crosses `max`, so the peak is bounded by the cap rather than by what the
+    /// client chose to send.
+    pub async fn try_receive_bytes_within(&mut self, max: usize) -> Result<Bytes> {
         match std::mem::replace(&mut self.body, RequestBody::Buffered(Bytes::new())) {
-            RequestBody::Buffered(b) => Ok(b),
+            RequestBody::Buffered(b) => {
+                if b.len() > max {
+                    return Err(Error::new(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        "request body too large",
+                    ));
+                }
+                Ok(b)
+            }
             RequestBody::Stream(cell) => {
                 let Some(mut s) = cell.lock().ok().and_then(|mut g| g.take()) else {
                     return Ok(Bytes::new());
@@ -512,7 +542,15 @@ impl Call {
                 use futures_util::StreamExt;
                 let mut buf = bytes::BytesMut::new();
                 while let Some(chunk) = s.next().await {
-                    buf.extend_from_slice(&chunk?);
+                    let chunk = chunk?;
+                    // Check before extending, so the allocation never happens.
+                    if buf.len().saturating_add(chunk.len()) > max {
+                        return Err(Error::new(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "request body too large",
+                        ));
+                    }
+                    buf.extend_from_slice(&chunk);
                 }
                 Ok(buf.freeze())
             }
