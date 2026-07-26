@@ -479,6 +479,21 @@ released together, so every entry below applies to the whole set.
   permits a literal `%`, but since values are decoded on read, letting one
   through made the round trip lossy — a stored `%3D` came back as `=`, which
   corrupted a session payload before its signature was checked.
+- **One bad HTTP/3 stream no longer closes the whole QUIC connection.**
+  `resolve_request` reports a *stream* error — a header block over
+  `max_field_section_size`, a stream that ends before its headers arrive — and
+  the accept loop propagated it with `?`. That returned from the connection
+  task, dropped the `h3::server::Connection`, and its `Drop` closed the QUIC
+  connection with H3_NO_ERROR, taking every other request multiplexed on it.
+  Resolving now happens inside the per-request task, so a failed stream is
+  logged and abandoned on its own. A genuinely connection-fatal error is not
+  lost: h3 records it on the shared connection state and the next `accept`
+  returns it, which also lets h3 send the true code (H3_FRAME_UNEXPECTED,
+  QPACK_DECOMPRESSION_FAILED) instead of the H3_NO_ERROR that dropping sent for
+  what was a protocol violation. The same move fixes head-of-line blocking in
+  the accept loop: `accept` returns as soon as a bidi stream exists, so
+  awaiting the peer's HEADERS frame there stalled every request queued behind a
+  stream whose headers never came.
 - **`tls_handshake_timeout_ms` now covers the wait for a handshake permit, not
   just the handshake.** The deadline was armed after `max_tls_handshakes` had
   been acquired, and that acquisition had no deadline of its own — so the budget

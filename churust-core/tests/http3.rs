@@ -247,3 +247,93 @@ async fn the_peer_address_reaches_the_handler_over_h3() {
         "the peer address did not reach the handler: {body}"
     );
 }
+
+#[tokio::test]
+async fn a_stream_that_never_sends_headers_does_not_kill_the_connection() {
+    // h3 multiplexes every request of a connection onto that one QUIC
+    // connection, so the blast radius of a per-stream failure is the whole
+    // client. `resolve_request` reports a *stream* error — a header block over
+    // `max_field_section_size`, or a stream that ends before its headers ever
+    // arrive — and propagating it out of the accept loop dropped the
+    // `h3::server::Connection`, whose `Drop` closes the QUIC connection with
+    // H3_NO_ERROR. One malformed stream took every sibling request with it.
+    //
+    // The trigger here is a raw bidi stream opened and finished without a byte
+    // on it, which h3 surfaces as `StreamError::StreamError` with
+    // H3_REQUEST_INCOMPLETE.
+    let cert = self_signed();
+    let addr = serve(app(), &cert).await;
+
+    let mut roots = rustls::RootCertStore::empty();
+    for der in &cert.chain {
+        roots.add(der.clone()).expect("trust the test certificate");
+    }
+    let mut tls = rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+
+    let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("quic client config");
+    let mut endpoint =
+        quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("a client socket");
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic)));
+
+    let connection = endpoint
+        .connect(addr, "localhost")
+        .expect("a connect attempt")
+        .await
+        .expect("a completed handshake");
+
+    // Kept before h3 takes its own clone, so the raw QUIC connection can be
+    // used as a side channel and inspected afterwards. Both halves are the
+    // same connection, which is the whole point of the test.
+    let raw = connection.clone();
+
+    let (mut driver, mut send) = h3::client::new(h3_quinn::Connection::new(connection))
+        .await
+        .expect("an h3 client");
+    let drive = tokio::spawn(async move { std::future::poll_fn(|cx| driver.poll_close(cx)).await });
+
+    // The failing stream goes first, so the server has already handled it by
+    // the time the real request arrives. A sibling still in flight would hold
+    // the connection open on its own and could mask the defect.
+    let (mut doomed, _recv) = raw.open_bi().await.expect("a raw bidi stream");
+    doomed.finish().expect("finish it empty");
+
+    // The sibling request: this is what must still be served.
+    let uri: http::Uri = "https://localhost/hello".parse().unwrap();
+    let req = http::Request::builder()
+        .method(http::Method::GET)
+        .uri(uri)
+        .body(())
+        .unwrap();
+    let mut stream = send
+        .send_request(req)
+        .await
+        .expect("the connection was torn down by the empty stream");
+    stream.finish().await.expect("finish the request");
+    let response = stream
+        .recv_response()
+        .await
+        .expect("no response: the empty stream killed the connection");
+    let mut out = Vec::new();
+    while let Some(mut chunk) = stream.recv_data().await.expect("a body chunk") {
+        out.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()));
+    }
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        String::from_utf8(out).expect("a utf-8 body"),
+        "hello over quic"
+    );
+    // Names the defect directly: the server must not have closed the QUIC
+    // connection over one unusable stream.
+    assert!(
+        raw.close_reason().is_none(),
+        "the connection was closed: {:?}",
+        raw.close_reason()
+    );
+
+    drop(send);
+    let _ = drive.await;
+}

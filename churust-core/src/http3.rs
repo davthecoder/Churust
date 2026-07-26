@@ -251,12 +251,43 @@ async fn serve_connection(
     loop {
         match h3.accept().await {
             Ok(Some(resolver)) => {
-                let (request, stream) = resolver.resolve_request().await?;
                 let app = app.clone();
                 // One task per request: h3 multiplexes streams on one
                 // connection, so serving them in sequence would make a slow
                 // handler block every other request on that connection.
+                //
+                // Resolving belongs inside the task for the same reason, and
+                // for a second one. `accept` returns as soon as a bidi stream
+                // exists, before any frame has been read, so awaiting
+                // `resolve_request` out here waited for one peer's HEADERS
+                // frame before the next stream could even be accepted — a
+                // stream whose headers never arrive head-of-line blocked every
+                // request behind it. And its error is a *stream* error:
+                // propagating it with `?` returned from this function, dropped
+                // the `h3::server::Connection`, and closed the whole QUIC
+                // connection, killing every other request multiplexed on it.
                 tokio::spawn(async move {
+                    let (request, stream) = match resolver.resolve_request().await {
+                        Ok(pair) => pair,
+                        // Scoped to this stream by construction. h3 has already
+                        // done whatever the stream needed — a `431` for an
+                        // oversized header block, a reset for one that ended
+                        // before its headers — and the connection is untouched.
+                        //
+                        // The genuinely connection-fatal case is not lost by
+                        // handling it here: h3 records it on the shared
+                        // connection state, so the next `accept` above returns
+                        // it and the `Err` arm ends the connection then. That
+                        // path is also *better* than the `?` was, because it
+                        // lets h3 emit the real code — H3_FRAME_UNEXPECTED,
+                        // say — where dropping the connection sent
+                        // H3_NO_ERROR for what was actually a protocol
+                        // violation.
+                        Err(e) => {
+                            tracing::debug!(error = %e, "http3 request headers failed");
+                            return;
+                        }
+                    };
                     if let Err(e) = serve_request(app, request, stream, peer).await {
                         tracing::debug!(error = %e, "http3 request failed");
                     }
