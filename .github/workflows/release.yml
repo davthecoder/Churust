@@ -75,7 +75,7 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
 
-      # Packages and verifies the seven publishable crates without uploading,
+      # Packages and verifies the fourteen publishable crates without uploading,
       # catching a broken manifest before anything becomes permanent.
       #
       # `cargo package` rather than `publish --dry-run`, because the latter
@@ -191,7 +191,7 @@ jobs:
             -f tag_name="$GITHUB_REF_NAME" --jq '.body' 2>/dev/null || true)
 
           {
-            echo "All seven Churust crates release together on \`$VERSION\`."
+            echo "All fourteen Churust crates release together on \`$VERSION\`."
             echo
             echo '```toml'
             echo '[dependencies]'

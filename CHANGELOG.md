@@ -4,11 +4,18 @@ All notable changes to Churust are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and the project
 follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-All seven crates — `churust`, `churust-core`, `churust-macros`, `churust-json`,
-`churust-logging`, `churust-cors`, `churust-auth` — share one version and are
-released together, so every entry below applies to the whole set.
+All fourteen crates — `churust`, `churust-core`, `churust-macros`,
+`churust-json`, `churust-logging`, `churust-cors`, `churust-auth`,
+`churust-ratelimit`, `churust-compression`, `churust-templates`,
+`churust-redis`, `churust-client`, `churust-openapi` and `churust-lab` — share
+one version and are released together, so every entry below applies to the
+whole set.
 
 ## [Unreleased]
+
+Nothing yet.
+
+## [0.3.0] - 2026-07-26
 
 ### Changed — breaking
 
@@ -1197,7 +1204,8 @@ First public release.
   panicking handler returns 500 rather than killing the server), and no version
   banner.
 
-[Unreleased]: https://github.com/davthecoder/Churust/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/davthecoder/Churust/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/davthecoder/Churust/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/davthecoder/Churust/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/davthecoder/Churust/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/davthecoder/Churust/releases/tag/v0.1.0

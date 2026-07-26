@@ -21,9 +21,9 @@ rustls, and they stay that way.
 
 Proposals that add a dependency to do something the stack already does, or that
 widen the API surface without a concrete use case, will usually be declined.
-Deferred on purpose right now: sessions, response compression, HTTP/3, and
-route-scoped middleware sugar. If you want one of those, make the case in a
-discussion first.
+Sessions, response compression, HTTP/3 and route-scoped middleware all landed in
+0.3.0, so that list is no longer the answer to "why isn't this here?" — if
+something is missing now, make the case in a discussion first.
 
 ## Getting set up
 
@@ -54,6 +54,13 @@ cargo run -p static-example  # static file serving
 | `churust-logging` | `CallLogging` over `tracing` |
 | `churust-cors` | preflight and CORS headers |
 | `churust-auth` | Bearer/Basic/JWT, `Principal<P>` |
+| `churust-ratelimit` | `RateLimit`, GCRA |
+| `churust-compression` | brotli / gzip / deflate response bodies |
+| `churust-templates` | `Templates` + `Renderer` over minijinja |
+| `churust-redis` | `RedisStore`, a revocable server-side `SessionStore` |
+| `churust-client` | outbound HTTP client on the same hyper the server uses |
+| `churust-openapi` | an OpenAPI 3.1 document generated from the router |
+| `churust-lab` | incubator; deliberately never reaches 1.0 |
 | `churust` | umbrella re-export; the crate users actually depend on |
 | `examples/*` | runnable examples, `publish = false` |
 
@@ -91,14 +98,14 @@ Run the same gate CI runs. All of it:
 
 ```sh
 cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo clippy -p churust --all-targets --features full -- -D warnings
-cargo clippy -p churust-core --all-targets --features tls -- -D warnings
-cargo test --workspace
-cargo test -p churust --features full
-cargo test -p churust-core --features tls
-cargo build -p hello -p api
-RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo clippy --locked -p churust --all-targets --all-features -- -D warnings
+cargo clippy --locked -p churust-core --all-targets --all-features -- -D warnings
+cargo test --locked --workspace
+cargo test --locked -p churust --features full
+cargo test --locked -p churust-core --all-features
+cargo build --locked -p hello -p api
+RUSTDOCFLAGS="-D warnings" cargo doc --locked --workspace --all-features --no-deps
 ```
 
 Warnings are errors here — `RUSTFLAGS: "-D warnings"` is set for the whole CI
@@ -152,9 +159,12 @@ control it.
 
 ## Releases
 
-Maintainers only, and there is no partial release: all seven crates share one
-version and go out together. See [RELEASING.md](RELEASING.md). Don't bump
-versions in a PR — the release tooling owns those numbers.
+Maintainers only, and there is no partial release: all fourteen crates share one
+version and go out together. See [RELEASING.md](RELEASING.md).
+
+Don't bump versions in an ordinary PR. `main` is protected, so the bump happens
+in a dedicated release PR and the tag is pushed to `main` afterwards — a tag is
+not a commit, which is what lets the release run at all.
 
 ## Licence
 
