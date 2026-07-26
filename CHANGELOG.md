@@ -119,6 +119,32 @@ released together, so every entry below applies to the whole set.
   all is `400`, as it always was through `MultipartStream`, rather than `200`
   with no parts; and a body ending with a part still open is likewise `400`
   instead of yielding a silently truncated part.
+- **A guard on a `{path...}` route no longer makes `OPTIONS` answer `405` with
+  an `Allow` naming `OPTIONS`.** `Router::methods_for`, which builds the header
+  for the automatic `OPTIONS`, enumerated the exact branch guard-free — `Allow`
+  describes the resource, not the request that asked about it — but reached the
+  wildcard branch by driving the ordinary matching walk with a synthetic `TRACE`
+  call. That call has no headers and no authority, so it fails every guard
+  there is: one `guard::host` on `/assets/{p...}` left the method list empty,
+  the dispatcher skipped its `204` arm, and the request fell through to the
+  `405` path — where the real call *does* pass the guard, so the refusal went
+  out advertising `Allow: GET, HEAD, OPTIONS`, naming the very method it was
+  refusing. The same probe also assumed no application registers `TRACE`; one
+  that does turned it into a match, which the caller discarded, losing the list
+  entirely. The wildcard branch is now enumerated directly, the way the exact
+  branch always was, unioning the methods of every wildcard the path can reach
+  and skipping one whose tail decoded to something containing a separator,
+  since routing has already refused that request.
+- **`Router::add`'s documentation said a repeated `(method, path)` replaces the
+  earlier handler; it panics.** The code has been right since duplicate
+  detection was added — silently replacing a route made a typo produce a
+  handler that mysteriously never ran — but the prose was never updated, and it
+  is prose about a public API, which `cargo doc` cannot check against the
+  function beneath it. The doc now states the real rule, that only an
+  *unguarded* duplicate is refused and guarded siblings resolve first-match-wins
+  in registration order, and its `# Panics` section lists the two panics it
+  omitted: the duplicate route, and a `{name}` conflicting with a differently
+  spelled parameter already registered at that position.
 - **A saturated connection budget no longer blocks shutdown.** The accept loop
   awaited a `max_connections` permit *outside* the shutdown race, so once every
   slot was held the shutdown signal was never polled — `serve()` did not return

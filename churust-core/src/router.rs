@@ -230,13 +230,22 @@ impl Router {
     /// Insert `handler` for `method` at `pattern` (the full path, e.g.
     /// `/users/{id}`).
     ///
-    /// Registering different methods at the same path is fine; registering the
-    /// same `(method, path)` twice replaces the earlier handler.
+    /// Registering different methods at the same path is fine. Registering the
+    /// same `(method, path)` twice does *not* replace the earlier handler: an
+    /// unguarded duplicate is a mistake this router refuses to guess about, so
+    /// it panics. Several routes may share a `(method, path)` when guards tell
+    /// them apart — [`RouteBuilder::guard`] attaches one to the registration
+    /// just made — and those resolve first-match-wins in registration order, so
+    /// an unguarded route registered last is the fallback.
     ///
     /// # Panics
     ///
     /// Panics if a `{name...}` wildcard segment is not the final segment of the
-    /// pattern.
+    /// pattern; if an unguarded route is already registered for this
+    /// `(method, path)`; or if a `{name}` at this position was already
+    /// registered under a different name, since one trie node holds one
+    /// parameter name and the second route's handler would look up a capture
+    /// that is not there.
     ///
     /// ```
     /// use churust_core::{boxed, Call, IntoHandler, Router, Match};
@@ -497,32 +506,59 @@ impl Router {
             None
         });
 
-        // TRACE is a probe: nothing registers it, so `walk_wildcard` reports
-        // MethodNotAllowed carrying the wildcard's full method list.
-        params.clear();
-        // `Allow` describes the resource, not this request, so guards are not
-        // consulted: a probe call stands in for one.
-        let probe = crate::call::Call::new(
-            Method::TRACE,
-            "/".parse().expect("static uri"),
-            http::HeaderMap::new(),
-            bytes::Bytes::new(),
-        );
-        if let Some(Match::MethodNotAllowed { allow }) = Self::walk_wildcard(
-            &self.root,
-            &segments,
-            0,
-            &Method::TRACE,
-            &probe,
-            &mut params,
-        ) {
-            for m in allow {
+        // The wildcard branch is enumerated directly, the same guard-free way
+        // the exact branch above is. It used to be driven by `walk_wildcard`
+        // with a synthetic `TRACE` call standing in for a real one, on the
+        // reasoning that nothing registers `TRACE`, so the walk would report
+        // `MethodNotAllowed` carrying the wildcard's method list. Both halves of
+        // that were wrong. `walk_wildcard` resolves guards against the call it
+        // is given, and a synthetic call has no headers and no authority, so it
+        // fails every guard there is: one `guard::host` on a `{p...}` route left
+        // `methods_for` empty, the dispatcher skipped its `204` arm, and the
+        // request fell through to the `405` path — where the real call *does*
+        // pass the guard, so the reply advertised `Allow: GET, HEAD, OPTIONS`
+        // while refusing the `OPTIONS` it had just named. It also assumed no
+        // application registers `TRACE`; one that does turned the probe into a
+        // `Found`, which the `if let` discarded, losing the list entirely.
+        Self::collect_wildcard_methods(&self.root, &segments, 0, &mut out);
+        out
+    }
+
+    /// Union the methods of every wildcard a path could reach, guards ignored.
+    ///
+    /// Mirrors `walk_wildcard`'s structural descent — statics and params first,
+    /// this node's own wildcard last — but unions instead of choosing, because
+    /// `Allow` describes a resource rather than the fate of one request:
+    /// `walk_wildcard` stops at the first wildcard that can serve, while every
+    /// wildcard reachable along the path is part of what this URL supports, and
+    /// that is exactly what `walk_wildcard` already unions into `Allow` when
+    /// none of them can serve.
+    fn collect_wildcard_methods(node: &Node, segs: &[&str], i: usize, out: &mut Vec<Method>) {
+        if i < segs.len() {
+            if let Some(child) = node.statics.get(segs[i]) {
+                Self::collect_wildcard_methods(child, segs, i + 1, out);
+            }
+            if let Some((_, child)) = &node.param {
+                Self::collect_wildcard_methods(child, segs, i + 1, out);
+            }
+        }
+        if let Some((_, handlers)) = &node.wildcard {
+            // The same refusal `walk_wildcard` applies: a tail whose decoded
+            // segments contain a separator is not a request this wildcard will
+            // ever serve, so advertising its methods would promise a `200` that
+            // routing has already decided against.
+            if segs[i..]
+                .iter()
+                .any(|s| s.contains('/') || s.contains('\\'))
+            {
+                return;
+            }
+            for m in handlers.methods() {
                 if !out.contains(&m) {
                     out.push(m);
                 }
             }
         }
-        out
     }
 
     /// Every method registered anywhere in this router, deduplicated.
@@ -682,6 +718,16 @@ impl Router {
             // handed that back, making `/files/a%2Fb/c` indistinguishable from
             // `/files/a/b/c` for every consumer of the capture. `StaticFiles`
             // has its own guard; nothing else did.
+            //
+            // This `BadPath` refuses the wildcard, not the request. `route`
+            // deliberately does not forward it as the `400` the variant is
+            // named for: the tail being unusable *here* says nothing about the
+            // rest of the trie, and a sibling `{n}` may match the same path
+            // cleanly with the separator inside one capture — which is the
+            // whole point of splitting before decoding. Promoting this into a
+            // `400` would overrule that sibling and report a malformed request
+            // where there is none. The wildcard simply stops matching, so the
+            // request lands on whatever else does, or on `404`.
             if segs[i..]
                 .iter()
                 .any(|s| s.contains('/') || s.contains('\\'))
@@ -1228,6 +1274,26 @@ mod tests {
                 );
             }
             _ => panic!("the wildcard should have matched"),
+        }
+    }
+
+    #[test]
+    fn an_encoded_separator_in_a_wildcard_tail_does_not_override_a_matching_sibling() {
+        // The wildcard refuses this tail, but a sibling `{n}` matches the path
+        // cleanly with `n = "a/b"` — that is what splitting before decoding is
+        // for. The wildcard's opinion about its own tail must not be promoted
+        // into a verdict on the whole request: only POST is registered at the
+        // route that does match, so `405` is the honest answer and a `400`
+        // would describe a request that is in fact perfectly well formed.
+        let mut r = Router::new();
+        {
+            let mut b = RouteBuilder::new(&mut r);
+            b.get("/files/{p...}", |_c: Call| async { "wild" });
+            b.post("/files/{n}", |_c: Call| async { "one" });
+        }
+        match run(&r, Method::GET, "/files/a%2Fb") {
+            Match::MethodNotAllowed { allow } => assert_eq!(allow, vec![Method::POST]),
+            _ => panic!("expected the sibling param route to answer"),
         }
     }
 

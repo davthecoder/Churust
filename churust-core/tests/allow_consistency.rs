@@ -7,7 +7,7 @@
 //! single `GET` route answered `Allow: GET` to a `DELETE` while telling
 //! `OPTIONS` it supported `GET, HEAD, OPTIONS`.
 
-use churust_core::{App, Call, Churust, TestClient};
+use churust_core::{guard, App, Call, Churust, TestClient};
 use http::{Method, StatusCode};
 
 /// Parse an `Allow` header into a sorted, comparable set.
@@ -145,6 +145,91 @@ async fn head_is_not_advertised_where_there_is_no_get() {
 async fn an_unknown_path_is_404_not_405() {
     let (status, _) = allow_from_405(shapes()[0].1(), "/nowhere", Method::PATCH).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// A guard on a wildcard route must not empty out that resource's `Allow`.
+///
+/// `methods_for` answers the automatic `OPTIONS`, and it enumerates the exact
+/// branch guard-free — `Allow` describes the resource, not this request. The
+/// wildcard branch used to be driven by a synthetic `TRACE` call instead, whose
+/// empty headers fail every guard, so a single guarded wildcard route reported
+/// no methods at all. `allow_header_value` then returned `None`, the `204` arm
+/// was skipped, and the request fell through to the ordinary `405` path — where
+/// the *real* call does pass the guard, so the response advertised
+/// `Allow: GET, HEAD, OPTIONS` while refusing the very `OPTIONS` it named.
+#[tokio::test]
+async fn a_guarded_wildcard_still_reports_its_methods_to_options() {
+    let app = || {
+        Churust::server()
+            .routing(|r| {
+                r.get("/assets/{p...}", |_c: Call| async { "asset" })
+                    .guard(guard::header("x-tenant", "acme"));
+            })
+            .build()
+    };
+
+    let res = TestClient::new(app())
+        .request(Method::OPTIONS, "/assets/logo.png")
+        .header("x-tenant", "acme")
+        .send()
+        .await;
+    assert_eq!(
+        res.status(),
+        StatusCode::NO_CONTENT,
+        "OPTIONS on a guarded wildcard was refused instead of answered"
+    );
+    let from_options = allow_set(res.header("allow").unwrap_or_default());
+    assert_eq!(from_options, vec!["GET", "HEAD", "OPTIONS"]);
+
+    // The other view of the same fact still agrees.
+    let (status, from_405) = {
+        let res = TestClient::new(app())
+            .request(Method::PATCH, "/assets/logo.png")
+            .header("x-tenant", "acme")
+            .send()
+            .await;
+        (
+            res.status(),
+            allow_set(res.header("allow").unwrap_or_default()),
+        )
+    };
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(
+        from_405, from_options,
+        "405 said {from_405:?} but OPTIONS said {from_options:?}"
+    );
+}
+
+/// The guard-free enumeration describes the resource, and a request that fails
+/// the guard is still refused.
+///
+/// This is the pre-existing contract for a guarded *exact* route — `OPTIONS`
+/// lists the method, `GET` without the header is a `404` because no candidate
+/// matches — and a wildcard must not answer differently just because it is a
+/// wildcard.
+#[tokio::test]
+async fn a_wildcard_whose_guard_fails_is_404_rather_than_405() {
+    let app = || {
+        Churust::server()
+            .routing(|r| {
+                r.get("/assets/{p...}", |_c: Call| async { "asset" })
+                    .guard(guard::header("x-tenant", "acme"));
+            })
+            .build()
+    };
+
+    for method in allow_from_options(app(), "/assets/logo.png").await {
+        let m = Method::from_bytes(method.as_bytes()).unwrap();
+        let res = TestClient::new(app())
+            .request(m, "/assets/logo.png")
+            .send()
+            .await;
+        assert_ne!(
+            res.status(),
+            StatusCode::METHOD_NOT_ALLOWED,
+            "Allow advertised {method}, which then returned 405"
+        );
+    }
 }
 
 #[tokio::test]
