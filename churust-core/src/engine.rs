@@ -854,13 +854,28 @@ where
 
 /// Serve on a Unix domain socket instead of TCP.
 ///
-/// Useful behind a local reverse proxy: no TCP stack, no port to firewall, and
-/// filesystem permissions become the access control.
+/// Useful behind a local reverse proxy: no TCP stack and no port to firewall.
 ///
-/// The socket path is unlinked first if a stale file is present — a crashed
-/// process leaves one behind, and binding would otherwise fail forever.
+/// The socket path is unlinked first if a *stale* file is present — a crashed
+/// process leaves one behind, and binding would otherwise fail forever. Stale
+/// is established rather than assumed: a socket node that still has a listener
+/// is left alone and the bind fails with [`AddrInUse`], so a second instance
+/// started on a path already in use refuses instead of taking it over.
+///
+/// # Permissions
+///
+/// The socket node is created under the process umask and this function does
+/// not chmod it. Do not rely on the node's own mode for access control: whether
+/// the permission bits on a socket are consulted at `connect(2)` is
+/// platform-dependent — Linux enforces them, some BSDs historically did not.
+/// What is enforced everywhere is path resolution, so put the socket in a
+/// directory whose permissions you control, and set the umask before calling if
+/// the node's own mode matters to you. Adjusting it afterwards is racy: the
+/// socket accepts connections from the moment it is bound.
 ///
 /// Unix only; there is no Windows equivalent.
+///
+/// [`AddrInUse`]: std::io::ErrorKind::AddrInUse
 #[cfg(unix)]
 pub async fn serve_unix<F>(
     app: App,
@@ -871,10 +886,23 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let path = path.as_ref();
-    // A leftover socket file from a crash blocks bind with EADDRINUSE.
-    let _ = std::fs::remove_file(path);
+    // A leftover socket node from a crash blocks bind with EADDRINUSE, so one
+    // has to go — but only once it is known to be dead. The unlink used to be
+    // unconditional, which meant a second `serve_unix` on a path an instance
+    // was already serving deleted that instance's node and bound its own: the
+    // first process kept running on an inode nothing could reach any more,
+    // still reporting itself healthy, while every new connection went to the
+    // second. Probing with a connect distinguishes the two cases the way any
+    // other server does it — a refused connection means nobody is listening,
+    // and an accepted one means the path is genuinely in use.
+    unlink_if_stale(path).await?;
 
     let listener = tokio::net::UnixListener::bind(path)?;
+    // Remember which inode this bind produced. At shutdown the node at `path`
+    // may no longer be ours, and removing whatever happens to be there then
+    // would leave a live successor serving a path with no socket on it. See
+    // the unlink at the end of this function.
+    let bound = socket_identity(path);
     let conn_cfg = ConnSettings::from(app.config());
     let shutdown_timeout_ms = app.config().shutdown_timeout_ms;
 
@@ -917,9 +945,70 @@ where
     }
 
     drain.wait(shutdown_timeout_ms).await;
-    // Leave no socket file behind for the next start to trip over.
-    let _ = std::fs::remove_file(path);
+    // Leave no socket file behind for the next start to trip over — but only
+    // our own. If something else has taken the path over in the meantime, the
+    // node sitting there belongs to a listener that is still serving, and
+    // deleting it would take the successor off the air without either process
+    // noticing: it goes on accepting on an inode with no name, and the next
+    // client to resolve the path finds nothing. Comparing device and inode is
+    // exact where comparing paths is not.
+    if bound.is_some() && bound == socket_identity(path) {
+        let _ = std::fs::remove_file(path);
+    }
     Ok(())
+}
+
+/// Identify the node currently at `path` by device and inode.
+///
+/// `None` means there is nothing there, or that it could not be stated — either
+/// way it is not something this process should claim, so the callers treat it
+/// as "not ours". `symlink_metadata` rather than `metadata`: a symlink pointing
+/// at the socket is a different node from the socket, and following it would
+/// let a link swapped in under us stand in for the real thing.
+#[cfg(unix)]
+fn socket_identity(path: &std::path::Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let md = std::fs::symlink_metadata(path).ok()?;
+    Some((md.dev(), md.ino()))
+}
+
+/// Clear `path` for a fresh bind, refusing to disturb a socket still in use.
+///
+/// Returns `AddrInUse` when the path already has a listener behind it. Anything
+/// else there is removed, as before: a socket node that refuses connections is
+/// the leftover this exists to clean up, and a non-socket file at the path is
+/// removed too, because that is the behaviour `serve_unix` has always had and
+/// bind would fail on it regardless.
+#[cfg(unix)]
+async fn unlink_if_stale(path: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+
+    let Ok(md) = std::fs::symlink_metadata(path) else {
+        return Ok(()); // nothing in the way
+    };
+
+    // Only a socket can have a listener, so only a socket is worth probing.
+    // The probe is a real `connect(2)`, which is the only way to tell a live
+    // socket from an abandoned node: both look identical on disk, since neither
+    // a crash nor a plain `drop` of the listener unlinks the name.
+    if md.file_type().is_socket() && tokio::net::UnixStream::connect(path).await.is_ok() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            format!(
+                "{} is already being served by another listener",
+                path.display()
+            ),
+        ));
+    }
+
+    // The removal is reported now rather than swallowed, because the bind that
+    // follows would fail with a bare EADDRINUSE that says nothing about why the
+    // path could not be cleared. A node that vanished between the stat and the
+    // removal is not a failure: the path is clear, which is all this wanted.
+    match std::fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
+    }
 }
 
 async fn serve_stream<S>(

@@ -483,6 +483,41 @@ fn address_bucket(ip: IpAddr) -> String {
   hazard, and its docs now say why: it collapses in the router for matching
   only and never rewrites the URI, so `call.path()` reports `//admin/secret` in
   middleware and handler alike. Both properties are now pinned by tests.
+- **`serve_unix` no longer takes over a socket another instance is serving.**
+  The doc said the path was unlinked "if a stale file is present", but the code
+  assumed staleness rather than establishing it: `remove_file` ran
+  unconditionally, so starting a second instance on a path already in use
+  deleted the first one's socket node and bound a new one in its place. Nothing
+  failed and nothing was logged. The first process kept accepting on an inode
+  with no name — healthy by every check it makes of itself, unreachable by every
+  client — while its supervisor saw a running server and its socket saw no
+  traffic. The path is now probed with a `connect(2)` before anything is
+  removed: a refused connection means the node is the leftover of a crash and is
+  unlinked as before, and an accepted one means the path is genuinely occupied,
+  so the bind fails with `AddrInUse` and says which path. A non-socket file at
+  the path is still removed, since bind would fail on it regardless.
+- **Shutting down no longer unlinks a socket that belongs to someone else.**
+  The cleanup at the end of `serve_unix` removed whatever was at the path,
+  which is only correct while the node there is still the one this process
+  bound. It is not, after any takeover of the path — the case above, or an
+  operator, or a different program entirely — and the consequence lands on the
+  *innocent* party: the departing process deletes the successor's node, so the
+  successor goes on serving an inode nothing can resolve while the path it was
+  started on has no socket at all. `serve_unix` now records the device and inode
+  it bound and removes the node only if the one still at the path matches, which
+  is exact where comparing paths is not.
+- **`serve_unix` no longer claims filesystem permissions as its access
+  control.** The socket node is created under the process umask and the
+  framework never chmods it, so the sentence promised a control the code does
+  not implement. It also does not travel: whether the permission bits on a
+  socket node are consulted at `connect(2)` is platform-dependent — Linux
+  enforces them, some BSDs historically did not — so the mode is the wrong thing
+  to lean on even where it is honoured. The documentation now says what is
+  actually true, which is that path resolution is enforced everywhere: put the
+  socket in a directory whose permissions you control, and set the umask before
+  calling if the node's own mode matters. No behaviour changed; tightening the
+  mode after bind would be racy, since the socket accepts from the moment it
+  exists.
 - **A saturated connection budget no longer blocks shutdown.** The accept loop
   awaited a `max_connections` permit *outside* the shutdown race, so once every
   slot was held the shutdown signal was never polled — `serve()` did not return

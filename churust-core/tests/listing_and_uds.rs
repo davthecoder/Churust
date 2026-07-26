@@ -152,6 +152,116 @@ async fn a_stale_socket_file_does_not_block_binding() {
     let _ = std::fs::remove_file(&path);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn a_stale_socket_node_left_by_a_crash_is_still_unlinked() {
+    // The realistic leftover is a *socket* inode with nobody listening on it,
+    // not the regular file the test above writes. Binding must still succeed.
+    let path = std::env::temp_dir().join(format!("churust-crash-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let orphan = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    drop(orphan); // dropping does not unlink: the node outlives the listener
+
+    let app = Churust::server()
+        .routing(|r| {
+            r.get("/", |_c: Call| async { "ok" });
+        })
+        .build();
+
+    let p = path.clone();
+    let server = tokio::spawn(async move {
+        let _ = churust_core::engine::serve_unix(app, p, std::future::pending::<()>()).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    assert!(
+        tokio::net::UnixStream::connect(&path).await.is_ok(),
+        "a socket node whose owner crashed must not make bind fail forever"
+    );
+
+    server.abort();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_live_socket_is_not_hijacked_by_a_second_bind() {
+    let path = std::env::temp_dir().join(format!("churust-hijack-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+
+    let app = Churust::server()
+        .routing(|r| {
+            r.get("/", |_c: Call| async { "first" });
+        })
+        .build();
+
+    let p = path.clone();
+    let first = tokio::spawn(async move {
+        let _ = churust_core::engine::serve_unix(app, p, std::future::pending::<()>()).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    let second = Churust::server()
+        .routing(|r| {
+            r.get("/", |_c: Call| async { "second" });
+        })
+        .build();
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_millis(500),
+        churust_core::engine::serve_unix(second, &path, std::future::pending::<()>()),
+    )
+    .await;
+
+    first.abort();
+    let _ = std::fs::remove_file(&path);
+
+    let err = match outcome {
+        Ok(Ok(())) => panic!("the second bind returned instead of refusing"),
+        Ok(Err(e)) => e,
+        Err(_) => panic!("the second bind took over a live socket instead of refusing"),
+    };
+    assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse, "{err}");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shutting_down_does_not_unlink_a_socket_someone_else_bound() {
+    let path = std::env::temp_dir().join(format!("churust-succ-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+
+    let app = Churust::server()
+        .routing(|r| {
+            r.get("/", |_c: Call| async { "ours" });
+        })
+        .build();
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let p = path.clone();
+    let server = tokio::spawn(async move {
+        churust_core::engine::serve_unix(app, p, async {
+            let _ = rx.await;
+        })
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    // Somebody else takes the path over while we are still up: our node is
+    // gone and a different inode now answers there.
+    std::fs::remove_file(&path).unwrap();
+    let successor = std::os::unix::net::UnixListener::bind(&path).unwrap();
+
+    let _ = tx.send(());
+    server.await.unwrap().unwrap();
+
+    assert!(
+        tokio::net::UnixStream::connect(&path).await.is_ok(),
+        "our shutdown deleted the successor's socket, leaving the path dead"
+    );
+
+    drop(successor);
+    let _ = std::fs::remove_file(&path);
+}
+
 #[tokio::test]
 async fn serves_on_several_addresses_at_once() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
