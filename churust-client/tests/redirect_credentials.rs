@@ -27,9 +27,11 @@ struct Seen(Arc<Mutex<Observed>>);
 /// Start a server that records the credentials it is handed, and return its
 /// base URL plus the recorder.
 async fn recording_server() -> (String, Seen) {
+    // Keep the listener: dropping it to free the port leaves a window in
+    // which another test's server can take it, and the client then talks to
+    // the wrong server.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    drop(listener);
 
     let seen = Seen::default();
     let sink = seen.clone();
@@ -48,16 +50,18 @@ async fn recording_server() -> (String, Seen) {
             });
         })
         .build();
-    tokio::spawn(async move { app.start().await });
+    tokio::spawn(async move { app.start_on(listener, std::future::pending()).await });
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     (format!("http://127.0.0.1:{port}"), seen)
 }
 
 /// Start a server that bounces every request to `target`.
 async fn bouncing_server(target: String) -> String {
+    // Keep the listener: dropping it to free the port leaves a window in
+    // which another test's server can take it, and the client then talks to
+    // the wrong server.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    drop(listener);
 
     let app = Churust::server()
         .port(port)
@@ -84,7 +88,7 @@ async fn bouncing_server(target: String) -> String {
             });
         })
         .build();
-    tokio::spawn(async move { app.start().await });
+    tokio::spawn(async move { app.start_on(listener, std::future::pending()).await });
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     format!("http://127.0.0.1:{port}")
 }

@@ -11,9 +11,11 @@ use std::time::Duration;
 /// Binding port 0 and reading back what the OS chose is what keeps these tests
 /// runnable in parallel and on a machine that already has something on 8080.
 async fn serve() -> String {
+    // Keep the listener: dropping it to free the port leaves a window in
+    // which another test's server can take it, and the client then talks to
+    // the wrong server.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    drop(listener);
 
     let app = Churust::server()
         .port(port)
@@ -60,7 +62,7 @@ async fn serve() -> String {
         .build();
 
     tokio::spawn(async move {
-        let _ = app.start().await;
+        let _ = app.start_on(listener, std::future::pending()).await;
     });
 
     // Give the listener a moment to bind before the first connection.
@@ -280,7 +282,7 @@ async fn a_default_header_is_sent_on_every_request() {
 
 #[tokio::test]
 async fn a_refused_connection_is_a_transport_error() {
-    // Bind and drop, so the port is almost certainly closed.
+    // Bind and drop on purpose: this test needs a port with nothing on it.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     drop(listener);
