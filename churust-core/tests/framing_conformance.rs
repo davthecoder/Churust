@@ -199,3 +199,29 @@ async fn a_head_reply_still_reports_the_length() {
         "HEAD lost Content-Length: {res}"
     );
 }
+
+#[tokio::test]
+async fn transfer_encoding_first_is_refused_too() {
+    // Header *order* is the attacker's choice, and the guard only ever saw one
+    // of the two orderings: below hyper 1.11, hyper deletes the Content-Length
+    // when it parses a Transfer-Encoding first, so `contains_key` was false and
+    // the message was served — with the smuggled request answered. The
+    // Content-Length-first ordering was refused, which made the gap look closed.
+    let res = exchange(
+        b"POST /echo HTTP/1.1\r\n\
+          Host: x\r\n\
+          Transfer-Encoding: chunked\r\n\
+          Content-Length: 6\r\n\
+          \r\n\
+          0\r\n\r\n\
+          GET / HTTP/1.1\r\nHost: x\r\n\r\n",
+    )
+    .await;
+
+    let responses = res.matches("HTTP/1.1 ").count();
+    assert_eq!(responses, 1, "the smuggled request was answered: {res}");
+    assert!(
+        res.to_ascii_lowercase().contains("connection: close"),
+        "the connection stayed reusable after an ambiguous message: {res}"
+    );
+}

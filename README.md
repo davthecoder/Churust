@@ -148,10 +148,12 @@ Every Churust crate is released in lockstep on one version number, so
   collapsing makes prefix-based auth checks bypassable and cache identity
   ambiguous.
 - **Ambiguity is refused, not guessed** — a request carrying both
-  `Transfer-Encoding` and `Content-Length` never keeps its connection: below
-  hyper 1.11 Churust answers `400`, and from 1.11 hyper strips the
-  `Content-Length`, frames by the transfer coding and closes. Either way no
-  leftover byte becomes the next request. A repeated query key on a scalar field
+  `Transfer-Encoding` and `Content-Length` never keeps its connection,
+  whichever order the two headers arrive in, so no leftover byte becomes the
+  next request behind a proxy that read the length differently. This is why
+  hyper `1.11` is a floor rather than a preference: earlier versions delete the
+  `Content-Length` while parsing and leave the connection open, and no check
+  above hyper can see what was deleted. A repeated query key on a scalar field
   is an error rather than a silent first-or-last-wins.
 - **Borrow the ecosystem** — the `tower` feature runs any `tower::Service` as
   middleware, so `tower-http`'s layers work without Churust reimplementing

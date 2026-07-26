@@ -75,13 +75,23 @@ pub struct ServerSection {
     /// connection open indefinitely by dribbling one header byte at a time,
     /// because the per-request timeout does not start until there is a request.
     ///
-    /// It covers both protocols, by different means. HTTP/1 gets a literal
-    /// deadline on the header block. HTTP/2 has no equivalent — a header block
-    /// arrives as frames on an already-open connection — so the same value
-    /// drives a keep-alive PING and the deadline for its acknowledgement,
-    /// which answers the equivalent question of whether the peer is still
-    /// there. A stalled h2 peer is therefore dropped within roughly twice this
-    /// value, and a live one with nothing to say answers the ping and stays.
+    /// It covers all three phases of a connection, by different means.
+    ///
+    /// Before either protocol exists, the server is still reading up to the 24
+    /// bytes of the HTTP/2 preface to find out which one to speak, and neither
+    /// mechanism below has been created yet. A connection that does not get as
+    /// far as choosing a protocol within this deadline is closed — which is
+    /// what bounds a peer that connects and then sends nothing at all.
+    ///
+    /// HTTP/1 then gets a literal deadline on the header block. HTTP/2 has no
+    /// equivalent — a header block arrives as frames on an already-open
+    /// connection — so the same value drives a keep-alive PING and the deadline
+    /// for its acknowledgement, which answers the equivalent question of
+    /// whether the peer is still there. A stalled h2 peer is therefore dropped
+    /// within roughly twice this value, and a live one with nothing to say
+    /// answers the ping and stays: once a protocol has been negotiated this
+    /// deadline no longer applies, so an idle-but-responsive client is not
+    /// bound by it.
     pub header_read_timeout_ms: u64,
     /// Maximum number of headers accepted on a request (default `100`).
     pub max_headers: usize,

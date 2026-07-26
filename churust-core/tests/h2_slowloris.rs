@@ -1,4 +1,4 @@
-//! The slow-loris defence must cover both protocols served on the port.
+//! The slow-loris defence must cover every phase of a connection.
 //!
 //! `header_read_timeout_ms` is documented as "the slow-loris defence" but was
 //! applied only to `builder.http1()`. The HTTP/2 branch got a timer and no
@@ -7,6 +7,14 @@
 //! was bounded by nothing but the idle watchdog at `keep_alive_ms` (75s by
 //! default, against a documented 10s defence), while holding a connection
 //! permit the whole time.
+//!
+//! There is a third phase, before either protocol exists. `auto::Builder`
+//! sniffs up to the 24 bytes of the HTTP/2 preface to decide which connection
+//! to build, and both deadlines above are properties of a connection that has
+//! not been built yet. hyper-util's `ReadVersion` future holds no timer of its
+//! own, so a peer that sends nothing at all — or 23 of the 24 preface bytes —
+//! parks there holding a connection permit and a drain token. The idle watchdog
+//! is the only backstop, and `keep_alive_ms(0)` disables even that.
 
 use churust_core::{Call, Churust};
 use std::time::{Duration, Instant};
@@ -105,4 +113,82 @@ async fn a_responsive_http2_client_is_not_dropped() {
         .expect("no response: the live connection was closed")
         .expect("response");
     assert_eq!(res.status(), 200);
+}
+
+/// Read until the peer closes, or fail after `patience`.
+async fn time_until_closed(sock: &mut tokio::net::TcpStream, patience: Duration) -> Duration {
+    let t0 = Instant::now();
+    let mut buf = [0u8; 4096];
+    loop {
+        match tokio::time::timeout(patience, sock.read(&mut buf)).await {
+            Ok(Ok(0)) | Ok(Err(_)) => return t0.elapsed(),
+            // Whatever the server says on the way out — keep reading.
+            Ok(Ok(_)) => continue,
+            Err(_) => panic!("still connected after {patience:?}"),
+        }
+    }
+}
+
+/// Serve `app` on an ephemeral port and hand back the address.
+///
+/// The listener is bound before the server task starts and never dropped, so
+/// no other test can take the port in between.
+async fn serve(app: churust_core::App) -> std::net::SocketAddr {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        churust_core::engine::serve_on(app, l, std::future::pending::<()>()).await
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    addr
+}
+
+#[tokio::test]
+async fn a_peer_that_sends_nothing_is_dropped_before_a_protocol_is_chosen() {
+    // `keep_alive_ms(0)` disables the idle watchdog outright, so nothing but
+    // the header deadline can close this connection. That is the point: the
+    // watchdog was the only thing covering this phase, and at 0 it is not
+    // there at all.
+    let app = Churust::server()
+        .header_read_timeout_ms(400)
+        .keep_alive_ms(0)
+        .routing(|r| {
+            r.get("/", |_c: Call| async { "ok" });
+        })
+        .build();
+    let addr = serve(app).await;
+
+    // Not one byte. hyper-util is parked in `ReadVersion` waiting to see
+    // whether this is an HTTP/2 preface, and neither protocol's deadline
+    // exists until it decides.
+    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let elapsed = time_until_closed(&mut sock, Duration::from_secs(6)).await;
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "a silent connection was held for {elapsed:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_peer_that_stalls_inside_the_preface_is_dropped() {
+    // The sneakier shape: 23 of the 24 preface bytes. Every byte matches, so
+    // `ReadVersion` keeps waiting for the last one rather than falling through
+    // to HTTP/1, and the connection is parked for as long as the peer likes.
+    let app = Churust::server()
+        .header_read_timeout_ms(400)
+        .keep_alive_ms(0)
+        .routing(|r| {
+            r.get("/", |_c: Call| async { "ok" });
+        })
+        .build();
+    let addr = serve(app).await;
+
+    const PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+    let mut sock = tokio::net::TcpStream::connect(addr).await.unwrap();
+    sock.write_all(&PREFACE[..PREFACE.len() - 1]).await.unwrap();
+    let elapsed = time_until_closed(&mut sock, Duration::from_secs(6)).await;
+    assert!(
+        elapsed < Duration::from_secs(3),
+        "a connection stalled inside the preface was held for {elapsed:?}"
+    );
 }

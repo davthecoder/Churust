@@ -241,7 +241,7 @@ where
                                     // The handshake budget is for handshakes; the
                                     // connection budget takes over from here.
                                     drop(_handshake_permit);
-                                    serve_stream(app, TokioIo::new(tls_stream), conn_cfg, peer, token, slot).await;
+                                    serve_stream(app, tls_stream, conn_cfg, peer, token, slot).await;
                                 }
                                 // Certificate, protocol-version and SNI failures
                                 // all land here. Logged at debug because an
@@ -255,7 +255,7 @@ where
                         continue;
                     }
                 }
-                serve_stream(app.clone(), TokioIo::new(stream), conn_cfg, peer, drain.token(), slot).await;
+                serve_stream(app.clone(), stream, conn_cfg, peer, drain.token(), slot).await;
             }
         }
     }
@@ -569,6 +569,144 @@ impl ConnActivity {
     }
 }
 
+/// The 24 bytes an HTTP/2 client sends before anything else (RFC 9113 §3.4).
+const H2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+/// Whether `auto::Builder` has finished deciding which protocol this is.
+///
+/// The two header deadlines the engine configures — `http1().header_read_timeout`
+/// and the h2 keep-alive ping — belong to a `Connection` that hyper-util only
+/// builds *after* it has sniffed the preface, and the sniffing future itself
+/// (`ReadVersion`) holds no timer: it is a bare read of up to 24 bytes. A peer
+/// that connects and sends nothing, or that sends 23 of the 24 preface bytes,
+/// parks there holding a connection permit and a drain token with no deadline
+/// on it at all.
+///
+/// Reading this flag is what lets the connection loop bound that phase and stop
+/// bounding it the moment a protocol exists — which matters, because a live
+/// HTTP/2 client is allowed to sit idle far longer than the header deadline
+/// once it has handshaken.
+#[derive(Default)]
+struct Negotiated(std::sync::atomic::AtomicBool);
+
+impl Negotiated {
+    fn get(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn set(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Wraps the socket to watch the bytes `ReadVersion` reads, and nothing else.
+///
+/// The condition below mirrors hyper-util's: it stops sniffing on the first
+/// read that diverges from the preface, on end of file, and once all 24 bytes
+/// have matched. Mirroring is safe to do here because the preface is a protocol
+/// constant rather than a hyper internal — hyper-util cannot decide differently
+/// without HTTP/2 itself changing.
+///
+/// Once `flag` is set the wrapper is a pure delegate; the comparison costs at
+/// most 24 byte tests per connection.
+struct Sniffing<S> {
+    inner: S,
+    flag: std::sync::Arc<Negotiated>,
+    /// Preface bytes matched so far, across however many reads they arrived in.
+    matched: usize,
+}
+
+impl<S> Sniffing<S> {
+    fn new(inner: S, flag: std::sync::Arc<Negotiated>) -> Self {
+        Self {
+            inner,
+            flag,
+            matched: 0,
+        }
+    }
+
+    /// Feed the bytes a single read produced.
+    fn observe(&mut self, fresh: &[u8]) {
+        // End of file. hyper-util stops sniffing here too, and the connection
+        // is about to end on its own.
+        if fresh.is_empty() {
+            self.flag.set();
+            return;
+        }
+        for &byte in fresh {
+            if byte != H2_PREFACE[self.matched] {
+                // Not HTTP/2: hyper-util builds an HTTP/1 connection, whose own
+                // header deadline takes over from here.
+                self.flag.set();
+                return;
+            }
+            self.matched += 1;
+            if self.matched == H2_PREFACE.len() {
+                self.flag.set();
+                return;
+            }
+        }
+    }
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for Sniffing<S> {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let polled = std::pin::Pin::new(&mut this.inner).poll_read(cx, buf);
+        if matches!(polled, std::task::Poll::Ready(Ok(()))) && !this.flag.get() {
+            // Copied out because `observe` takes `&mut self` while `buf` is
+            // still borrowed from the read above.
+            let fresh: Vec<u8> = buf.filled()[before..].to_vec();
+            this.observe(&fresh);
+        }
+        polled
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for Sniffing<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+
+    // Delegated rather than left to the default: hyper writes a response head
+    // and body as separate slices, and losing vectored writes here would turn
+    // every response into an extra syscall.
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+}
+
 /// Per-connection settings, resolved once from the app config.
 ///
 /// Grouped rather than passed individually: nine positional parameters is a
@@ -732,7 +870,7 @@ where
                         continue;
                     }
                 };
-                serve_stream(app.clone(), TokioIo::new(stream), conn_cfg, peer, drain.token(), slot).await;
+                serve_stream(app.clone(), stream, conn_cfg, peer, drain.token(), slot).await;
             }
         }
     }
@@ -743,16 +881,21 @@ where
     Ok(())
 }
 
-async fn serve_stream<I>(
+async fn serve_stream<S>(
     app: App,
-    io: I,
+    stream: S,
     cfg: ConnSettings,
     peer: std::net::SocketAddr,
     token: DrainToken,
     slot: ConnSlot,
 ) where
-    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    // Taken as the raw stream rather than as an already-wrapped `TokioIo` so
+    // the preface sniffing can be watched underneath it — see `Sniffing`.
+    let negotiated = std::sync::Arc::new(Negotiated::default());
+    let io = TokioIo::new(Sniffing::new(stream, negotiated.clone()));
+
     // The idle watchdog needs to know when this connection last did anything.
     // hyper exposes no per-request hook, but the service *is* the per-request
     // hook: every request on this connection passes through the closure below.
@@ -868,6 +1011,29 @@ async fn serve_stream<I>(
         let mut linger = std::pin::pin!(linger);
         let mut lingering = false;
 
+        // The deadline for choosing a protocol at all. Both header deadlines
+        // configured above belong to a connection hyper-util has not built yet,
+        // and the sniffing it does first carries no timer, so this is the only
+        // thing standing between a silent socket and a permit held for the life
+        // of the process — the idle watchdog is a backstop at `keep_alive_ms`
+        // rather than at the advertised deadline, and `keep_alive_ms` of 0
+        // disables it outright.
+        //
+        // It stops applying at negotiation, not at the first request: an HTTP/2
+        // client that has handshaken is entitled to idle for far longer than
+        // the header deadline, and the h2 keep-alive ping is what asks whether
+        // it is still there.
+        let mut negotiation_armed = cfg.header_read_timeout_ms > 0;
+        let negotiation =
+            tokio::time::sleep(std::time::Duration::from_millis(if negotiation_armed {
+                cfg.header_read_timeout_ms
+            } else {
+                // Parked, like the linger above: the branch is disabled, but
+                // `select!` still needs a future to name.
+                u64::MAX / 2
+            }));
+        let mut negotiation = std::pin::pin!(negotiation);
+
         loop {
             tokio::select! {
                 // Bias the connection: with both branches ready, finishing the
@@ -913,6 +1079,42 @@ async fn serve_stream<I>(
                     linger
                         .as_mut()
                         .reset(tokio::time::Instant::now() + GOAWAY_LINGER);
+                }
+                // The peer never got as far as a protocol. Wound down the same
+                // way the idle watchdog does rather than dropped outright, so
+                // the socket is closed by hyper and anything already buffered
+                // reaches the wire.
+                _ = negotiation.as_mut(), if negotiation_armed && !winding_down => {
+                    // `select!` evaluates a branch's precondition when it is
+                    // *entered*, not when the branch fires. This one is entered
+                    // before the peer has sent anything, so `negotiated` cannot
+                    // be tested there: a connection that handshakes a
+                    // millisecond later still arrives here with the branch
+                    // armed, and closing it would drop every live HTTP/2 client
+                    // that idles past the header deadline — which is exactly
+                    // what `a_responsive_http2_client_is_not_dropped` exists to
+                    // catch. Read the flag here, where it is current.
+                    if negotiated.get() {
+                        // Disarms the branch on the next pass, so a deadline
+                        // that has already elapsed does not keep waking us.
+                        negotiation_armed = false;
+                    } else {
+                        tracing::debug!(
+                            %peer,
+                            deadline_ms = cfg.header_read_timeout_ms,
+                            "no protocol chosen within the header deadline; closing"
+                        );
+                        winding_down = true;
+                        conn.as_mut().graceful_shutdown();
+                        // Nothing has been served, so there is nothing to drain
+                        // — but an idle connection does not necessarily close
+                        // on its own, which is what this linger is for
+                        // elsewhere too.
+                        linger
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + GOAWAY_LINGER);
+                        lingering = true;
+                    }
                 }
                 _ = idle.as_mut(), if idle_enabled && !winding_down => {
                     match activity.idle_for(cfg.keep_alive_ms) {

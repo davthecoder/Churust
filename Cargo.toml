@@ -50,7 +50,15 @@ tokio = { version = "1", features = [
   "signal",
   "macros",
 ] }
-hyper = { version = "1", features = ["http1", "http2", "server"] }
+# 1.11 is a floor, not a preference. Below it, hyper deletes a request's
+# `Content-Length` when it parses a `Transfer-Encoding` first and does *not*
+# close the connection — so an ambiguous message is served, and a smuggled
+# request behind a Content-Length-believing proxy is answered. No header-map
+# check in Churust can see that, because the evidence is gone before the engine
+# is handed the request. 1.11 refuses both orderings itself. Churust is a
+# library, so a dependent resolves its own hyper: the floor is the only thing
+# that protects them, not our lockfile.
+hyper = { version = "1.11", features = ["http1", "http2", "server"] }
 hyper-util = { version = "0.1", features = [
   "tokio",
   "server",

@@ -58,6 +58,14 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+/// How long a QUIC connection may sit idle before quinn closes it.
+///
+/// Matches the default `keep_alive_ms`, so an idle connection costs the same
+/// whichever transport it arrived on. `server_config_from_pem` is a free
+/// function with no access to the app config; a caller that needs a different
+/// value builds its own `quinn::ServerConfig` and uses `serve_with_config`.
+const DEFAULT_IDLE_MS: u64 = 75_000;
+
 /// Build a QUIC server configuration from a PEM certificate chain and key.
 ///
 /// The ALPN protocol is `h3` and nothing else: a QUIC connection that
@@ -80,7 +88,25 @@ pub fn server_config_from_pem(cert_path: &str, key_path: &str) -> io::Result<qui
 
     let quic = quinn::crypto::rustls::QuicServerConfig::try_from(tls)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    Ok(quinn::ServerConfig::with_crypto(Arc::new(quic)))
+    let mut config = quinn::ServerConfig::with_crypto(Arc::new(quic));
+
+    // Bound the connection's life, not just the request's. A permit is held for
+    // as long as the QUIC connection lives, and quinn's default idle timeout is
+    // negotiated with the peer — so a client that opens a connection and then
+    // says nothing at all, or answers one request and lingers, pinned a
+    // `max_connections` slot indefinitely. Neither case involves a request, so
+    // no request-level deadline can reach them.
+    //
+    // Set from the same knob that bounds an idle TCP connection, so one setting
+    // means one thing on both transports.
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(Some(
+        std::time::Duration::from_millis(DEFAULT_IDLE_MS)
+            .try_into()
+            .expect("idle timeout fits in a QUIC varint"),
+    ));
+    config.transport_config(Arc::new(transport));
+    Ok(config)
 }
 
 fn load_certs(path: &str) -> io::Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
@@ -256,7 +282,31 @@ where
     let (parts, _) = request.into_parts();
     let max_body = app.config().max_body_bytes;
 
-    let body = match read_body(&mut stream, max_body).await {
+    // The deadline has to start here, not after the body has arrived. Reading
+    // the body is the attacker-controlled phase — a client can dribble one byte
+    // and stop — and wrapping only the handler left exactly that phase
+    // unbounded, which the TCP path does not do.
+    let timeout_ms = app.config().request_timeout_ms;
+    let deadline = (timeout_ms > 0)
+        .then(|| tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms));
+
+    let read = async { read_body(&mut stream, max_body).await };
+    let read = match deadline {
+        Some(at) => match tokio::time::timeout_at(at, read).await {
+            Ok(r) => r,
+            Err(_) => {
+                let response = http::Response::builder()
+                    .status(http::StatusCode::REQUEST_TIMEOUT)
+                    .body(())?;
+                stream.send_response(response).await?;
+                stream.finish().await?;
+                return Ok(());
+            }
+        },
+        None => read.await,
+    };
+
+    let body = match read {
         Ok(body) => body,
         Err(TooLarge) => {
             let response = http::Response::builder()
@@ -279,18 +329,15 @@ where
         extensions,
     );
 
-    // `request_timeout_ms` applies here too. It was never read on this path, so
-    // an h3 request could run without any deadline while the identical request
-    // over TCP was bounded.
-    let timeout_ms = app.config().request_timeout_ms;
-    let response = if timeout_ms == 0 {
-        process.await
-    } else {
-        match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), process).await {
+    // The remainder of the same budget, so the whole exchange is bounded once
+    // rather than the body and the handler each getting a full allowance.
+    let response = match deadline {
+        None => process.await,
+        Some(at) => match tokio::time::timeout_at(at, process).await {
             Ok(res) => res,
             Err(_) => crate::response::Response::text("Request Timeout")
                 .with_status(http::StatusCode::REQUEST_TIMEOUT),
-        }
+        },
     };
 
     send_response(&mut stream, response, parts.method == Method::HEAD).await

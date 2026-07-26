@@ -479,6 +479,19 @@ released together, so every entry below applies to the whole set.
   permits a literal `%`, but since values are decoded on read, letting one
   through made the round trip lossy — a stored `%3D` came back as `=`, which
   corrupted a session payload before its signature was checked.
+- **A connection that never chooses a protocol is now closed at
+  `header_read_timeout_ms`.** The knob documented itself as "the slow-loris
+  defence", but both mechanisms it drives — the HTTP/1 header deadline and the
+  HTTP/2 keep-alive ping — belong to a connection `auto::Builder` has not built
+  yet while it reads up to the 24 bytes of the HTTP/2 preface to decide which
+  one to build. hyper-util's sniffing future carries no timer, so a peer that
+  connected and sent nothing, or sent 23 of the 24 preface bytes, held a
+  connection permit and a drain token bounded only by the idle watchdog at
+  `keep_alive_ms` — 75s against an advertised 10s — and by nothing whatsoever
+  when `keep_alive_ms` is `0`, which disables the watchdog outright. The
+  deadline now covers that phase too and stops applying at negotiation rather
+  than at the first request, so an HTTP/2 client that handshakes and then idles
+  is still governed by the keep-alive ping and not by this.
 - Encoded path separators (`%2F`, `%5C`) are refused by `StaticFiles`. Traversal
   was already blocked by the `..` rejection, but `%2F` silently became a real
   separator once a wildcard's segments were rejoined, which made the safety
