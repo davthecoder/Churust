@@ -208,3 +208,51 @@ async fn a_filename_cannot_become_a_url_scheme_or_query() {
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[tokio::test]
+async fn a_parameterised_prefix_does_not_hijack_the_wildcard_capture() {
+    // `StaticFiles` read the *first* capture. Captures used to be an unordered
+    // HashMap, which made this a coin flip; ordering them turned it into a
+    // reliably wrong pick — under `/{tenant}/assets/{p...}` the first capture is
+    // `tenant`, so the request served `<root>/acme/...` instead of the file the
+    // URL named. Serving the wrong file is worse than a 404, and with an index
+    // file configured it answers 200 while doing it.
+    let base = std::env::temp_dir().join(format!("churust-tenant-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let root = base.join("public");
+    std::fs::create_dir_all(root.join("acme")).unwrap();
+    std::fs::write(root.join("a.txt"), "THE FILE").unwrap();
+    std::fs::write(root.join("acme").join("index.html"), "TENANT INDEX").unwrap();
+
+    let r2 = root.clone();
+    let app = Churust::server()
+        .routing(move |r| {
+            r.route("/{tenant}/assets", move |r| {
+                r.get(
+                    "/{p...}",
+                    StaticFiles::dir(r2.clone()).index("index.html").handler(),
+                );
+            });
+        })
+        .build();
+
+    let res = TestClient::new(app).get("/acme/assets/a.txt").send().await;
+    assert_eq!(res.status(), StatusCode::OK, "{}", res.text());
+    assert_eq!(
+        res.text(),
+        "THE FILE",
+        "the prefix capture was used as the path and served the wrong file"
+    );
+
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[tokio::test]
+async fn a_single_capture_route_still_works() {
+    // The ordinary mount, which must be unaffected.
+    let root = tree("single");
+    let res = TestClient::new(app(&root)).get("/s/sub/b.txt").send().await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(res.text(), "BBB");
+    let _ = std::fs::remove_dir_all(root.parent().unwrap());
+}

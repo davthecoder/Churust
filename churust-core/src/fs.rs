@@ -104,12 +104,21 @@ impl StaticFiles {
     }
 
     async fn serve(&self, call: &Call) -> Result<Response> {
-        // The relative path is the route's (single) captured param value.
+        // The relative path is the route's *wildcard* capture, which is the
+        // last one: `Router::add` requires a `{name...}` to be the final
+        // segment, so nothing can be captured after it.
+        //
+        // This used to take the first capture. While captures were an unordered
+        // `HashMap` that was a coin flip; ordering them made it reliably wrong
+        // under a parameterised prefix — mounted at `/{tenant}/assets/{p...}`,
+        // the first capture is `tenant`, so `/acme/assets/a.txt` served
+        // `<root>/acme/...`. With an index file configured that is a `200`
+        // carrying the wrong file, which is worse than a miss.
         let rel = call
-            .params_iter()
-            .map(|(_, v)| v.to_string())
-            .next()
-            .unwrap_or_default();
+            .params()
+            .nth(call.params().len().saturating_sub(1))
+            .unwrap_or_default()
+            .to_string();
 
         // Refuse an encoded separator before anything interprets the path.
         //
