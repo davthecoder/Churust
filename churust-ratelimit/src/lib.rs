@@ -58,7 +58,9 @@ use async_trait::async_trait;
 use churust_core::{AppBuilder, Call, Error, Middleware, Next, Phase, Plugin, Response};
 use http::header::RETRY_AFTER;
 use http::{HeaderValue, StatusCode};
+use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
+use std::hash::BuildHasher;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -75,11 +77,36 @@ type KeyFn = Arc<dyn Fn(&Call) -> Option<String> + Send + Sync>;
 /// briefly is not the bottleneck in a pipeline that is about to do I/O.
 #[derive(Debug, Default)]
 struct Table {
-    /// Key to theoretical arrival time.
-    tat: HashMap<String, Instant>,
+    /// Key digest to theoretical arrival time.
+    ///
+    /// The digest, not the key. `max_keys` bounds how many entries there are
+    /// and nothing bounds how long a [`KeyFn`] makes one, so storing the key
+    /// itself would let whoever supplies it choose what a bucket costs: a
+    /// header-derived key at a few hundred kilobytes apiece stays far under the
+    /// entry cap, never trips [`Table::prune`], and still pins gigabytes for
+    /// the life of the process. At a fixed width the documented bound holds by
+    /// construction, for every `KeyFn`, without the limiter having to have an
+    /// opinion about what a reasonable key looks like.
+    tat: HashMap<u64, Instant>,
+    /// The seed the digests are taken under.
+    ///
+    /// Two distinct keys that collide share one budget, so the seed is per
+    /// table and randomly chosen rather than fixed: a caller who could compute
+    /// a digest offline could hunt for a value colliding with somebody else's
+    /// key and spend it for them. Against a secret seed that costs the birthday
+    /// work on a 64-bit output with no way to observe a hit, while an accidental
+    /// collision across the default 100,000 live entries sits around one in four
+    /// billion. Truncating the key instead would have been cheaper and would
+    /// have handed that collision to anyone who can type a prefix.
+    seed: RandomState,
 }
 
 impl Table {
+    /// The fixed-width stand-in for a key.
+    fn digest(&self, key: &str) -> u64 {
+        self.seed.hash_one(key)
+    }
+
     /// Drop keys that have gone idle, then, if the table is still over its cap,
     /// evict the entries nearest to expiry until it is under.
     ///
@@ -93,8 +120,7 @@ impl Table {
             return;
         }
         let target = max_keys * 9 / 10;
-        let mut by_expiry: Vec<(String, Instant)> =
-            self.tat.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        let mut by_expiry: Vec<(u64, Instant)> = self.tat.iter().map(|(k, v)| (*k, *v)).collect();
         by_expiry.sort_by_key(|(_, tat)| *tat);
         for (key, _) in by_expiry.into_iter().take(self.tat.len() - target) {
             self.tat.remove(&key);
@@ -202,6 +228,10 @@ impl RateLimit {
     /// Returning `None` exempts the request from limiting entirely, which is
     /// how you let health checks or an authenticated internal caller through.
     ///
+    /// The key is hashed and dropped rather than kept, so its length costs
+    /// nothing beyond the one call and a caller-supplied value needs no length
+    /// check of its own before it is handed over.
+    ///
     /// ```
     /// use churust_ratelimit::RateLimit;
     ///
@@ -219,9 +249,10 @@ impl RateLimit {
 
     /// Set how many keys are tracked before the table is pruned.
     ///
-    /// The table holds one string key and one timestamp per active client, so
-    /// the default of 100,000 is a few megabytes. Raise it for a large fleet,
-    /// lower it for a memory-constrained deployment.
+    /// The table holds a 64-bit digest of the key and one timestamp per active
+    /// client, so an entry costs the same whatever the key is and the default of
+    /// 100,000 is a few megabytes for any [`by`](RateLimit::by) function. Raise
+    /// it for a large fleet, lower it for a memory-constrained deployment.
     ///
     /// # Panics
     ///
@@ -244,7 +275,8 @@ impl RateLimit {
             table.prune(now, self.max_keys);
         }
 
-        let tat = table.tat.get(key).copied().unwrap_or(now);
+        let digest = table.digest(key);
+        let tat = table.tat.get(&digest).copied().unwrap_or(now);
         // The earliest arrival this key may make. `checked_sub` failing means
         // the tolerance reaches back past the process's own clock origin, which
         // can only mean the key is idle, so the request conforms.
@@ -257,7 +289,7 @@ impl RateLimit {
         // accumulating credit for the time it was quiet. That credit is what
         // the burst tolerance already expresses.
         let base = if tat > now { tat } else { now };
-        table.tat.insert(key.to_string(), base + self.emission);
+        table.tat.insert(digest, base + self.emission);
         Ok(())
     }
 
@@ -375,6 +407,30 @@ mod tests {
         }
         let len = limiter.table.lock().unwrap().tat.len();
         assert!(len <= 8, "table grew past its cap: {len}");
+    }
+
+    #[test]
+    fn a_long_key_is_stored_at_the_same_width_as_a_short_one() {
+        // A key that comes out of a header is chosen by the caller in length as
+        // well as in value, and `max_keys` counts entries rather than bytes, so
+        // nothing else in this file stops one client from deciding what a
+        // bucket costs. Debug renders precisely what an entry holds, which
+        // makes the rendered length a proxy for the entry's footprint that does
+        // not depend on knowing the key type.
+        let limiter = RateLimit::per(2, Duration::from_secs(30));
+        let long = "k".repeat(1 << 20);
+        assert!(limiter.check("k").is_ok());
+        assert!(limiter.check(&long).is_ok());
+
+        let table = limiter.table.lock().unwrap();
+        assert_eq!(table.tat.len(), 2, "the two keys are distinct");
+        let rendered = format!("{:?}", table.tat);
+        assert!(
+            rendered.len() < 256,
+            "the table retained the key's {} bytes instead of a fixed-width \
+             digest, so a caller picks the cost of its own bucket",
+            long.len()
+        );
     }
 
     #[test]

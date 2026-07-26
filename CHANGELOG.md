@@ -561,6 +561,21 @@ released together, so every entry below applies to the whole set.
   ambiguity to refuse it — but the same release sets `keep_alive = false` for
   exactly this shape. The check stays for the versions `hyper = "1"` still
   admits below 1.11, where nothing else closes the connection.
+- **`RateLimit` stores a digest of the bucket key, not the key.** `max_keys`
+  bounds how many entries the table holds and nothing bounded how large one was,
+  so with a key read off a header — `by(|call| call.header("x-api-key").map(…))`,
+  which the docs themselves suggest — the caller chose what a bucket cost.
+  A fresh key gets the full burst, so a few thousand requests each carrying a
+  distinct several-hundred-kilobyte header were all admitted, stayed far below
+  the entry cap, never tripped the prune, and pinned gigabytes for the life of
+  the process; repeating it exhausted memory. Each entry is now a 64-bit digest
+  and a timestamp, which makes the documented "a few megabytes at 100,000 keys"
+  true by construction for every key function rather than only for short keys.
+  The seed is per table and randomly chosen rather than fixed, because two keys
+  that collide share one budget and a digest anyone could compute offline would
+  let a caller hunt for a value colliding with somebody else's key and spend it
+  for them. Truncating the key to a fixed length would have been cheaper and
+  would have handed exactly that collision to anyone able to type a prefix.
 
 ## [0.2.0] - 2026-07-25
 
