@@ -507,6 +507,14 @@ impl Middleware for Compression {
         // Whatever length was set describes the identity body. The engine
         // recomputes it for a buffered body and omits it for a stream.
         res.headers.remove(CONTENT_LENGTH);
+        // Ranges described the identity body too, and they cannot be honoured
+        // for this one. `StaticFiles` sets `Accept-Ranges: bytes`; leaving it
+        // told the client it could resume, and its `Range` request then came
+        // back `206` with *identity* bytes — `should_compress` correctly skips
+        // `206` — against a total it never received. The client splices
+        // plaintext into a gzip stream and the resumed download is corrupt.
+        // nginx's gzip filter clears this header for the same reason.
+        res.headers.remove(http::header::ACCEPT_RANGES);
         weaken_etag(&mut res);
         res
     }

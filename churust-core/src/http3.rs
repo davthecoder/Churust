@@ -169,11 +169,25 @@ impl Http3Server {
 
 /// Accept QUIC connections until the endpoint closes.
 async fn accept_loop(app: App, endpoint: quinn::Endpoint) {
+    // The same connection budget the TCP engine applies. Without it, enabling
+    // http3 opted a deployment out of `max_connections` entirely — and
+    // `advertise_http3` actively steers clients here.
+    let slots = (app.config().max_connections > 0)
+        .then(|| std::sync::Arc::new(tokio::sync::Semaphore::new(app.config().max_connections)));
+
     while let Some(incoming) = endpoint.accept().await {
         let app = app.clone();
+        // Taken before accepting, so excess load waits in QUIC's own queue
+        // rather than as memory in this process. Held for the connection's
+        // life by the task below.
+        let permit = match &slots {
+            Some(sem) => sem.clone().acquire_owned().await.ok(),
+            None => None,
+        };
         // One task per connection, like the TCP engine: a slow peer must not
         // hold up the accept loop.
         tokio::spawn(async move {
+            let _permit = permit;
             match incoming.await {
                 Ok(connection) => {
                     if let Err(e) = serve_connection(app, connection).await {
@@ -194,7 +208,19 @@ async fn serve_connection(
     app: App,
     connection: quinn::Connection,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut h3 = h3::server::Connection::new(h3_quinn::Connection::new(connection)).await?;
+    // The peer address, which the TCP engine seeds and this path did not — so
+    // `Call::peer_addr` was `None` and anything keying on it (rate limiting,
+    // audit logs, IP allowlists) treated the entire h3 fleet as one client.
+    let peer = connection.remote_address();
+
+    // h3's default `max_field_section_size` is `VarInt::MAX`, i.e. no bound on
+    // a header block at all, where the TCP engine caps HTTP/1 headers by count
+    // and HTTP/2 by encoded size. Reuse the HTTP/2 knob: it asks the same
+    // question of the same kind of header block.
+    let mut h3 = h3::server::builder()
+        .max_field_section_size(app.config().h2_max_header_list_size as u64)
+        .build(h3_quinn::Connection::new(connection))
+        .await?;
 
     loop {
         match h3.accept().await {
@@ -205,7 +231,7 @@ async fn serve_connection(
                 // connection, so serving them in sequence would make a slow
                 // handler block every other request on that connection.
                 tokio::spawn(async move {
-                    if let Err(e) = serve_request(app, request, stream).await {
+                    if let Err(e) = serve_request(app, request, stream, peer).await {
                         tracing::debug!(error = %e, "http3 request failed");
                     }
                 });
@@ -222,6 +248,7 @@ async fn serve_request<S>(
     app: App,
     request: Request<()>,
     mut stream: h3::server::RequestStream<S, Bytes>,
+    peer: SocketAddr,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
 where
     S: h3::quic::BidiStream<Bytes>,
@@ -241,15 +268,30 @@ where
         }
     };
 
-    let response = app
-        .process_with_extensions(
-            parts.method.clone(),
-            normalise_uri(&parts.uri, &parts.method),
-            parts.headers.clone(),
-            body,
-            http::Extensions::new(),
-        )
-        .await;
+    let mut extensions = http::Extensions::new();
+    extensions.insert(crate::call::PeerAddr(peer));
+
+    let process = app.process_with_extensions(
+        parts.method.clone(),
+        normalise_uri(&parts.uri, &parts.method),
+        parts.headers.clone(),
+        body,
+        extensions,
+    );
+
+    // `request_timeout_ms` applies here too. It was never read on this path, so
+    // an h3 request could run without any deadline while the identical request
+    // over TCP was bounded.
+    let timeout_ms = app.config().request_timeout_ms;
+    let response = if timeout_ms == 0 {
+        process.await
+    } else {
+        match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), process).await {
+            Ok(res) => res,
+            Err(_) => crate::response::Response::text("Request Timeout")
+                .with_status(http::StatusCode::REQUEST_TIMEOUT),
+        }
+    };
 
     send_response(&mut stream, response, parts.method == Method::HEAD).await
 }

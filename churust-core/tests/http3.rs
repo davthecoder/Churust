@@ -125,6 +125,12 @@ fn app() -> churust_core::App {
             r.get("/missing-on-purpose", |_c: Call| async {
                 (StatusCode::NOT_FOUND, "nope")
             });
+            r.get("/whoami", |c: Call| async move {
+                match c.peer_addr() {
+                    Some(a) => format!("peer {}", a.ip()),
+                    None => "peer unknown".to_string(),
+                }
+            });
             r.get("/streamed", |_c: Call| async {
                 let chunks = futures_util::stream::iter(
                     (0..4).map(|i| Ok::<_, std::io::Error>(Bytes::from(format!("part{i} ")))),
@@ -222,5 +228,22 @@ async fn alt_svc_points_tcp_clients_at_h3() {
         client.get("/missing").send().await.header("alt-svc"),
         Some("h3=\":8443\"; ma=86400"),
         "a client that only ever sees an error should still learn about h3"
+    );
+}
+
+#[tokio::test]
+async fn the_peer_address_reaches_the_handler_over_h3() {
+    // The h3 path passed an empty extension map, so `Call::peer_addr` was
+    // always `None` — per-IP rate limiting keyed every h3 request as one
+    // client, and audit logs recorded nothing, while the same request over TCP
+    // carried the address. `advertise_http3` steers clients here, so the gap
+    // widened as h3 adoption grew.
+    let cert = self_signed();
+    let addr = serve(app(), &cert).await;
+    let (status, body) = request(addr, &cert, http::Method::GET, "/whoami", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.starts_with("peer 127.0.0.1"),
+        "the peer address did not reach the handler: {body}"
     );
 }

@@ -362,3 +362,62 @@ async fn a_handler_that_already_encoded_is_not_encoded_twice() {
     );
     assert_eq!(res.headers().get_all(VARY).iter().count(), 1);
 }
+
+mod range_consistency {
+    //! A compressed response must not advertise byte ranges.
+    //!
+    //! `StaticFiles` sets `Accept-Ranges: bytes` describing the identity file.
+    //! Compression replaces the body and drops `Content-Length`, but left that
+    //! header in place — so a client is told it may resume, and its
+    //! `Range: bytes=100-199` on the same URL comes back `206` with *identity*
+    //! bytes (`should_compress` correctly skips `206`) plus a `Content-Range`
+    //! whose total the client never received. The client splices plaintext into
+    //! a gzip stream and the resumed download is corrupt. nginx's gzip filter
+    //! clears `Accept-Ranges` for exactly this reason.
+
+    use churust_compression::Compression;
+    use churust_core::{Churust, Response, TestClient};
+    use http::header::{ACCEPT_ENCODING, ACCEPT_RANGES};
+    use http::HeaderValue;
+
+    fn app() -> churust_core::App {
+        Churust::server()
+            .install(Compression::new())
+            .routing(|r| {
+                // Stands in for StaticFiles: a body worth compressing, with the
+                // range advertisement a file response carries.
+                r.get("/file", |_c: churust_core::Call| async {
+                    Response::bytes("text/plain", "x".repeat(4096))
+                        .with_header(ACCEPT_RANGES, HeaderValue::from_static("bytes"))
+                });
+            })
+            .build()
+    }
+
+    #[tokio::test]
+    async fn a_compressed_response_does_not_advertise_ranges() {
+        let res = TestClient::new(app())
+            .get("/file")
+            .header(ACCEPT_ENCODING.as_str(), "gzip")
+            .send()
+            .await;
+        assert_eq!(res.header("content-encoding"), Some("gzip"));
+        assert_eq!(
+            res.header("accept-ranges"),
+            None,
+            "a compressed body must not claim its identity ranges are resumable"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_uncompressed_response_keeps_its_range_advertisement() {
+        // The header is only wrong once the body has been replaced.
+        let res = TestClient::new(app()).get("/file").send().await;
+        assert_eq!(res.header("content-encoding"), None);
+        assert_eq!(
+            res.header("accept-ranges"),
+            Some("bytes"),
+            "an identity response is genuinely resumable"
+        );
+    }
+}
