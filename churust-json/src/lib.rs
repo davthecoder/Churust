@@ -69,6 +69,12 @@ use std::sync::Arc;
 /// request body and attempts to deserialize it as JSON into `T`.  `T` must
 /// implement [`serde::de::DeserializeOwned`].
 ///
+/// The request must declare a JSON content type — `application/json`, or any
+/// `+json` structured suffix. Anything else is **415 Unsupported Media Type**,
+/// which is what keeps a cross-origin HTML form (whose three possible content
+/// types send no CORS preflight) from reaching a JSON handler with the
+/// visitor's cookies attached.
+///
 /// If the body is missing or malformed the framework returns an HTTP **400
 /// Bad Request** response automatically — the handler is never called.
 ///
@@ -91,6 +97,7 @@ use std::sync::Arc;
 ///
 /// let res = TestClient::new(app)
 ///     .post("/users")
+///     .header("content-type", "application/json")
 ///     .body(r#"{"username":"bob"}"#)
 ///     .send()
 ///     .await;
@@ -157,12 +164,46 @@ where
     T: DeserializeOwned + Send,
 {
     async fn from_call(mut call: Call) -> Result<Self> {
+        require_json_content_type(&call)?;
         let bytes = call.try_receive_bytes().await?;
         churust_core::check_body_limit(&call, bytes.len())?;
         let value = serde_json::from_slice::<T>(&bytes)
             .map_err(|e| Error::bad_request(format!("invalid JSON body: {e}")))?;
         Ok(Json(value))
     }
+}
+
+/// Refuse a body that is not declared as JSON.
+///
+/// Not merely tidiness. The three content types an HTML form can send —
+/// `text/plain`, `application/x-www-form-urlencoded`, `multipart/form-data` —
+/// make a *simple* cross-origin request: no preflight, so the CORS layer is
+/// never consulted, and the browser attaches the victim's cookies. Deserialising
+/// such a body as JSON makes every state-changing endpoint executable from any
+/// site the victim visits. Requiring a JSON type forces a preflight, which is
+/// what puts CORS back in the path.
+///
+/// `Form<T>` and `Multipart` have always done this; only the JSON path did not.
+///
+/// Structured suffixes (`application/problem+json`, `application/vnd.api+json`)
+/// are JSON by definition and are accepted — they cannot be produced by a form.
+fn require_json_content_type(call: &Call) -> Result<()> {
+    let raw = call
+        .header(http::header::CONTENT_TYPE.as_str())
+        .unwrap_or("");
+    // Compare the media type only: a charset parameter is legitimate.
+    let media = raw.split(';').next().unwrap_or("").trim();
+    let ok = media.eq_ignore_ascii_case("application/json")
+        || media
+            .rsplit_once('+')
+            .is_some_and(|(_, suffix)| suffix.eq_ignore_ascii_case("json"));
+    if ok {
+        return Ok(());
+    }
+    Err(Error::new(
+        http::StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "expected a JSON content type",
+    ))
 }
 
 impl<T> IntoResponse for Json<T>
@@ -396,6 +437,9 @@ pub trait CallJson {
 #[async_trait::async_trait]
 impl CallJson for churust_core::Call {
     async fn receive_json<T: serde::de::DeserializeOwned>(&mut self) -> churust_core::Result<T> {
+        // Same rule as the `Json<T>` extractor: the two must not disagree about
+        // what counts as a JSON request.
+        require_json_content_type(self)?;
         // `try_receive_bytes` and the route limit, matching the `Json<T>`
         // extractor. `receive_bytes` swallows a read error into an empty
         // payload, which turned an over-limit body into
@@ -456,8 +500,16 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_json_is_400() {
+        // Declared as JSON and malformed: the type was right, the content was
+        // not. A body with no declared type is a different failure — see
+        // `tests/content_type.rs` — and answers 415.
         let client = TestClient::new(app());
-        let res = client.post("/echo").body("not json").send().await;
+        let res = client
+            .post("/echo")
+            .header("content-type", "application/json")
+            .body("not json")
+            .send()
+            .await;
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 
