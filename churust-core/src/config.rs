@@ -68,6 +68,14 @@ pub struct ServerSection {
     /// This is the slow-loris defence: without it a client can hold a
     /// connection open indefinitely by dribbling one header byte at a time,
     /// because the per-request timeout does not start until there is a request.
+    ///
+    /// It covers both protocols, by different means. HTTP/1 gets a literal
+    /// deadline on the header block. HTTP/2 has no equivalent — a header block
+    /// arrives as frames on an already-open connection — so the same value
+    /// drives a keep-alive PING and the deadline for its acknowledgement,
+    /// which answers the equivalent question of whether the peer is still
+    /// there. A stalled h2 peer is therefore dropped within roughly twice this
+    /// value, and a live one with nothing to say answers the ping and stays.
     pub header_read_timeout_ms: u64,
     /// Maximum number of headers accepted on a request (default `100`).
     pub max_headers: usize,

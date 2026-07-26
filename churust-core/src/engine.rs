@@ -784,11 +784,25 @@ async fn serve_stream<I>(
     // there is no request until the header block is complete.
     if cfg.header_read_timeout_ms > 0 {
         // hyper panics if a timeout is configured without a timer to drive it.
+        let deadline = std::time::Duration::from_millis(cfg.header_read_timeout_ms);
         builder.http1().timer(hyper_util::rt::TokioTimer::new());
-        builder
-            .http1()
-            .header_read_timeout(std::time::Duration::from_millis(cfg.header_read_timeout_ms));
+        builder.http1().header_read_timeout(deadline);
         builder.http2().timer(hyper_util::rt::TokioTimer::new());
+        // HTTP/2 has no header-read deadline to set: a header block arrives in
+        // frames on an already-open connection, so hyper offers no equivalent
+        // knob. Its equivalent question — is this peer actually still there? —
+        // is answered by a keep-alive PING, which hyper leaves disabled by
+        // default. Without it the documented slow-loris defence covered only
+        // one of the two protocols served on the port: a peer that completed
+        // the preface and then dribbled a partial HEADERS frame was bounded by
+        // nothing but the idle watchdog, at `keep_alive_ms` rather than at the
+        // 10s this knob advertises, while holding a connection permit.
+        //
+        // Ping at the deadline, drop at the deadline again, so a stalled peer
+        // is gone within roughly twice the configured value and a live one that
+        // simply has nothing to say answers and stays.
+        builder.http2().keep_alive_interval(deadline);
+        builder.http2().keep_alive_timeout(deadline);
     }
 
     // The connection borrows the builder, which is the ownership problem the v1

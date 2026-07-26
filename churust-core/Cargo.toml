@@ -70,6 +70,9 @@ tokio-tungstenite = "0.26"
 # Self-signed certificates generated in-process, so the TLS serving path can be
 # tested without checking key material into the repository.
 rcgen = "0.13"
+# A real HTTP/2 client for the connection-bound tests. hyper already depends on
+# h2, so this names an existing tree entry rather than adding one.
+h2 = "0.4"
 # Hand-written layers in the tower-adapter tests, so those tests check the
 # adapter rather than someone else's middleware.
 tower-layer = "0.3"
