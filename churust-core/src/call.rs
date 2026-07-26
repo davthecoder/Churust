@@ -214,9 +214,16 @@ impl Call {
             .header(http::header::HOST.as_str())
             .map(str::to_string)
             .or_else(|| self.uri.authority().map(|a| a.as_str().to_string()))?;
-        // Strip any userinfo, then the port.
+        // Strip any userinfo first.
         let after_at = raw.rsplit('@').next().unwrap_or(&raw);
-        let host = after_at.split(':').next().unwrap_or(after_at);
+        // An IPv6 literal is bracketed and full of colons, so the port cannot
+        // be found by splitting on `:` — that yielded `"[2001"` and made every
+        // host comparison fail for v6. The brackets are authority syntax, so
+        // they come off with the port.
+        let host = match after_at.strip_prefix('[') {
+            Some(rest) => rest.split(']').next().unwrap_or(rest),
+            None => after_at.split(':').next().unwrap_or(after_at),
+        };
         (!host.is_empty()).then(|| host.to_string())
     }
 

@@ -97,6 +97,8 @@ pub struct ServerConfig {
     pub h2_max_header_list_size: u32,
     /// Maximum concurrent HTTP/2 streams per connection; `0` removes the limit.
     pub h2_max_concurrent_streams: u32,
+    /// WebSocket idle bound in milliseconds; `0` disables it (`ws` feature).
+    pub ws_idle_timeout_ms: u64,
     /// Maximum simultaneously served connections; `0` means unlimited.
     pub max_connections: usize,
     /// Maximum TLS handshakes in progress at once; `0` means unlimited.
@@ -125,6 +127,7 @@ impl Default for ServerConfig {
             path_policy: crate::path::PathPolicy::Strict,
             h2_max_header_list_size: 16 << 10,
             h2_max_concurrent_streams: 200,
+            ws_idle_timeout_ms: 300_000,
             max_connections: 25_000,
             max_tls_handshakes: 256,
             tls_handshake_timeout_ms: 10_000,
@@ -226,6 +229,7 @@ impl AppBuilder {
         self.config.path_policy = cfg.server.path_policy;
         self.config.h2_max_header_list_size = cfg.server.h2_max_header_list_size;
         self.config.h2_max_concurrent_streams = cfg.server.h2_max_concurrent_streams;
+        self.config.ws_idle_timeout_ms = cfg.server.ws_idle_timeout_ms;
         self.config.max_connections = cfg.server.max_connections;
         self.config.max_tls_handshakes = cfg.server.max_tls_handshakes;
         self.config.tls_handshake_timeout_ms = cfg.server.tls_handshake_timeout_ms;
@@ -312,6 +316,18 @@ impl AppBuilder {
     /// connection from becoming an unbounded amount of concurrent work.
     pub fn h2_max_concurrent_streams(mut self, n: u32) -> Self {
         self.config.h2_max_concurrent_streams = n;
+        self
+    }
+
+    /// Set how long an upgraded WebSocket may sit idle before it is closed
+    /// (default `300000` ms; `0` disables the bound).
+    ///
+    /// An upgraded socket holds a connection permit for its whole life, and no
+    /// HTTP-level timeout survives the upgrade — so without this a peer that
+    /// completes the handshake and then goes silent holds a permit until the
+    /// process restarts. Idle means no frame in either direction.
+    pub fn ws_idle_timeout_ms(mut self, ms: u64) -> Self {
+        self.config.ws_idle_timeout_ms = ms;
         self
     }
 

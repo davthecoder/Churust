@@ -124,6 +124,18 @@ pub struct ServerSection {
     /// the HTTP/2 stream-flood denial-of-service family. hyper's own docs
     /// encourage setting an explicit limit rather than inheriting its default.
     pub h2_max_concurrent_streams: u32,
+    /// How long an upgraded WebSocket may sit with no traffic in either
+    /// direction before it is closed, in milliseconds (default `300000`, five
+    /// minutes). `0` disables the bound. Requires the `ws` feature.
+    ///
+    /// An upgraded socket holds a connection permit for its whole life, and
+    /// none of the HTTP-level bounds survive the upgrade —
+    /// [`header_read_timeout_ms`](Self::header_read_timeout_ms) applies before
+    /// there is a WebSocket and [`request_timeout_ms`](Self::request_timeout_ms)
+    /// wraps a request that has already completed. Without this, a peer that
+    /// completes the handshake and then says nothing pins a permit until the
+    /// process restarts.
+    pub ws_idle_timeout_ms: u64,
     /// Maximum simultaneously served connections (default `25000`). `0` means
     /// unlimited.
     ///
@@ -180,6 +192,7 @@ impl Default for ServerSection {
             path_policy: crate::path::PathPolicy::Strict,
             h2_max_header_list_size: 16 << 10,
             h2_max_concurrent_streams: 200,
+            ws_idle_timeout_ms: 300_000,
             max_connections: 25_000,
             max_tls_handshakes: 256,
             tls_handshake_timeout_ms: 10_000,
@@ -304,6 +317,9 @@ impl Config {
             get("CHURUST_SERVER_H2_MAX_CONCURRENT_STREAMS").and_then(|s| s.parse().ok())
         {
             self.server.h2_max_concurrent_streams = v;
+        }
+        if let Some(v) = get("CHURUST_SERVER_WS_IDLE_TIMEOUT_MS").and_then(|s| s.parse().ok()) {
+            self.server.ws_idle_timeout_ms = v;
         }
         if let Some(v) = get("CHURUST_SERVER_MAX_CONNECTIONS").and_then(|s| s.parse().ok()) {
             self.server.max_connections = v;

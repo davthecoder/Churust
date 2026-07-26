@@ -856,9 +856,14 @@ async fn serve_stream<I>(
                     if !activity.busy() {
                         break;
                     }
-                    // A request arrived between the signal and now — rare, but
-                    // the grace period is the right bound for it, not this.
-                    lingering = false;
+                    // A request arrived between arming this and now — rare.
+                    // Re-check later rather than clearing `winding_down`, which
+                    // would let the shutdown branch fire again and turn this
+                    // into a 250ms cycle of repeated `graceful_shutdown` calls.
+                    // The grace period still bounds the wait overall.
+                    linger
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + GOAWAY_LINGER);
                 }
                 _ = idle.as_mut(), if idle_enabled && !winding_down => {
                     match activity.idle_for(cfg.keep_alive_ms) {
@@ -866,6 +871,19 @@ async fn serve_stream<I>(
                         None => {
                             winding_down = true;
                             conn.as_mut().graceful_shutdown();
+                            // Arm the linger here too. `graceful_shutdown` on an
+                            // HTTP/2 connection sends GOAWAY and then waits for
+                            // the peer, which an idle peer never answers — and
+                            // with `winding_down` set every other branch is
+                            // gated off, so the loop had nothing left to poll
+                            // but a future that never resolves. The connection
+                            // and its permit were then held for the life of the
+                            // process; at the default cap that is a server that
+                            // stops accepting anything at all.
+                            linger
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + GOAWAY_LINGER);
+                            lingering = true;
                         }
                         // Busy or recently active — wait out the remainder.
                         Some(remaining) => idle
@@ -936,6 +954,8 @@ async fn handle(
     #[cfg(feature = "ws")]
     let ws_max_message_bytes = app.config().ws_max_message_bytes;
     #[cfg(feature = "ws")]
+    let ws_idle_timeout_ms = app.config().ws_idle_timeout_ms;
+    #[cfg(feature = "ws")]
     let mut req = req;
     #[cfg(feature = "ws")]
     let on_upgrade = if crate::ws::is_upgrade_request(req.headers()) {
@@ -975,6 +995,7 @@ async fn handle(
             extensions.insert(crate::ws::OnUpgradeHandle::new(on_upgrade));
             // So the upgraded socket keeps this connection's budget share.
             extensions.insert(conn_guard.clone());
+            extensions.insert(crate::ws::WsIdleTimeout(ws_idle_timeout_ms));
             extensions.insert(crate::ws::WsLimits {
                 max_frame_bytes: ws_max_frame_bytes,
                 max_message_bytes: ws_max_message_bytes,
