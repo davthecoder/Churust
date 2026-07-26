@@ -8,11 +8,13 @@ use churust_core::{Call, Churust};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-fn free_addr() -> std::net::SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+/// Bind an ephemeral port and keep the listener, so nothing can take the port
+/// between discovering it and serving on it. Dropping it first is a race that
+/// shows up as one test's client reaching another test's server.
+async fn bound() -> (tokio::net::TcpListener, std::net::SocketAddr) {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
-    drop(l);
-    addr
+    (l, addr)
 }
 
 /// Send a request and read the first chunk of the response.
@@ -26,7 +28,7 @@ async fn request(sock: &mut tokio::net::TcpStream, path: &str) -> std::io::Resul
 
 #[tokio::test]
 async fn connections_beyond_the_cap_wait_rather_than_being_served() {
-    let addr = free_addr();
+    let (l, addr) = bound().await;
     let app = Churust::server()
         .max_connections(1)
         // Long enough that the first connection is unambiguously still holding
@@ -38,7 +40,7 @@ async fn connections_beyond_the_cap_wait_rather_than_being_served() {
         .build();
     let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
-        churust_core::engine::serve(app, addr, async {
+        churust_core::engine::serve_on(app, l, async {
             let _ = rx.await;
         })
         .await
@@ -69,7 +71,7 @@ async fn connections_beyond_the_cap_wait_rather_than_being_served() {
 
 #[tokio::test]
 async fn zero_means_unlimited() {
-    let addr = free_addr();
+    let (l, addr) = bound().await;
     let app = Churust::server()
         .max_connections(0)
         .routing(|r| {
@@ -78,7 +80,7 @@ async fn zero_means_unlimited() {
         .build();
     let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
-        churust_core::engine::serve(app, addr, async {
+        churust_core::engine::serve_on(app, l, async {
             let _ = rx.await;
         })
         .await
@@ -106,7 +108,7 @@ async fn shutdown_works_while_the_connection_budget_is_saturated() {
     // shutdown race meant a saturated server never noticed SIGTERM and had to
     // be SIGKILLed — a worse failure than the unbounded drain the budget was
     // added alongside.
-    let addr = free_addr();
+    let (l, addr) = bound().await;
     let app = Churust::server()
         .max_connections(1)
         .keep_alive_ms(60_000)
@@ -118,7 +120,7 @@ async fn shutdown_works_while_the_connection_budget_is_saturated() {
 
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(async move {
-        churust_core::engine::serve(app, addr, async {
+        churust_core::engine::serve_on(app, l, async {
             let _ = rx.await;
         })
         .await
@@ -164,7 +166,14 @@ async fn serve_many_refuses_to_start_when_any_address_fails_to_bind() {
     // addresses that worked, reported nothing, and surfaced the error only on
     // the way out. A server that silently came up on half its addresses is
     // exactly what this is supposed to prevent.
-    let good = free_addr();
+    // `serve_many` binds the addresses itself, so this one genuinely needs a
+    // free address rather than a live listener.
+    let good = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let a = probe.local_addr().unwrap();
+        drop(probe);
+        a
+    };
     // 192.0.2.0/24 is TEST-NET-1 (RFC 5737) and is not assigned locally.
     let bad: std::net::SocketAddr = "192.0.2.1:9".parse().unwrap();
 

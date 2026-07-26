@@ -84,6 +84,41 @@ where
     serve_listener(app, listener, limits, shutdown).await
 }
 
+/// Serve `app` on an already-bound listener until `shutdown` resolves.
+///
+/// Use this when the port must be known before the server starts — a test that
+/// needs the address, a socket passed in by a supervisor, or anything binding
+/// under its own policy.
+///
+/// It also closes a race that [`serve`] cannot: discovering a free port by
+/// binding, dropping, and letting `serve` bind again leaves a window in which
+/// something else can take it. Handing over the listener removes the window.
+///
+/// ```no_run
+/// use churust_core::{Churust, Call, engine};
+/// # tokio::runtime::Runtime::new().unwrap().block_on(async {
+/// let app = Churust::server()
+///     .routing(|r| { r.get("/", |_c: Call| async { "hi" }); })
+///     .build();
+/// let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+/// let addr = listener.local_addr()?;
+/// println!("listening on {addr}");
+/// engine::serve_on(app, listener, async { let _ = tokio::signal::ctrl_c().await; }).await?;
+/// # Ok::<(), std::io::Error>(())
+/// # });
+/// ```
+pub async fn serve_on<F>(
+    app: App,
+    listener: tokio::net::TcpListener,
+    shutdown: F,
+) -> std::io::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let limits = std::sync::Arc::new(AcceptLimits::from(app.config()));
+    serve_listener(app, listener, limits, shutdown).await
+}
+
 /// Bind one address, with the backlog and socket options Churust wants.
 ///
 /// Separate from serving so several addresses can be bound *before* any accept

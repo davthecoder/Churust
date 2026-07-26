@@ -847,6 +847,39 @@ impl App {
         crate::engine::serve(self, addr, shutdown).await
     }
 
+    /// Serve on an already-bound listener until `shutdown` resolves.
+    ///
+    /// The counterpart to [`start_with_shutdown`](App::start_with_shutdown) for
+    /// callers that must know the port before the server runs — a supervisor
+    /// passing a socket in, or a test that needs the address.
+    ///
+    /// It also closes a race the address-based entry points cannot: finding a
+    /// free port by binding, dropping, and letting the server bind again leaves
+    /// a window for something else to claim it. Handing over the listener
+    /// removes the window.
+    ///
+    /// ```no_run
+    /// use churust_core::{Churust, Call};
+    /// # async fn f() -> std::io::Result<()> {
+    /// let app = Churust::server()
+    ///     .routing(|r| { r.get("/", |_c: Call| async { "hi" }); })
+    ///     .build();
+    /// let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    /// println!("listening on {}", listener.local_addr()?);
+    /// app.start_on(listener, async { let _ = tokio::signal::ctrl_c().await; }).await
+    /// # }
+    /// ```
+    pub async fn start_on<F>(
+        self,
+        listener: tokio::net::TcpListener,
+        shutdown: F,
+    ) -> std::io::Result<()>
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        crate::engine::serve_on(self, listener, shutdown).await
+    }
+
     /// Serve on a Unix domain socket until Ctrl-C, then drain.
     #[cfg(unix)]
     pub async fn start_unix(self, path: impl AsRef<std::path::Path>) -> std::io::Result<()> {

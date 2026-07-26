@@ -298,7 +298,6 @@ async fn chunking_the_body_does_not_change_what_is_parsed() {
     // being handed over in one buffer.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    drop(listener);
 
     let app = Churust::server()
         .host("127.0.0.1")
@@ -317,7 +316,7 @@ async fn chunking_the_body_does_not_change_what_is_parsed() {
         .build();
 
     tokio::spawn(async move {
-        let _ = app.start().await;
+        let _ = app.start_on(listener, std::future::pending()).await;
     });
     for _ in 0..50 {
         if tokio::net::TcpStream::connect(("127.0.0.1", port))
@@ -373,7 +372,6 @@ async fn the_server_wide_body_cap_still_applies() {
     // in-process client would accept a body the real server refuses.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    drop(listener);
 
     let app = Churust::server()
         .host("127.0.0.1")
@@ -393,7 +391,7 @@ async fn the_server_wide_body_cap_still_applies() {
         .build();
 
     tokio::spawn(async move {
-        let _ = app.start().await;
+        let _ = app.start_on(listener, std::future::pending()).await;
     });
     for _ in 0..50 {
         if tokio::net::TcpStream::connect(("127.0.0.1", port))

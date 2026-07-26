@@ -8,12 +8,13 @@ use churust_core::{Call, Churust};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// Bind an ephemeral port and release it, so the engine can claim the address.
-fn free_addr() -> std::net::SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+/// Bind an ephemeral port and keep the listener, so nothing can take the port
+/// between discovering it and serving on it. Dropping it first is a race that
+/// shows up as one test's client reaching another test's server.
+async fn bound() -> (tokio::net::TcpListener, std::net::SocketAddr) {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
-    drop(l);
-    addr
+    (l, addr)
 }
 
 /// A server whose `/slow` handler takes `handler_ms` to answer.
@@ -31,13 +32,13 @@ fn slow_app(handler_ms: u64, shutdown_timeout_ms: u64) -> churust_core::App {
 
 #[tokio::test]
 async fn an_in_flight_request_completes_before_serve_returns() {
-    let addr = free_addr();
+    let (l, addr) = bound().await;
     // Generous grace: the point is that the drain waits, not that it gives up.
     let app = slow_app(800, 5_000);
 
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(async move {
-        churust_core::engine::serve(app, addr, async {
+        churust_core::engine::serve_on(app, l, async {
             let _ = rx.await;
         })
         .await
@@ -82,12 +83,12 @@ async fn an_idle_connection_does_not_hold_shutdown_for_the_grace_period() {
     // by sending GOAWAY and waiting for the *peer* to close, which an idle peer
     // never does. Without a bound on that wait, every shutdown costs the full
     // grace period and a rolling restart pays it on every instance.
-    let addr = free_addr();
+    let (l, addr) = bound().await;
     let app = slow_app(10, 30_000);
 
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(async move {
-        churust_core::engine::serve(app, addr, async {
+        churust_core::engine::serve_on(app, l, async {
             let _ = rx.await;
         })
         .await
@@ -122,13 +123,13 @@ async fn an_idle_connection_does_not_hold_shutdown_for_the_grace_period() {
 
 #[tokio::test]
 async fn the_drain_gives_up_after_the_configured_grace_period() {
-    let addr = free_addr();
+    let (l, addr) = bound().await;
     // A handler far slower than the grace period: the drain must abandon it.
     let app = slow_app(5_000, 200);
 
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(async move {
-        churust_core::engine::serve(app, addr, async {
+        churust_core::engine::serve_on(app, l, async {
             let _ = rx.await;
         })
         .await

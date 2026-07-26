@@ -17,11 +17,13 @@ use churust_core::{Call, Churust};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-fn free_addr() -> std::net::SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+/// Bind an ephemeral port and keep the listener, so nothing can take the port
+/// between discovering it and serving on it. Dropping it first is a race that
+/// shows up as one test's client reaching another test's server.
+async fn bound() -> (tokio::net::TcpListener, std::net::SocketAddr) {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
-    drop(l);
-    addr
+    (l, addr)
 }
 
 // ---------------------------------------------------------------- 1. host()
@@ -97,7 +99,7 @@ async fn a_host_guard_matches_an_ipv6_request() {
 
 #[tokio::test]
 async fn an_idle_http2_connection_is_closed_and_returns_its_permit() {
-    let addr = free_addr();
+    let (l, addr) = bound().await;
     let app = Churust::server()
         .max_connections(1)
         .keep_alive_ms(400)
@@ -107,7 +109,7 @@ async fn an_idle_http2_connection_is_closed_and_returns_its_permit() {
         .build();
     let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
-        churust_core::engine::serve(app, addr, async {
+        churust_core::engine::serve_on(app, l, async {
             let _ = rx.await;
         })
         .await
@@ -147,7 +149,7 @@ async fn an_idle_http2_connection_is_closed_and_returns_its_permit() {
 async fn a_silent_websocket_does_not_pin_a_permit_forever() {
     use churust_core::ws::WebSocketUpgrade;
 
-    let addr = free_addr();
+    let (l, addr) = bound().await;
     let app = Churust::server()
         .max_connections(1)
         .ws_idle_timeout_ms(500)
@@ -168,7 +170,7 @@ async fn a_silent_websocket_does_not_pin_a_permit_forever() {
         .build();
     let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
-        churust_core::engine::serve(app, addr, async {
+        churust_core::engine::serve_on(app, l, async {
             let _ = rx.await;
         })
         .await
@@ -200,7 +202,7 @@ async fn an_active_websocket_is_not_reaped() {
     use churust_core::ws::{Message, WebSocketUpgrade};
     use futures_util::{SinkExt, StreamExt};
 
-    let addr = free_addr();
+    let (l, addr) = bound().await;
     let app = Churust::server()
         .ws_idle_timeout_ms(400)
         .routing(|r| {
@@ -220,7 +222,7 @@ async fn an_active_websocket_is_not_reaped() {
         .build();
     let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
-        churust_core::engine::serve(app, addr, async {
+        churust_core::engine::serve_on(app, l, async {
             let _ = rx.await;
         })
         .await

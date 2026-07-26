@@ -10,16 +10,18 @@ use churust_core::{Call, Churust};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-fn free_addr() -> std::net::SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+/// Bind an ephemeral port and keep the listener, so nothing can take the port
+/// between discovering it and serving on it. Dropping it first is a race that
+/// shows up as one test's client reaching another test's server.
+async fn bound() -> (tokio::net::TcpListener, std::net::SocketAddr) {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
-    drop(l);
-    addr
+    (l, addr)
 }
 
 /// Serve an echo-length app, send `raw` verbatim, and read what comes back.
 async fn exchange(raw: &[u8]) -> String {
-    let addr = free_addr();
+    let (l, addr) = bound().await;
     let app = Churust::server()
         .routing(|r| {
             r.post("/echo", |body: String| async move {
@@ -30,7 +32,7 @@ async fn exchange(raw: &[u8]) -> String {
         .build();
     let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
-        churust_core::engine::serve(app, addr, async {
+        churust_core::engine::serve_on(app, l, async {
             let _ = rx.await;
         })
         .await

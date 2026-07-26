@@ -14,9 +14,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[tokio::test]
 async fn a_stalled_http2_peer_is_dropped_by_the_header_read_deadline() {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
-    drop(l);
 
     let app = Churust::server()
         .header_read_timeout_ms(400)
@@ -29,7 +28,7 @@ async fn a_stalled_http2_peer_is_dropped_by_the_header_read_deadline() {
         .build();
     let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
-        churust_core::engine::serve(app, addr, async {
+        churust_core::engine::serve_on(app, l, async {
             let _ = rx.await;
         })
         .await
@@ -70,9 +69,8 @@ async fn a_stalled_http2_peer_is_dropped_by_the_header_read_deadline() {
 #[tokio::test]
 async fn a_responsive_http2_client_is_not_dropped() {
     // The bound must reach a dead peer, not a quiet one that is still there.
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
-    drop(l);
 
     let app = Churust::server()
         .header_read_timeout_ms(300)
@@ -83,7 +81,7 @@ async fn a_responsive_http2_client_is_not_dropped() {
         .build();
     let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
-        churust_core::engine::serve(app, addr, async {
+        churust_core::engine::serve_on(app, l, async {
             let _ = rx.await;
         })
         .await

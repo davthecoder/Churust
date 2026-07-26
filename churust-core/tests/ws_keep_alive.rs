@@ -12,9 +12,8 @@ use std::time::Duration;
 
 #[tokio::test]
 async fn a_quiet_websocket_outlives_the_keep_alive_period() {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
-    drop(l);
 
     let app = Churust::server()
         .keep_alive_ms(300) // deliberately tiny
@@ -36,7 +35,7 @@ async fn a_quiet_websocket_outlives_the_keep_alive_period() {
 
     let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
-        churust_core::engine::serve(app, addr, async {
+        churust_core::engine::serve_on(app, l, async {
             let _ = rx.await;
         })
         .await

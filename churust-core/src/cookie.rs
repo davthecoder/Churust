@@ -101,10 +101,10 @@ impl Cookie {
         let mut out = String::new();
         let _ = write!(out, "{}={}", encode(&self.name), encode(&self.value));
         if let Some(p) = &self.path {
-            let _ = write!(out, "; Path={p}");
+            let _ = write!(out, "; Path={}", attribute_value(p));
         }
         if let Some(d) = &self.domain {
-            let _ = write!(out, "; Domain={d}");
+            let _ = write!(out, "; Domain={}", attribute_value(d));
         }
         if let Some(m) = self.max_age {
             let _ = write!(out, "; Max-Age={m}");
@@ -120,6 +120,25 @@ impl Cookie {
         }
         out
     }
+}
+
+/// Strip anything from an attribute value that would change the structure of
+/// the header.
+///
+/// RFC 6265's `av-octet` is any CHAR except CTLs and `;`, and both exclusions
+/// matter here. A `;` starts a new attribute, so an application scoping a
+/// cookie with `.path(format!("/u/{slug}"))` and a hostile slug could append
+/// `Max-Age=0` and delete the victim's session — or set `Secure`, a `Domain`,
+/// or a second `Path`. A CR or LF is header injection outright, and previously
+/// made `HeaderValue::from_str` reject the whole value, so the `Set-Cookie` was
+/// dropped silently and the session was simply never issued.
+///
+/// Stripping rather than refusing: dropping the attribute would *widen* the
+/// cookie's scope, which is the more dangerous failure of the two.
+fn attribute_value(raw: &str) -> String {
+    raw.chars()
+        .filter(|c| *c != ';' && !c.is_control())
+        .collect()
 }
 
 /// Percent-encode anything that would change the meaning of the header.

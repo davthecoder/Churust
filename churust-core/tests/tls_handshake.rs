@@ -10,11 +10,13 @@ use churust_core::{Call, Churust};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-fn free_addr() -> std::net::SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+/// Bind an ephemeral port and keep the listener, so nothing can take the port
+/// between discovering it and serving on it. Dropping it first is a race that
+/// shows up as one test's client reaching another test's server.
+async fn bound() -> (tokio::net::TcpListener, std::net::SocketAddr) {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
-    drop(l);
-    addr
+    (l, addr)
 }
 
 /// Write a throwaway self-signed cert and key, returning their paths.
@@ -43,7 +45,7 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
 async fn a_stalled_handshake_is_dropped_at_the_deadline() {
     let dir = temp_dir("stall");
     let (cert, key) = self_signed(&dir);
-    let addr = free_addr();
+    let (l, addr) = bound().await;
 
     let app = Churust::server()
         .tls(cert, key)
@@ -54,7 +56,7 @@ async fn a_stalled_handshake_is_dropped_at_the_deadline() {
         .build();
     let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
-        churust_core::engine::serve(app, addr, async {
+        churust_core::engine::serve_on(app, l, async {
             let _ = rx.await;
         })
         .await
@@ -94,7 +96,7 @@ async fn a_real_tls_request_still_works() {
     // the whole test above passes trivially if TLS never works at all.
     let dir = temp_dir("ok");
     let (cert, key) = self_signed(&dir);
-    let addr = free_addr();
+    let (l, addr) = bound().await;
 
     let app = Churust::server()
         .tls(cert.clone(), key)
@@ -104,7 +106,7 @@ async fn a_real_tls_request_still_works() {
         .build();
     let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
-        churust_core::engine::serve(app, addr, async {
+        churust_core::engine::serve_on(app, l, async {
             let _ = rx.await;
         })
         .await

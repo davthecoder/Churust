@@ -12,15 +12,14 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 async fn serve_app(app: churust_core::App) -> std::net::SocketAddr {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
-    drop(l);
     // The sender must outlive this function: dropping it resolves `rx` and
     // shuts the server down before the test has connected.
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     std::mem::forget(tx);
     tokio::spawn(async move {
-        churust_core::engine::serve(app, addr, async {
+        churust_core::engine::serve_on(app, l, async {
             let _ = rx.await;
         })
         .await

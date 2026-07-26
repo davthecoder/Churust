@@ -270,9 +270,8 @@ async fn range_response_is_well_formed_on_the_wire() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let root = tree("wire");
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    drop(listener);
 
     let root2 = root.clone();
     let app = Churust::server()
@@ -285,7 +284,7 @@ async fn range_response_is_well_formed_on_the_wire() {
 
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(async move {
-        app.start_with_shutdown(async move {
+        app.start_on(listener, async move {
             let _ = rx.await;
         })
         .await

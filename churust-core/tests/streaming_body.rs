@@ -73,9 +73,8 @@ async fn buffering_extractors_still_work() {
 /// consumed incrementally over a real socket.
 #[tokio::test]
 async fn a_large_body_streams_over_a_socket_in_several_chunks() {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    drop(listener);
 
     let app = Churust::server()
         .host(addr.ip().to_string())
@@ -101,7 +100,7 @@ async fn a_large_body_streams_over_a_socket_in_several_chunks() {
 
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(async move {
-        app.start_with_shutdown(async move {
+        app.start_on(listener, async move {
             let _ = rx.await;
         })
         .await

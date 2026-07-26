@@ -14,9 +14,8 @@ async fn serve() -> (
     tokio::sync::oneshot::Sender<()>,
     tokio::task::JoinHandle<()>,
 ) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    drop(listener);
 
     let app = Churust::server()
         .host(addr.ip().to_string())
@@ -28,7 +27,7 @@ async fn serve() -> (
 
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
-        app.start_with_shutdown(async move {
+        app.start_on(listener, async move {
             let _ = rx.await;
         })
         .await

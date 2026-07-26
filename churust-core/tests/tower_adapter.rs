@@ -233,9 +233,8 @@ async fn a_buffered_response_keeps_its_content_length_through_a_layer() {
     // exact size of an already-buffered body, so every response through any
     // layer -- even Identity -- lost Content-Length and was chunked instead.
     // Driven over a real socket: TestClient never sees the framing.
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
-    drop(l);
 
     let app = Churust::server()
         .install(TowerMiddleware::new(tower_layer::Identity::new()))
@@ -245,7 +244,7 @@ async fn a_buffered_response_keeps_its_content_length_through_a_layer() {
         .build();
     let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
-        churust_core::engine::serve(app, addr, async {
+        churust_core::engine::serve_on(app, l, async {
             let _ = rx.await;
         })
         .await
