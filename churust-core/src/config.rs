@@ -48,6 +48,12 @@ pub struct ServerSection {
     /// Maximum accepted request body size in bytes (default `1 MiB`). Larger
     /// bodies are rejected with `413 Payload Too Large`.
     ///
+    /// A body whose `Content-Length` exceeds this is refused before the request
+    /// is dispatched, so a handler that never reads the body cannot serve one
+    /// anyway. A chunked body declares no length, so it is bounded as it is
+    /// read — which means a handler that ignores a chunked body will not notice
+    /// the cap. Reject on `Transfer-Encoding` explicitly if that matters.
+    ///
     /// Raise [`request_timeout_ms`](Self::request_timeout_ms) alongside it: the
     /// per-request timeout spans the upload, so a generous size cap paired with
     /// a short timeout rejects large-but-legitimate transfers part-way through.

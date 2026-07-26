@@ -932,6 +932,37 @@ async fn handle(
     peer: std::net::SocketAddr,
     conn_guard: ConnGuard,
 ) -> Result<HyperResponse<UnsyncBoxBody<Bytes, std::io::Error>>, Infallible> {
+    // Refuse a body the client has already declared too large, before the
+    // request is dispatched.
+    //
+    // Streaming made the cap lazy: `Limited` only trips when something reads
+    // the body, so a handler that ignores it — or middleware that
+    // short-circuits before an extractor runs — answered `200` for a request
+    // the server had declared it would refuse. `Content-Length` is the client's
+    // own statement of size, so this costs one header lookup and needs no
+    // buffering. A chunked body still declares nothing and remains bounded by
+    // the stream limit at the point it is read.
+    if let Some(declared) = req
+        .headers()
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        if declared > max_body as u64 {
+            let res = HyperResponse::builder()
+                .status(StatusCode::PAYLOAD_TOO_LARGE)
+                // Nothing will read the body, so the connection cannot be
+                // reused: whatever the client is still sending would be read as
+                // the next request.
+                .header(http::header::CONNECTION, "close")
+                .body(into_boxed_body(Body::Bytes(bytes::Bytes::from_static(
+                    b"Payload Too Large",
+                ))))
+                .expect("response build is infallible");
+            return Ok(res);
+        }
+    }
+
     // Only the WebSocket branch below consumes this. Discarded explicitly
     // rather than silencing the whole function, which would also hide a
     // genuinely unused variable.
