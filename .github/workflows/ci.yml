@@ -38,8 +38,20 @@ jobs:
       - name: Clippy (workspace, default features)
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
-      - name: Clippy (umbrella, all plugins)
-        run: cargo clippy --locked -p churust --all-targets --features full -- -D warnings
+      # `--all-features` rather than `--features full`. `full` is the plugin
+      # set and deliberately stops short of openapi, redis, client, client-tls,
+      # multipart and http3, so the re-exports those gate — `pub use
+      # churust_openapi as openapi;` and its neighbours in churust/src/lib.rs,
+      # plus the prelude's `RedisStore` and `multipart::{..}` — were compiled by
+      # no step in this matrix, while docs.rs builds the crate with
+      # `all-features = true`. Renaming a re-exported item stayed green here and
+      # broke for whoever turned the feature on. Widening this step rather than
+      # adding one keeps the bill near zero: the third-party half of that
+      # feature set is already in the cache from the workspace step above, so
+      # the widening re-checks sixteen crates — a couple of seconds — and the
+      # core and plugin-crate steps below then reuse what it built.
+      - name: Clippy (umbrella, every feature)
+        run: cargo clippy --locked -p churust --all-targets --all-features -- -D warnings
 
       - name: Clippy (core, every feature)
         run: cargo clippy --locked -p churust-core --all-targets --all-features -- -D warnings
@@ -77,7 +89,15 @@ jobs:
       - name: Build examples
         run: cargo build --locked -p hello -p api
 
+      # Also `--all-features`, and for the same reason: every crate here carries
+      # `all-features = true` under `[package.metadata.docs.rs]`, so a default
+      # feature build documents something narrower than what readers are served.
+      # A broken intra-doc link or a missing-docs item behind an off-by-default
+      # feature is invisible to this step otherwise and turns up on the
+      # published page, where it can no longer be fixed without a release. By
+      # this point in the job every one of those features has been compiled
+      # already, so the wider build measures a few seconds.
       - name: Docs
-        run: cargo doc --locked --workspace --no-deps
+        run: cargo doc --locked --workspace --all-features --no-deps
         env:
           RUSTDOCFLAGS: "-D warnings"

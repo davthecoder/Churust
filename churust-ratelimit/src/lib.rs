@@ -43,10 +43,26 @@
 //!
 //! # Choosing a key
 //!
-//! The default key is the connection's peer IP, without the port, so several
-//! connections from one client share a bucket. Behind a reverse proxy that IP
-//! is the proxy, which would put every visitor in one bucket. Use
-//! [`RateLimit::by`] there, and read a forwarding header only after checking
+//! The default key is the connection's peer address, without the port, so
+//! several connections from one client share a bucket. An IPv4 peer is keyed on
+//! the whole address; an IPv6 peer is keyed on its /64 prefix, because the low
+//! 64 bits of an IPv6 address are the interface identifier and the host picks
+//! those itself. Without the mask, a peer that walks its own subnet gets a
+//! fresh allowance per address and is never limited at all, and even an honest
+//! client rotating privacy addresses drifts out of its bucket. The cost of the
+//! mask is that hosts which genuinely share one /64 share a budget; if that is
+//! wrong for your deployment, key on the full address yourself:
+//!
+//! ```
+//! use churust_ratelimit::RateLimit;
+//!
+//! let limiter = RateLimit::per_minute(60)
+//!     .by(|call| call.peer_addr().map(|addr| addr.ip().to_string()));
+//! ```
+//!
+//! Behind a reverse proxy the peer address is the proxy, which would put every
+//! visitor in one bucket. Use [`RateLimit::by`] there too, and read a
+//! forwarding header only after checking
 //! [`Call::peer_addr`](churust_core::Call::peer_addr) against proxies you
 //! actually trust. `X-Forwarded-For` is caller-supplied and trivially spoofed.
 //!
@@ -61,6 +77,7 @@ use http::{HeaderValue, StatusCode};
 use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
 use std::hash::BuildHasher;
+use std::net::{IpAddr, Ipv6Addr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -313,8 +330,8 @@ impl RateLimit {
     }
 }
 
-/// The peer IP without its port, so several connections from one client share a
-/// bucket.
+/// The peer address without its port, so several connections from one client
+/// share a bucket.
 ///
 /// A call with no peer address (the in-process test client, or a transport that
 /// does not carry one) falls into a single shared bucket rather than being
@@ -322,9 +339,52 @@ impl RateLimit {
 /// the limiter.
 fn default_key(call: &Call) -> Option<String> {
     Some(match call.peer_addr() {
-        Some(addr) => addr.ip().to_string(),
+        Some(addr) => address_bucket(addr.ip()),
         None => "unknown".to_string(),
     })
+}
+
+/// The bucket an address belongs to: the whole address for IPv4, the /64 prefix
+/// for IPv6.
+///
+/// Keying on the full IPv6 address was the obvious reading of "one bucket per
+/// client" and it was the wrong one, because an IPv6 address does not name a
+/// client the way an IPv4 address does. The smallest allocation anybody is
+/// delegated is a /64 — RFC 4291 §2.5.1 spends the low half of every unicast
+/// address on an interface identifier, and SLAAC has the host mint those itself
+/// — so the low 64 bits are chosen by the peer, for free, as often as it likes.
+/// That broke the limiter in both directions. An attacker took a fresh address
+/// per request and never met a 429, because every request missed the table,
+/// defaulted its arrival time to `now` and conformed; and an ordinary laptop
+/// running RFC 8981 temporary addresses silently earned a new allowance every
+/// time it rotated. Masking to the /64 keys on the part of the address that is
+/// routed to the peer rather than the part the peer writes itself, which is the
+/// only half that costs anything to change.
+///
+/// A /64 and no coarser. Aggregating to a /56 or /48 would bucket by delegation
+/// rather than by subnet, and delegation sizes are a matter of ISP taste, so it
+/// would fold strangers together at some providers to catch a rotation that a
+/// /64 already catches. The residual is that hosts sharing one provider's /64 —
+/// virtual machines handed single addresses out of a rack prefix, say — share a
+/// bucket; that is the trade IPv4 has always made behind NAT, and a deployment
+/// that cannot afford it keys on something else with [`RateLimit::by`].
+///
+/// IPv4-mapped addresses are unwrapped before any of that. A dual-stack
+/// listener reports IPv4 peers as `::ffff:a.b.c.d`, and every one of those sits
+/// in `::ffff:0:0/96` — inside a single /64 — so masking them would have put
+/// the entire IPv4 internet in one bucket and turned the fix into a far worse
+/// defect than the one it repairs.
+fn address_bucket(ip: IpAddr) -> String {
+    let v6 = match ip {
+        IpAddr::V4(v4) => return v4.to_string(),
+        IpAddr::V6(v6) => v6,
+    };
+    if let Some(v4) = v6.to_ipv4_mapped() {
+        return v4.to_string();
+    }
+    let mut octets = v6.octets();
+    octets[8..].fill(0);
+    Ipv6Addr::from(octets).to_string()
 }
 
 #[async_trait]
@@ -430,6 +490,52 @@ mod tests {
             "the table retained the key's {} bytes instead of a fixed-width \
              digest, so a caller picks the cost of its own bucket",
             long.len()
+        );
+    }
+
+    #[test]
+    fn a_client_rotating_through_one_ipv6_subnet_gets_no_extra_budget() {
+        let limiter = RateLimit::per(2, Duration::from_secs(30));
+        let rotate = |suffix: &str| {
+            let ip: IpAddr = format!("2001:db8:1:2::{suffix}").parse().unwrap();
+            limiter.check(&address_bucket(ip))
+        };
+        assert!(rotate("1").is_ok());
+        assert!(rotate("2").is_ok());
+        assert!(
+            rotate("3").is_err(),
+            "a new address out of the same /64 is the same client and must not \
+             reset the budget"
+        );
+    }
+
+    #[test]
+    fn separate_ipv6_subnets_keep_separate_budgets() {
+        let one: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let other: IpAddr = "2001:db8:1:3::1".parse().unwrap();
+        assert_ne!(
+            address_bucket(one),
+            address_bucket(other),
+            "different /64s are different networks"
+        );
+    }
+
+    #[test]
+    fn an_ipv4_peer_keeps_every_octet() {
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        assert_eq!(address_bucket(ip), "203.0.113.7");
+    }
+
+    #[test]
+    fn an_ipv4_mapped_peer_is_bucketed_as_the_address_it_carries() {
+        let mapped: IpAddr = "::ffff:203.0.113.7".parse().unwrap();
+        let neighbour: IpAddr = "::ffff:203.0.113.8".parse().unwrap();
+        assert_eq!(address_bucket(mapped), "203.0.113.7");
+        assert_ne!(
+            address_bucket(mapped),
+            address_bucket(neighbour),
+            "a dual-stack socket reports IPv4 peers inside one /64, so masking \
+             them would put the whole IPv4 internet in a single bucket"
         );
     }
 
