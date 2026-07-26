@@ -39,7 +39,10 @@
 #![deny(missing_docs)]
 
 use bytes::Bytes;
-use http::header::{HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE, LOCATION, USER_AGENT};
+use http::header::{
+    HeaderName, HeaderValue, AUTHORIZATION, CONTENT_TYPE, COOKIE, LOCATION, PROXY_AUTHORIZATION,
+    USER_AGENT,
+};
 use http::{HeaderMap, Method, Request, StatusCode, Uri};
 use http_body_util::{BodyExt, Full, Limited};
 use hyper_util::client::legacy::Client as HyperClient;
@@ -371,11 +374,19 @@ impl RequestBuilder {
             body,
             ..
         } = self;
+        // Mutable because a cross-origin redirect drops credentials from it.
+        let mut headers = headers;
 
         let mut uri: Uri = url.parse().map_err(|e| ClientError::Url(format!("{e}")))?;
         let mut method = method;
         let mut body = body;
         let mut hops = 0usize;
+
+        // Header names dropped for the remainder of this exchange because a
+        // redirect crossed an origin. Recorded rather than merely removed,
+        // since the default headers are re-applied on every hop.
+        let mut stripped: std::collections::HashSet<http::HeaderName> =
+            std::collections::HashSet::new();
 
         loop {
             check_scheme(&uri)?;
@@ -388,6 +399,11 @@ impl RequestBuilder {
 
             let target = request.headers_mut();
             for (name, value) in &client.default_headers {
+                // A default header is still a credential if it is one, and the
+                // loop re-applies these on every hop.
+                if stripped.contains(name) {
+                    continue;
+                }
                 target.insert(name, value.clone());
             }
             for (name, value) in &headers {
@@ -423,7 +439,28 @@ impl RequestBuilder {
                     .and_then(|v| v.to_str().ok())
                     .map(|v| v.to_string())
                 {
+                    let previous = uri.clone();
                     uri = resolve(&uri, &next)?;
+                    // A credential is scoped to the origin it was issued for.
+                    // Re-sending it because a server said `Location:` hands it
+                    // to whatever host that server named — which is a
+                    // credential-harvesting primitive, not a redirect. curl and
+                    // reqwest both strip on a change of origin.
+                    if !same_origin(&previous, &uri) {
+                        for name in [AUTHORIZATION, COOKIE, PROXY_AUTHORIZATION] {
+                            headers.remove(&name);
+                            stripped.insert(name);
+                        }
+                    }
+                    // A redirect must not walk a secure request down to
+                    // plaintext, which would send whatever survived in the
+                    // clear. `check_scheme` sees only the target, so the
+                    // comparison has to happen here.
+                    if previous.scheme_str() == Some("https") && uri.scheme_str() == Some("http") {
+                        return Err(ClientError::Url(
+                            "refusing a redirect from https to http".into(),
+                        ));
+                    }
                     // 303 always becomes a GET; 301 and 302 do in practice,
                     // which every browser and every other client settled on
                     // long ago. 307 and 308 preserve the method, which is the
@@ -465,6 +502,21 @@ impl RequestBuilder {
             });
         }
     }
+}
+
+/// Whether two URIs address the same origin: scheme, host and effective port.
+///
+/// The port is compared after defaulting, so `http://h` and `http://h:80` are
+/// one origin, matching the web's own definition rather than a string compare.
+fn same_origin(a: &Uri, b: &Uri) -> bool {
+    fn port(u: &Uri) -> Option<u16> {
+        u.port_u16().or(match u.scheme_str() {
+            Some("http") => Some(80),
+            Some("https") => Some(443),
+            _ => None,
+        })
+    }
+    a.scheme_str() == b.scheme_str() && a.host() == b.host() && port(a) == port(b)
 }
 
 /// Refuse a scheme the client cannot speak, before it reaches the connector.

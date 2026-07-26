@@ -37,8 +37,8 @@ jobs:
       - name: Clippy (umbrella, all plugins)
         run: cargo clippy -p churust --all-targets --features full -- -D warnings
 
-      - name: Clippy (core, TLS feature)
-        run: cargo clippy -p churust-core --all-targets --features tls -- -D warnings
+      - name: Clippy (core, every feature)
+        run: cargo clippy -p churust-core --all-targets --all-features -- -D warnings
 
       - name: Test (workspace)
         run: cargo test --workspace
@@ -46,8 +46,23 @@ jobs:
       - name: Test (umbrella, all plugins)
         run: cargo test -p churust --features full
 
-      - name: Test (core, TLS feature)
-        run: cargo test -p churust-core --features tls
+      # Every optional feature, not just `tls`. `cargo test --workspace` builds
+      # churust-core with default features only, and `-p churust --features
+      # full` does not build churust-core's own test targets — so the
+      # multipart, tower, ws, fs and http3 suites compiled to zero test cases
+      # and the defects they cover shipped green. CONTRIBUTING.md requires new
+      # optional functionality to reach the matrix; this is that entry.
+      - name: Test (core, every feature)
+        run: cargo test -p churust-core --all-features
+
+      # The plugin crates, each with its own optional surface.
+      - name: Test (plugin crates, every feature)
+        run: |
+          cargo test -p churust-json -p churust-logging -p churust-cors \
+                     -p churust-auth -p churust-lab -p churust-ratelimit \
+                     -p churust-compression -p churust-templates \
+                     -p churust-redis -p churust-client -p churust-openapi \
+                     --all-features
 
       - name: Build examples
         run: cargo build -p hello -p api
