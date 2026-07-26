@@ -52,8 +52,8 @@ use churust_core::{
     AppBuilder, Call, Error, FromCall, IntoResponse, Middleware, Next, Phase, Plugin, Response,
     Result,
 };
-use http::header::CONTENT_TYPE;
-use http::HeaderValue;
+use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use http::{HeaderValue, Method};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::sync::Arc;
@@ -358,6 +358,13 @@ struct JsonErrors {
 #[async_trait]
 impl Middleware for JsonErrors {
     async fn handle(&self, call: Call, next: Next) -> Response {
+        // A `HEAD` with no handler of its own is answered by running the `GET`
+        // route and then discarding the body, and that discarding happens at
+        // the endpoint — inside this middleware, not outside it. So a `HEAD`
+        // arrives back here already emptied, and the message this plugin exists
+        // to re-encode is gone before it can be read. The method has to be
+        // remembered now because `call` is consumed by the rest of the chain.
+        let is_head = call.method() == Method::HEAD;
         let mut res = next.run(call).await;
         let is_error = res.status.is_client_error() || res.status.is_server_error();
         let is_text = res
@@ -367,18 +374,55 @@ impl Middleware for JsonErrors {
             .map(|s| s.starts_with("text/plain"))
             .unwrap_or(false);
         if is_error && is_text {
-            if let Some(buffered) = res.body.as_bytes() {
-                let msg = String::from_utf8_lossy(buffered).into_owned();
-                let body = serde_json::json!({ "error": msg, "status": res.status.as_u16() });
-                let bytes = if self.pretty {
-                    serde_json::to_vec_pretty(&body)
-                } else {
-                    serde_json::to_vec(&body)
+            match res.body.as_bytes() {
+                // The ordinary case: a buffered plain-text message that becomes
+                // a JSON envelope. The envelope is always longer than the text
+                // it wraps, so any `Content-Length` already on the response now
+                // describes a body that no longer exists. The endpoint sets one
+                // when it strips a `HEAD`, and a handler is free to set one by
+                // hand, so it is removed here and hyper is left to frame the
+                // bytes actually being sent. Leaving the stale value behind is
+                // not a cosmetic slip: hyper's HTTP/1 encoder asserts that a
+                // supplied `Content-Length` matches the payload it is handed,
+                // panics on the mismatch in a debug build, and the connection
+                // dies with the task.
+                Some(buffered) if !buffered.is_empty() => {
+                    let msg = String::from_utf8_lossy(buffered).into_owned();
+                    let body = serde_json::json!({ "error": msg, "status": res.status.as_u16() });
+                    let bytes = if self.pretty {
+                        serde_json::to_vec_pretty(&body)
+                    } else {
+                        serde_json::to_vec(&body)
+                    }
+                    .unwrap_or_default();
+                    res.headers.remove(CONTENT_LENGTH);
+                    res.body = churust_core::Body::from(bytes);
+                    res.headers
+                        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
                 }
-                .unwrap_or_default();
-                res.body = churust_core::Body::from(bytes);
-                res.headers
-                    .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                // A synthesized `HEAD`, whose body was stripped further in. Its
+                // headers must still describe the representation the matching
+                // `GET` would return, so the media type is corrected to the one
+                // this middleware would have produced, but no body is invented:
+                // re-encoding the empty string would give a `HEAD` reply the
+                // `{"error":"","status":N}` payload it never had, and would
+                // announce a message the `GET` does not contain. The stale
+                // `Content-Length` goes too. It counts the plain text, and the
+                // JSON length cannot be derived from it because escaping is not
+                // length-preserving. RFC 9110 §9.3.2 lets a `HEAD` omit a field
+                // it could only learn by generating the content, which is
+                // exactly this; it does not let it quote a size the `GET` will
+                // not deliver.
+                Some(_) if is_head => {
+                    res.headers.remove(CONTENT_LENGTH);
+                    res.headers
+                        .insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+                }
+                // An error that really did carry an empty plain-text body, or a
+                // streamed one whose bytes were never buffered. Neither has a
+                // message to lift into an envelope, so both are passed through
+                // exactly as the handler wrote them.
+                _ => {}
             }
         }
         res
@@ -463,7 +507,8 @@ impl CallJson for churust_core::Call {
 mod tests {
     use super::*;
     use churust_core::{App, Churust, TestClient};
-    use http::StatusCode;
+    use http::header::CONTENT_LENGTH;
+    use http::{Method, StatusCode};
     use serde::Deserialize;
 
     #[derive(Serialize, Deserialize)]
@@ -522,5 +567,36 @@ mod tests {
         let v: serde_json::Value = serde_json::from_slice(res.body_bytes()).unwrap();
         assert_eq!(v["error"], "nope");
         assert_eq!(v["status"], 400);
+    }
+
+    /// A `HEAD` reply is synthesized from the `GET` route, so whatever this
+    /// middleware does to the `GET` representation has to be reflected in the
+    /// headers the `HEAD` carries. RFC 9110 §9.3.2 lets a `HEAD` omit fields
+    /// that are only determined while generating the content, but it never
+    /// lets it describe a representation the matching `GET` would not send.
+    #[tokio::test]
+    async fn a_head_error_reply_agrees_with_the_get_it_stands_in_for() {
+        let client = TestClient::new(app());
+        let get = client.get("/boom").send().await;
+        let head = client.request(Method::HEAD, "/boom").send().await;
+
+        assert_eq!(head.status(), get.status());
+        assert_eq!(
+            head.text(),
+            "",
+            "a HEAD response must not carry a body at all"
+        );
+        assert_eq!(
+            head.header("content-type"),
+            get.header("content-type"),
+            "HEAD advertised a different media type than the GET it stands in for"
+        );
+        if let Some(len) = head.header(CONTENT_LENGTH.as_str()) {
+            assert_eq!(
+                len.parse::<usize>().unwrap(),
+                get.body_bytes().len(),
+                "HEAD promised a size the GET does not deliver"
+            );
+        }
     }
 }

@@ -50,6 +50,24 @@ released together, so every entry below applies to the whole set.
 
 ### Fixed
 
+- **`ContentNegotiation` framed its JSON error bodies with the length of the
+  plain text they replaced.** `JsonErrors` swapped the body and the
+  `Content-Type` but left any `Content-Length` alone, and the JSON envelope is
+  always longer than the message it wraps. A synthesized `HEAD` made this
+  visible and fatal: the endpoint records the `GET` body's length before
+  dropping the bytes, so `HEAD /boom` went out claiming four bytes while the
+  middleware then attached a twenty-five byte envelope. hyper's HTTP/1 encoder
+  checks a supplied `Content-Length` against the payload it is handed, so in a
+  debug build the request panicked the connection task and the client got
+  nothing at all. The header is now removed before the body is replaced, and
+  hyper frames what is actually sent.
+- **A synthesized `HEAD` no longer grows an error body it never had.** The body
+  is stripped at the endpoint, inside the plugin phase, so the message was
+  already gone by the time `ContentNegotiation` saw the response and the empty
+  string was being re-encoded into `{"error":"","status":N}` — a payload on a
+  `HEAD` reply, describing an error the matching `GET` does not report. Such a
+  reply now keeps its empty body and corrects only its headers, so it describes
+  the representation `GET` would return.
 - **A saturated connection budget no longer blocks shutdown.** The accept loop
   awaited a `max_connections` permit *outside* the shutdown race, so once every
   slot was held the shutdown signal was never polled — `serve()` did not return
