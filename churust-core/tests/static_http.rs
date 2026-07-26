@@ -262,6 +262,53 @@ async fn if_range_matching_gives_partial_mismatching_gives_full() {
     assert_eq!(stale.text(), BODY);
 }
 
+#[tokio::test]
+async fn a_stale_if_range_with_an_out_of_range_request_serves_the_whole_entity() {
+    let root = tree("if-range-416");
+    let client = TestClient::new(app(&root));
+
+    // The resume case this exists for: the client remembers a ten-megabyte
+    // representation, asks to continue from an offset that only made sense for
+    // that one, and offers the validator it remembers. The entity has since
+    // shrunk, so the offset is now out of bounds *and* the validator is stale.
+    //
+    // RFC 9110 §14.2 settles which of those the server answers: a validator
+    // that does not match means the Range header field is ignored, full stop.
+    // Ignoring it cannot produce a 416, because there is no longer a range to
+    // find unsatisfiable — the correct answer is 200 with the whole current
+    // representation, which is exactly the fallback If-Range exists to provide.
+    let res = client
+        .get("/s/f.txt")
+        .header("range", "bytes=100-200")
+        .header("if-range", "W/\"stale\"")
+        .send()
+        .await;
+
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "a stale If-Range must retract the Range before it can be judged unsatisfiable"
+    );
+    assert_eq!(res.text(), BODY);
+    assert_eq!(
+        res.header("content-range"),
+        None,
+        "no range was served, so nothing should describe one"
+    );
+
+    // The other half of the same rule: a *matching* If-Range leaves the Range
+    // in force, so an out-of-bounds one is still the 416 it always was.
+    let (etag, _) = validators(&client).await;
+    let fresh = client
+        .get("/s/f.txt")
+        .header("range", "bytes=100-200")
+        .header("if-range", &etag)
+        .send()
+        .await;
+    assert_eq!(fresh.status(), StatusCode::RANGE_NOT_SATISFIABLE);
+    assert_eq!(fresh.header("content-range"), Some("bytes */10"));
+}
+
 /// `TestClient` never reaches hyper, so it cannot show whether an explicit
 /// `Content-Length` on a *streamed* body conflicts with chunked framing. If it
 /// did, real responses would be malformed while every test above still passed.

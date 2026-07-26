@@ -189,6 +189,31 @@ released together, so every entry below applies to the whole set.
   client had just said it could not decode; by the same slip `deflate;Q=0.1`
   could not lose a tie it should lose. The parameter name is now folded to lower
   case before the match, which is safe because a qvalue has no letters in it.
+- **A stale `If-Range` now retracts the `Range` even when the range was out of
+  bounds, instead of answering `416`.** The retraction was gated on the range
+  having parsed as satisfiable, which excluded precisely the case `If-Range` is
+  written for: a client resuming a download it remembers as larger than the file
+  now is sends an offset past the new end together with the validator of the
+  copy it remembers. The offset made the range unsatisfiable, the gate therefore
+  never consulted the validator, and the reply was `416` with
+  `Content-Range: bytes */<len>` — a dead end for the resume, when RFC 9110
+  §14.2 says a validator that does not match means the `Range` header field is
+  ignored, and a field that has been ignored cannot afterwards be judged
+  unsatisfiable. Such a request now gets `200` with the whole current
+  representation, which is the fallback offering `If-Range` exists to provide. A
+  *matching* `If-Range` leaves the range in force, so an out-of-bounds one is
+  still the `416` it always was.
+- **`StaticFiles` no longer probes for the index file with a blocking stat on a
+  runtime worker.** The guard that decided whether `<dir>/<index>` existed used
+  `std::path::Path::is_file`, a synchronous `stat(2)`, inside an `async fn`
+  where every other lookup awaits `tokio::fs`. It ran on whichever worker was
+  polling the request rather than on the blocking pool, so until the syscall
+  returned that worker polled nothing else: on local disk the cost is a warm
+  dentry lookup and invisible, but on a stalled NFS or SMB mount the unrelated
+  connections scheduled on that worker waited out the mount alongside it. The
+  probe now awaits `tokio::fs::metadata` and reads any error as "no index here",
+  exactly as `is_file` did, so the behaviour is unchanged and only the blocking
+  is gone.
 - **A saturated connection budget no longer blocks shutdown.** The accept loop
   awaited a `max_connections` permit *outside* the shutdown race, so once every
   slot was held the shutdown signal was never polled — `serve()` did not return

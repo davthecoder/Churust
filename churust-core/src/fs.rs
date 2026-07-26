@@ -164,8 +164,40 @@ impl StaticFiles {
             .await
             .map_err(|_| Error::not_found("not found"))?;
         if meta.is_dir() {
-            match &self.index {
-                Some(index) if path.join(index).is_file() => path = path.join(index),
+            // Probe for the index file with the same async stat as every other
+            // lookup in this function. The guard used to be
+            // `path.join(index).is_file()`, and `Path::is_file` is a
+            // synchronous `stat(2)`: it runs on whichever runtime worker is
+            // polling this future rather than on the blocking pool, so for as
+            // long as the syscall takes, that worker polls nothing else. On
+            // local disk the parent's dentry was warmed by the `metadata` call
+            // just above and the cost is negligible; on a wedged NFS or SMB
+            // mount it is however long the mount takes to answer, and the
+            // connections that happen to be scheduled on that worker wait it
+            // out for a request they have nothing to do with. Everything else
+            // here already awaits `tokio::fs`, so this was the one call in the
+            // path that could block the reactor.
+            //
+            // Hoisted out of the match guard because a guard cannot await, and
+            // that also spares the second identical `join` the old form did on
+            // the hit.
+            let index_file = match &self.index {
+                Some(index) => {
+                    let candidate = path.join(index);
+                    // `unwrap_or(false)` reproduces `Path::is_file` exactly:
+                    // both follow symlinks, and both read any stat error — not
+                    // just "missing" — as "no index here", which falls through
+                    // to the listing or the 404 below.
+                    let is_file = tokio::fs::metadata(&candidate)
+                        .await
+                        .map(|m| m.is_file())
+                        .unwrap_or(false);
+                    is_file.then_some(candidate)
+                }
+                None => None,
+            };
+            match index_file {
+                Some(candidate) => path = candidate,
                 _ if self.list_directories => {
                     // A directory has one URL, and it ends in `/`. The listing's
                     // links are relative and bare (`href="a.txt"`), so a browser
@@ -247,15 +279,30 @@ impl StaticFiles {
         }
 
         // A Range only applies if If-Range agrees the client's copy is current.
+        //
+        // The retraction is unconditional on purpose. It used to be gated on
+        // the range having come out `Satisfiable`, which quietly excluded the
+        // one case If-Range is written for: a client resuming a download it
+        // remembers as larger than the entity now is sends an offset past the
+        // new end *and* the validator of the copy it remembers. The range then
+        // parsed as `Unsatisfiable`, the gate skipped the validator check
+        // entirely, and the reply was `416 Content-Range: bytes */<len>` — a
+        // dead end for a resume that RFC 9110 §14.2 says must succeed: a
+        // validator that does not match means the Range header field is
+        // ignored, and a field that has been ignored cannot then be judged
+        // unsatisfiable. Answering `200` with the whole current representation
+        // is both what the spec requires and the entire point of offering
+        // If-Range in the first place.
+        //
+        // Applying it to `Absent` too is a no-op, which is why the gate is gone
+        // rather than merely widened.
         let mut spec = match call.header("range") {
             Some(raw) => parse_range(raw, len),
             None => RangeSpec::Absent,
         };
-        if matches!(spec, RangeSpec::Satisfiable(..)) {
-            if let Some(if_range) = call.header("if-range") {
-                if !if_range_matches(if_range, etag.as_deref(), last_modified.as_deref()) {
-                    spec = RangeSpec::Absent;
-                }
+        if let Some(if_range) = call.header("if-range") {
+            if !if_range_matches(if_range, etag.as_deref(), last_modified.as_deref()) {
+                spec = RangeSpec::Absent;
             }
         }
 
