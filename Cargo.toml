@@ -87,16 +87,16 @@ serde = { version = "1", features = ["derive"] }
 # `Vec<T>` field is unrepresentable — which breaks checkbox groups and
 # `<select multiple>`, the ordinary HTML for a multi-value control.
 # `serde_html_form` is the same surface with repeated keys supported.
-serde_html_form = "0.2"
+serde_html_form = "0.4"
 serde_json = "1"
 tracing = "0.1"
-jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }
-base64 = "0.22"
+jsonwebtoken = { version = "11", default-features = false, features = ["rust_crypto"] }
+base64 = "0.23.0"
 # Real MAC for signed session cookies. Both are RustCrypto, pure Rust, no_std
 # capable and pull nothing heavy — worth it to make a session a trust boundary
 # rather than a documented weakness.
-hmac = "0.12"
-sha2 = "0.10"
+hmac = "0.13.0"
+sha2 = "0.11.0"
 # Response compression. `async-compression` wraps the gzip/deflate/brotli
 # encoders in an `AsyncRead`, which is what lets a streamed body stay streamed
 # while being compressed instead of being collected first.
