@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/davthecoder/Churust/main/img/churust_logo.png" alt="Churust logo — a churro spiral inside a gear" width="180" />
+  <img src="https://raw.githubusercontent.com/davthecoder/Churust/main/img/churust_tumb_logo.png" alt="Churust logo — a churro spiral inside a gear" width="400" />
 </p>
 
 <h1 align="center">Churust 🌀</h1>
@@ -44,7 +44,7 @@ async fn main() -> std::io::Result<()> {
 
 ```toml
 [dependencies]
-churust = "0.2"
+churust = "0.3"
 ```
 
 That is the whole dependency list. Churust re-exports the runtime it is built
@@ -57,7 +57,7 @@ Plugins and transports are opt-in features on the umbrella crate — depend on
 directly:
 
 ```toml
-churust = { version = "0.2", features = ["full", "ws", "fs", "tls"] }
+churust = { version = "0.3", features = ["full", "ws", "fs", "tls"] }
 ```
 
 | Feature | Pulls in | Gives you |
@@ -79,7 +79,7 @@ churust = { version = "0.2", features = ["full", "ws", "fs", "tls"] }
 | `tls` | `churust-core/tls` | rustls-backed HTTPS |
 | `http3` | `churust-core/http3` | HTTP/3 over QUIC (implies `tls`) |
 
-Default features are empty, so a plain `churust = "0.2"` compiles the core
+Default features are empty, so a plain `churust = "0.3"` compiles the core
 engine and nothing else.
 
 Every Churust crate is released in lockstep on one version number, so
@@ -278,7 +278,7 @@ r.get("/echo", |ws: WebSocketUpgrade| async move {
 ```
 
 ```toml
-churust = { version = "0.2", features = ["ws"] }
+churust = { version = "0.3", features = ["ws"] }
 ```
 
 See [`examples/chat`](https://github.com/davthecoder/Churust/tree/main/examples/chat) for an echo endpoint plus a broadcast room.
@@ -311,7 +311,7 @@ paths, symlink escapes) with `404`, and streams the file in chunks. See
 [`examples/static`](https://github.com/davthecoder/Churust/tree/main/examples/static).
 
 ```toml
-churust = { version = "0.2", features = ["fs"] }
+churust = { version = "0.3", features = ["fs"] }
 ```
 
 ## Core concepts
