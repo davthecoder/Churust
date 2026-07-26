@@ -48,6 +48,31 @@
 //! Neither is set by default, because a default here would be either too short
 //! for an internal tool or too long for a bank, and the framework cannot know
 //! which it is looking at.
+//!
+//! # Reserved session keys
+//!
+//! This layer keeps its state in three ordinary session keys:
+//!
+//! - `__churust_uid` — who the visitor is. Writing it *is* logging someone in:
+//!   [`Authenticated`] and [`Identity::id`] read nothing else.
+//! - `__churust_lin` — when they logged in, as Unix seconds.
+//! - `__churust_seen` — when they were last seen, as Unix seconds.
+//!
+//! They are ordinary keys on purpose. [`Session::set`](crate::Session::set) does
+//! not refuse them, because [`Identity::login`] writes them through that very
+//! method, and because writing `__churust_uid` by hand is the supported way to
+//! adopt this layer over sessions an application was already minting itself.
+//! The `__churust` prefix is the reservation, and it covers
+//! [`SESSION_ID_KEY`](crate::SESSION_ID_KEY) too.
+//!
+//! Nothing a visitor sends can reach these keys: a session is server-authored,
+//! and [`CookieStore`](crate::CookieStore) verifies its signature before parsing
+//! the contents. The one shape that would is an application that writes
+//! caller-supplied key *names* — `session.set(form.key, form.value)` — which is
+//! mass assignment and hands the visitor its own `role` and `tenant_id` keys as
+//! well. If you must do that, reject any key beginning with `__churust` before
+//! the write; there is no framework-side filter that could do it for you without
+//! breaking login.
 
 use crate::app::{AppBuilder, Plugin};
 use crate::call::Call;

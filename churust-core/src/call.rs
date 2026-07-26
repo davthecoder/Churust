@@ -183,12 +183,18 @@ impl Call {
 
     /// The request's host, without the port.
     ///
-    /// Reads the `Host` header first, falling back to the URI authority. Both
-    /// spellings matter: HTTP/1.1 carries the host in a header, and HTTP/2
-    /// removed that header in favour of the `:authority` pseudo-header, which
-    /// lands in the URI. Anything that makes a decision about *which site* a
-    /// request is for must consult both, or it silently stops matching on the
-    /// protocol most clients now negotiate.
+    /// Reads the URI authority first, falling back to the `Host` header. Both
+    /// spellings matter: HTTP/1.1 in the ordinary origin form carries the host
+    /// in a header and nowhere else, while HTTP/2 removed that header in favour
+    /// of the `:authority` pseudo-header, which lands in the URI. Anything that
+    /// makes a decision about *which site* a request is for must consult both,
+    /// or it silently stops matching on the protocol most clients now
+    /// negotiate.
+    ///
+    /// When a request carries both — an HTTP/2 peer that appends a stray `host`
+    /// field beside `:authority`, or an HTTP/1.1 absolute-form target, where
+    /// `Host` is still mandatory — the authority wins, as RFC 9113 §8.3.1 and
+    /// RFC 9112 §3.2.2 both require.
     ///
     /// ```
     /// use churust_core::Call;
@@ -210,10 +216,32 @@ impl Call {
     /// assert_eq!(h2.host().as_deref(), Some("example.com"));
     /// ```
     pub fn host(&self) -> Option<String> {
+        // The authority is consulted first and the header only when the URI has
+        // none. Reading the header first meant a request that carried both was
+        // resolved against the one the wire protocol does *not* treat as the
+        // target: hyper builds the URI authority out of `:authority` alone, and
+        // h2 forwards an ordinary `host` field untouched because it is not one
+        // of the connection-specific fields it rejects, so an HTTP/2 peer can
+        // send `:authority: www.example.com` beside `host: admin.example.com`
+        // and an HTTP/1.1 peer can do the same with an absolute-form target.
+        // Both RFC 9113 §8.3.1 and RFC 9112 §3.2.2 settle that the same way —
+        // the authority is the target and the header is to be ignored — and
+        // agreeing with them is what keeps an intermediary that routed or
+        // authorized on the authority and the origin behind it from resolving
+        // one request to two different sites. On the origin-form HTTP/1.1
+        // request, which is the overwhelmingly common shape, the URI has no
+        // authority and nothing changes: the header is still the only signal.
+        //
+        // A disagreement is not refused outright, only decided. Answering `400`
+        // would be within the letter of RFC 9113, but the reading above already
+        // makes the stray field inert, and rejecting would turn a request that
+        // a lenient intermediary produced by accident into an outage for a
+        // caller who did nothing wrong.
         let raw = self
-            .header(http::header::HOST.as_str())
-            .map(str::to_string)
-            .or_else(|| self.uri.authority().map(|a| a.as_str().to_string()))?;
+            .uri
+            .authority()
+            .map(|a| a.as_str().to_string())
+            .or_else(|| self.header(http::header::HOST.as_str()).map(str::to_string))?;
         // Strip any userinfo first.
         let after_at = raw.rsplit('@').next().unwrap_or(&raw);
         // An IPv6 literal is bracketed and full of colons, so the port cannot
@@ -783,6 +811,48 @@ mod tests {
         sm.insert(99u32);
         c.set_state(std::sync::Arc::new(sm));
         assert_eq!(*c.state::<u32>().unwrap(), 99);
+    }
+
+    #[test]
+    fn the_uri_authority_outranks_a_disagreeing_host_header() {
+        // Both spellings of the host can arrive at once: over HTTP/2 a peer may
+        // append an ordinary `host` field beside `:authority` (h2 forwards it
+        // untouched, and hyper builds the URI authority from the pseudo-header
+        // alone), and over HTTP/1.1 an absolute-form target carries an
+        // authority beside the mandatory `Host`. Both RFCs say the authority
+        // is the request target and the header is to be ignored, so the guard
+        // and anything else asking "which site is this for" must agree with
+        // whatever an intermediary routed on.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::HOST,
+            http::HeaderValue::from_static("admin.example.com"),
+        );
+        let c = Call::new(
+            Method::GET,
+            "https://www.example.com/".parse::<Uri>().unwrap(),
+            headers,
+            Bytes::new(),
+        );
+        assert_eq!(c.host().as_deref(), Some("www.example.com"));
+    }
+
+    #[test]
+    fn the_host_header_is_still_read_when_the_uri_has_no_authority() {
+        // The origin-form HTTP/1.1 request, which is the overwhelmingly common
+        // shape: the header is the only host signal there is.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::HOST,
+            http::HeaderValue::from_static("admin.example.com:8443"),
+        );
+        let c = Call::new(
+            Method::GET,
+            "/".parse::<Uri>().unwrap(),
+            headers,
+            Bytes::new(),
+        );
+        assert_eq!(c.host().as_deref(), Some("admin.example.com"));
     }
 
     #[test]

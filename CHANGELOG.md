@@ -419,6 +419,40 @@ fn address_bucket(ip: IpAddr) -> String {
              them would put the whole IPv4 internet in a single bucket"
         );
     }
+- **`Call::host` answered with the `Host` header even when the request carried
+  an authority of its own.** A request can name its host twice: an HTTP/2 peer
+  may append an ordinary `host` field beside `:authority` — h2 forwards it
+  untouched, since it is not one of the connection-specific fields it rejects,
+  and hyper builds the URI authority from the pseudo-header alone — and an
+  HTTP/1.1 absolute-form target carries an authority beside the `Host` that
+  protocol still requires. Reading the header first resolved such a request
+  against the spelling the wire protocol does *not* treat as the target, which
+  RFC 9113 §8.3.1 and RFC 9112 §3.2.2 both forbid. The consequence is not a new
+  privilege — `guard::host` dispatches on client-controlled data on every
+  protocol, and a caller wanting the guarded vhost can simply ask for it
+  directly — but an intermediary that routes or authorizes on `:authority` and
+  the origin behind it would resolve one request to two different sites, and a
+  vhost split is not a thing two ends may disagree about. The authority is now
+  read first and the header consulted only when the URI carries none, so the
+  ordinary origin-form request, where the header is the only host signal there
+  is, behaves exactly as before. A disagreement is decided rather than refused:
+  the stray field is already inert once it is ignored, and answering `400` would
+  turn a lenient intermediary's accident into an outage for a caller who did
+  nothing wrong.
+- **The identity layer's session keys were reserved in fact but nowhere in
+  writing.** `__churust_uid`, `__churust_lin` and `__churust_seen` are ordinary
+  session keys that `Authenticated` trusts completely, yet the module documented
+  none of them, while `SESSION_ID_KEY` next door is public and carries six
+  lines explaining that it is spoken for. Nothing a visitor sends can reach
+  them — a session is server-authored and `CookieStore` verifies its signature
+  before parsing — but an application that writes caller-supplied key *names*
+  had no published list to filter against, and the framework cannot filter for
+  it: `Identity::login` writes those keys through the same public
+  `Session::set`, and writing `__churust_uid` by hand is the supported way to
+  adopt the layer over sessions an application was already minting. The identity
+  module now names the three keys, states that the `__churust` prefix is the
+  reservation, and says what to reject and why nothing rejects it for you. This
+  is a documentation change only; no behaviour moved.
 - **A saturated connection budget no longer blocks shutdown.** The accept loop
   awaited a `max_connections` permit *outside* the shutdown race, so once every
   slot was held the shutdown signal was never polled — `serve()` did not return

@@ -218,3 +218,51 @@ async fn host_guards_match_the_http2_authority_too() {
         .await;
     assert_eq!(res.text(), "PUBLIC");
 }
+
+#[tokio::test]
+async fn a_host_guard_follows_the_authority_when_a_host_header_disagrees() {
+    // Both spellings can arrive on one request. Over HTTP/2 the `host` field is
+    // not a forbidden one — h2 passes it through and hyper derives the URI
+    // authority from `:authority` alone — so a peer can send
+    // `:authority: www.example.com` beside `host: admin.example.com`. Over
+    // HTTP/1.1 an absolute-form target does the same, since `Host` is still
+    // mandatory there. RFC 9113 §8.3.1 and RFC 9112 §3.2.2 both settle it the
+    // same way: the authority *is* the target and the header is to be ignored.
+    //
+    // The guard used to read the header first, so an intermediary that routed
+    // or authorized on the authority and the origin behind it could disagree
+    // about which vhost was being addressed — the two ends resolving one
+    // request to two different sites is the whole hazard, even though sending
+    // the admin authority outright already reaches the same route.
+    use churust_core::{Call, Churust, TestClient};
+
+    let build = || {
+        Churust::server()
+            .routing(|r| {
+                r.get("/", |_c: Call| async { "ADMIN" })
+                    .guard(churust_core::guard::host("admin.example.com"));
+                r.get("/", |_c: Call| async { "PUBLIC" });
+            })
+            .build()
+    };
+
+    let res = TestClient::new(build())
+        .get("https://www.example.com/")
+        .header("host", "admin.example.com")
+        .send()
+        .await;
+    assert_eq!(
+        res.text(),
+        "PUBLIC",
+        "the stray Host header outranked the authority the request was routed on"
+    );
+
+    // And the converse: an authority naming the guarded vhost matches however
+    // the header disagrees, so the header cannot steer the route either way.
+    let res = TestClient::new(build())
+        .get("https://admin.example.com/")
+        .header("host", "www.example.com")
+        .send()
+        .await;
+    assert_eq!(res.text(), "ADMIN");
+}
