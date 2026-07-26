@@ -160,6 +160,69 @@ async fn strict_is_the_default() {
 }
 
 #[tokio::test]
+async fn a_refused_alias_is_an_ordinary_response_on_the_way_out() {
+    // Why the policy decision sits in the endpoint, inside the middleware
+    // chain, rather than ahead of it. Hoisting it out would let the refusal
+    // skip everything wrapped around the endpoint, and a `404` is exactly as
+    // reachable as handler output: it would go out without the security
+    // headers every other response carries, and `on_error` — whose whole
+    // premise is that it renders *any* `4xx`, including the `404` for an
+    // unmatched path — would never see it.
+    //
+    // The cost of that placement is that middleware runs first and observes the
+    // raw, un-collapsed spelling. It is not a bypass under `Strict` or
+    // `Redirect`: whatever a prefix-keyed middleware decides, the endpoint
+    // still replaces the response, so nothing is served.
+    let app = Churust::server()
+        .on_error(|status, call| {
+            (status == StatusCode::NOT_FOUND)
+                .then(|| churust_core::Response::text(format!("refused {}", call.path())))
+        })
+        .routing(|r| {
+            r.get("/admin/secret", |_c: Call| async { "SECRET" });
+        })
+        .build();
+
+    let res = TestClient::new(app).get("//admin/secret").send().await;
+    assert_eq!(
+        res.text(),
+        "refused //admin/secret",
+        "the alias refusal never reached the on_error renderer"
+    );
+    assert_eq!(
+        res.header("x-content-type-options"),
+        Some("nosniff"),
+        "the alias refusal went out without the default security headers"
+    );
+}
+
+#[tokio::test]
+async fn collapse_hands_the_raw_spelling_to_middleware_and_handlers() {
+    // `Collapse` collapses for *matching* only; it does not rewrite the URI.
+    // So `call.path()` is the spelling the client sent, in middleware and in
+    // the handler alike, and a prefix check keyed on it is bypassable — which
+    // is the documented hazard of opting into aliases, and the reason
+    // `Collapse` exists only as a migration step.
+    let app = Churust::server()
+        .path_policy(PathPolicy::Collapse)
+        .routing(|r| {
+            r.get(
+                "/admin/secret",
+                |c: Call| async move { c.path().to_string() },
+            );
+        })
+        .build();
+
+    let res = TestClient::new(app).get("//admin/secret").send().await;
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(
+        res.text(),
+        "//admin/secret",
+        "Collapse rewrote the URI; the docs promise it does not"
+    );
+}
+
+#[tokio::test]
 async fn an_encoded_slash_is_not_a_separator_under_any_policy() {
     // `%2F` is data inside one segment. Decoding it into a separator before
     // matching is how a normalisation change becomes a traversal bug.

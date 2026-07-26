@@ -193,6 +193,52 @@ async fn serves_on_several_addresses_at_once() {
 }
 
 #[tokio::test]
+async fn an_address_added_with_bind_is_still_served_after_build() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // `AppBuilder::start` honoured `bind`, but `build()` dropped the extra
+    // addresses on the floor, so the overwhelmingly common shape — build once,
+    // then serve with a custom shutdown signal — listened on the configured
+    // `host:port` alone and said nothing about the rest.
+    let mut addrs = Vec::new();
+    for _ in 0..2 {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        addrs.push(l.local_addr().unwrap());
+    }
+
+    let app = Churust::server()
+        .host(addrs[0].ip().to_string())
+        .port(addrs[0].port())
+        .bind(addrs[1].to_string())
+        .routing(|r| {
+            r.get("/", |_c: Call| async { "both" });
+        })
+        .build();
+
+    let server = tokio::spawn(async move {
+        let _ = app.start_with_shutdown(std::future::pending::<()>()).await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    for addr in &addrs {
+        let mut sock = tokio::net::TcpStream::connect(addr)
+            .await
+            .unwrap_or_else(|e| panic!("{addr} was never bound: {e}"));
+        sock.write_all(
+            format!("GET / HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut raw = Vec::new();
+        sock.read_to_end(&mut raw).await.unwrap();
+        let text = String::from_utf8_lossy(&raw);
+        assert!(text.ends_with("both"), "{addr} did not answer: {text}");
+    }
+
+    server.abort();
+}
+
+#[tokio::test]
 async fn binding_nothing_is_an_error_rather_than_a_silent_no_op() {
     let app = Churust::server().build();
     let err = churust_core::engine::serve_many(app, vec![], std::future::pending::<()>())

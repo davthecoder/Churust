@@ -522,28 +522,10 @@ impl AppBuilder {
     /// # }
     /// ```
     pub async fn start(self) -> std::io::Result<()> {
-        let extra = self.extra_binds.clone();
-        let app = self.build();
-        if extra.is_empty() {
-            return app.start().await;
-        }
-
-        // The configured host:port is always bound; `bind` adds to it.
-        let mut addrs = vec![format!("{}:{}", app.config().host, app.config().port)];
-        addrs.extend(extra);
-
-        let parsed = addrs
-            .iter()
-            .map(|a| {
-                a.parse::<std::net::SocketAddr>()
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
-            })
-            .collect::<std::io::Result<Vec<_>>>()?;
-
-        crate::engine::serve_many(app, parsed, async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await
+        // Genuinely nothing but `build().start()`. The extra-address handling
+        // that used to live here is now in `App`, where every entry point can
+        // reach it; keeping a second copy here is how the two got to disagree.
+        self.build().start().await
     }
 
     /// Render error responses yourself — v1 design §5.3's "StatusPages-lite".
@@ -623,6 +605,14 @@ impl AppBuilder {
     /// port alongside an admin one. The configured host and port are always
     /// bound; this adds to them.
     ///
+    /// The addresses survive [`build`](Self::build), so they are honoured by
+    /// [`App::start`] and [`App::start_with_shutdown`] just as much as by
+    /// [`start`](Self::start). The two exceptions are the entry points that are
+    /// handed a socket instead of choosing one — [`App::start_on`] takes an
+    /// already-bound listener and [`start_unix`](Self::start_unix) serves a
+    /// filesystem path — and neither binds the configured `host:port` either,
+    /// so there is nothing for this to add to.
+    ///
     /// ```no_run
     /// use churust_core::{Call, Churust};
     /// # async fn run() -> std::io::Result<()> {
@@ -684,6 +674,7 @@ impl AppBuilder {
                 middleware,
                 config: self.config,
                 state: Arc::new(self.state),
+                extra_binds: self.extra_binds,
             }),
         }
     }
@@ -694,6 +685,12 @@ struct AppInner {
     middleware: Vec<Arc<dyn Middleware>>,
     config: ServerConfig,
     state: Arc<StateMap>,
+    /// Carried through from [`AppBuilder::bind`]. `build` used to drop these,
+    /// which made `bind` a no-op for everybody who built an [`App`] and then
+    /// served it — the ordinary shape once a custom shutdown signal is in play.
+    /// The extra addresses are serve-time state rather than request-time state,
+    /// but so are `host` and `port`, which already ride along in `config`.
+    extra_binds: Vec<String>,
 }
 
 /// An assembled, immutable, cheaply-cloneable application.
@@ -790,13 +787,34 @@ impl App {
         }
     }
 
-    /// Bind the configured address and serve until Ctrl-C (SIGINT), then drain
-    /// in-flight connections gracefully. Does not return until shutdown.
+    /// Every TCP address this app should listen on: the configured `host:port`
+    /// first, then whatever [`AppBuilder::bind`] added.
+    ///
+    /// One list built in one place, so the address-based entry points cannot
+    /// drift apart on which addresses count — that drift is exactly how `bind`
+    /// came to be honoured by `AppBuilder::start` and silently ignored by every
+    /// other way of serving the same application.
+    fn bind_addrs(&self) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        std::iter::once(format!(
+            "{}:{}",
+            self.inner.config.host, self.inner.config.port
+        ))
+        .chain(self.inner.extra_binds.iter().cloned())
+        .map(|a| {
+            a.parse::<std::net::SocketAddr>()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+        })
+        .collect()
+    }
+
+    /// Bind the configured address — plus anything [`AppBuilder::bind`] added —
+    /// and serve until Ctrl-C (SIGINT), then drain in-flight connections
+    /// gracefully. Does not return until shutdown.
     ///
     /// # Errors
     ///
-    /// Returns an [`std::io::Error`] if the configured `host:port` is invalid or
-    /// the socket cannot be bound (e.g. the port is in use).
+    /// Returns an [`std::io::Error`] if any configured address is invalid or a
+    /// socket cannot be bound (e.g. the port is in use).
     ///
     /// ```no_run
     /// use churust_core::{Churust, Call};
@@ -808,23 +826,24 @@ impl App {
     /// # }
     /// ```
     pub async fn start(self) -> std::io::Result<()> {
-        let addr = format!("{}:{}", self.inner.config.host, self.inner.config.port)
-            .parse::<std::net::SocketAddr>()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-        let shutdown = async {
+        self.start_with_shutdown(async {
             let _ = tokio::signal::ctrl_c().await;
-        };
-        crate::engine::serve(self, addr, shutdown).await
+        })
+        .await
     }
 
     /// Bind and serve until the provided `shutdown` future resolves, then drain
     /// gracefully. Use this to wire a custom shutdown signal (e.g. in tests, or
     /// to combine SIGTERM with SIGINT).
     ///
+    /// Serves every address [`AppBuilder::bind`] registered as well as the
+    /// configured `host:port`; a bind failure on any one of them aborts the
+    /// whole start rather than leaving a half-up server.
+    ///
     /// # Errors
     ///
-    /// Returns an [`std::io::Error`] if the configured `host:port` is invalid or
-    /// the socket cannot be bound.
+    /// Returns an [`std::io::Error`] if any configured address is invalid or a
+    /// socket cannot be bound.
     ///
     /// ```no_run
     /// use churust_core::{Churust, Call};
@@ -841,10 +860,16 @@ impl App {
     where
         F: std::future::Future<Output = ()> + Send + 'static,
     {
-        let addr = format!("{}:{}", self.inner.config.host, self.inner.config.port)
-            .parse::<std::net::SocketAddr>()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
-        crate::engine::serve(self, addr, shutdown).await
+        let mut addrs = self.bind_addrs()?;
+        // The single-address case keeps going through `serve`, which serves the
+        // accept loop on this task. `serve_many` has to spawn one task per
+        // listener and fan a broadcast out to them, so routing the common case
+        // through it would change how a panic or a join failure surfaces for
+        // every existing caller, to buy nothing.
+        if addrs.len() == 1 {
+            return crate::engine::serve(self, addrs.remove(0), shutdown).await;
+        }
+        crate::engine::serve_many(self, addrs, shutdown).await
     }
 
     /// Serve on an already-bound listener until `shutdown` resolves.
@@ -910,10 +935,27 @@ impl App {
                     );
                 }
 
-                // Resolve the path spelling before anything looks at it. Doing
-                // it here rather than in the router means one decision point:
-                // guards, middleware and handlers all see a path that has
-                // already been accepted, redirected, or refused.
+                // Resolve the path spelling once, here rather than in the
+                // router, so there is a single decision point for it.
+                //
+                // "Here" is the endpoint, which is the *innermost* layer: the
+                // middleware chain has already run on the way in, so middleware
+                // observes the raw spelling and only the router and the
+                // handlers are downstream of the decision. That is deliberate,
+                // not an oversight. A refusal or a redirect is an ordinary
+                // response that has to travel back out through the chain to be
+                // finished — security headers live in `Phase::Setup` and
+                // `on_error` in `Phase::Monitoring`, and a `404` is exactly as
+                // reachable as handler output, so a decision taken outside the
+                // chain would ship an alias refusal with neither.
+                //
+                // Nothing is bypassable by it under `Strict` or `Redirect`:
+                // whatever a prefix-keyed middleware concludes from the raw
+                // spelling, the endpoint replaces the response regardless, so
+                // no handler runs. `Collapse` does keep the hazard, because it
+                // serves the alias and does not rewrite the URI — which is what
+                // `PathPolicy::Collapse` documents itself as, and why it is a
+                // migration step rather than a supported posture.
                 if let Some(canonical) = crate::path::canonical_path(&path) {
                     match inner.config.path_policy {
                         crate::path::PathPolicy::Strict => {

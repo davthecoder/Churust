@@ -97,6 +97,14 @@ pub enum PathPolicy {
     /// The pre-`PathPolicy` behaviour, kept so an application with
     /// alias-shaped links has somewhere to stand while it fixes them. It
     /// creates URL aliases by design; prefer `Strict` or `Redirect`.
+    ///
+    /// The collapsing happens in the router, for *matching* only: the URI is
+    /// not rewritten, so `call.path()` still reports the spelling the client
+    /// sent — `//admin/secret`, not `/admin/secret` — in middleware and in the
+    /// handler alike. That is what makes the prefix-check bypass above live
+    /// under this policy and only under this policy. Under `Strict` and
+    /// `Redirect` a middleware also sees the raw spelling, but the request is
+    /// refused or redirected before any handler runs, so nothing is served.
     Collapse,
 }
 

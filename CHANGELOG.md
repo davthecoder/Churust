@@ -453,6 +453,36 @@ fn address_bucket(ip: IpAddr) -> String {
   module now names the three keys, states that the `__churust` prefix is the
   reservation, and says what to reject and why nothing rejects it for you. This
   is a documentation change only; no behaviour moved.
+- **`AppBuilder::bind` survives `build()`.** The extra addresses were kept on
+  the builder and read only by `AppBuilder::start`, so `build()` dropped them
+  and the app listened on the configured `host:port` alone. That took out the
+  ordinary shape for anything with a real shutdown story —
+  `Churust::server().bind(…).build().start_with_shutdown(sigterm())` — since
+  wiring SIGTERM is precisely what forces you off the one entry point that
+  honoured `bind`. Nothing reported it: no error, no warning, just a server
+  quietly missing half its listeners until someone noticed the admin port
+  refusing connections. The addresses now travel with the built `App`, so
+  `App::start` and `App::start_with_shutdown` bind them too, and a failure on
+  any one of them aborts the start rather than leaving a half-up server.
+  `App::start_on` and `start_unix` are unaffected by design: both are handed a
+  socket rather than choosing one, and neither binds the configured `host:port`
+  either, so there is nothing for `bind` to add to. This is under-binding in
+  every direction, never accidental exposure.
+- **The `PathPolicy` decision is documented where it actually runs.** A comment
+  in the pipeline claimed guards, middleware and handlers all saw a path that
+  had already been accepted, redirected, or refused. Middleware did not: the
+  decision lives in the endpoint, the innermost layer, so the chain has already
+  run on the way in and observes the raw spelling. The placement is deliberate
+  and stays — an alias refusal is an ordinary response that has to travel back
+  out through the chain to pick up the security headers every other response
+  carries and to reach `on_error`, whose premise is that it renders any `4xx`
+  including the `404` for an unmatched path. Deciding outside the chain would
+  ship those refusals with neither. Under `Strict` and `Redirect` nothing is
+  bypassable regardless of what a prefix-keyed middleware concludes, because the
+  endpoint replaces the response and no handler runs. `Collapse` does keep the
+  hazard, and its docs now say why: it collapses in the router for matching
+  only and never rewrites the URI, so `call.path()` reports `//admin/secret` in
+  middleware and handler alike. Both properties are now pinned by tests.
 - **A saturated connection budget no longer blocks shutdown.** The accept loop
   awaited a `max_connections` permit *outside* the shutdown race, so once every
   slot was held the shutdown signal was never polled — `serve()` did not return
