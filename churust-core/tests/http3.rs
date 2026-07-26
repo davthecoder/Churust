@@ -137,6 +137,16 @@ fn app() -> churust_core::App {
                 );
                 Response::stream("text/plain", Body::from_stream(chunks))
             });
+            // A body that dies partway, the way a database cursor does: the
+            // status line has long since gone out, so the only way to say so
+            // is to leave the stream unfinished.
+            r.get("/truncated", |_c: Call| async {
+                let chunks = futures_util::stream::iter(vec![
+                    Ok::<_, std::io::Error>(Bytes::from_static(b"part0 ")),
+                    Err(std::io::Error::other("the cursor died")),
+                ]);
+                Response::stream("text/plain", Body::from_stream(chunks))
+            });
         })
         .build()
 }
@@ -332,6 +342,89 @@ async fn a_stream_that_never_sends_headers_does_not_kill_the_connection() {
         raw.close_reason().is_none(),
         "the connection was closed: {:?}",
         raw.close_reason()
+    );
+
+    drop(send);
+    let _ = drive.await;
+}
+
+#[tokio::test]
+async fn a_streamed_body_that_fails_partway_does_not_look_complete() {
+    // Once the head is on the wire the status cannot be taken back, so the
+    // only honest report of a body that died partway is a stream the peer can
+    // see was aborted. Returning early instead left the `RequestStream` to be
+    // dropped, and quinn finishes a stream when it drops — so the client
+    // received a well-formed 200 with a short body and no error at all, and
+    // would store the truncated answer as the whole thing.
+    let cert = self_signed();
+    let addr = serve(app(), &cert).await;
+
+    let mut roots = rustls::RootCertStore::empty();
+    for der in &cert.chain {
+        roots.add(der.clone()).expect("trust the test certificate");
+    }
+    let mut tls = rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+
+    let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("quic client config");
+    let mut endpoint =
+        quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("a client socket");
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic)));
+
+    let connection = endpoint
+        .connect(addr, "localhost")
+        .expect("a connect attempt")
+        .await
+        .expect("a completed handshake");
+
+    let (mut driver, mut send) = h3::client::new(h3_quinn::Connection::new(connection))
+        .await
+        .expect("an h3 client");
+    let drive = tokio::spawn(async move { std::future::poll_fn(|cx| driver.poll_close(cx)).await });
+
+    let uri: http::Uri = "https://localhost/truncated".parse().unwrap();
+    let req = http::Request::builder()
+        .method(http::Method::GET)
+        .uri(uri)
+        .body(())
+        .unwrap();
+    let mut stream = send.send_request(req).await.expect("a request stream");
+    stream.finish().await.expect("finish the request");
+
+    // Where the abort surfaces depends on what has reached the wire when the
+    // reset goes out. With a body this small nothing has been flushed, so the
+    // reset takes the head with it and `recv_response` is what fails; with a
+    // body large enough to have been sent, the head arrives and the failure
+    // lands on a later `recv_data`. Both are correct — asserting one of them
+    // would be asserting a flush timing. What must never happen is the third
+    // outcome: a complete-looking response whose body is short.
+    let mut out = Vec::new();
+    let ended_cleanly = match stream.recv_response().await {
+        // Aborted before the head reached us.
+        Err(_) => false,
+        Ok(response) => {
+            assert_eq!(response.status(), StatusCode::OK);
+            loop {
+                match stream.recv_data().await {
+                    Ok(Some(mut chunk)) => {
+                        out.extend_from_slice(&chunk.copy_to_bytes(chunk.remaining()))
+                    }
+                    // A normal end of body: the client has no way to know it
+                    // is short.
+                    Ok(None) => break true,
+                    // Aborted mid-body, which is the signal we want.
+                    Err(_) => break false,
+                }
+            }
+        }
+    };
+
+    assert!(
+        !ended_cleanly,
+        "a body that failed after {} byte(s) was reported as a complete response",
+        out.len()
     );
 
     drop(send);

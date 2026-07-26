@@ -479,6 +479,20 @@ released together, so every entry below applies to the whole set.
   permits a literal `%`, but since values are decoded on read, letting one
   through made the round trip lossy — a stored `%3D` came back as `=`, which
   corrupted a session payload before its signature was checked.
+- **An HTTP/3 response body that fails partway is no longer reported as
+  complete.** The `Err` arm returned `Ok(())` on the theory that skipping
+  `finish` left the stream unfinished. It does not: the `RequestStream` is owned
+  by the per-request task and dropped on the way out, and quinn finishes a
+  stream when its `SendStream` drops. So a handler streaming a hundred records
+  whose cursor died after three sent a well-formed `200` with three records and
+  a clean end of stream — the client had no way to tell it was short, and would
+  store it as the whole answer. The same handler over HTTP/1.1 or HTTP/2
+  surfaces the error to hyper, which aborts. The stream is now reset with
+  H3_INTERNAL_ERROR before returning, which wins the race against the drop:
+  after a reset the drop-time finish fails with `ClosedStream`, which quinn
+  ignores. Depending on what has reached the wire, the client sees the abort
+  either in place of the response head or partway through the body; what it
+  never sees is a complete-looking short one.
 - **One bad HTTP/3 stream no longer closes the whole QUIC connection.**
   `resolve_request` reports a *stream* error — a header block over
   `max_field_section_size`, a stream that ends before its headers arrive — and

@@ -453,7 +453,27 @@ where
                         // change, so the honest signal is an incomplete
                         // stream: reset it rather than finishing cleanly and
                         // claiming the truncated body was the whole thing.
-                        Err(_) => return Ok(()),
+                        //
+                        // Returning without resetting did the opposite of what
+                        // this comment promised. It skips the `finish` below,
+                        // but the `RequestStream` is owned by this task and is
+                        // dropped on the way out — and quinn's `SendStream`
+                        // finishes the stream when it drops. The peer got a
+                        // clean FIN and a truncated body it could not tell
+                        // apart from the whole one: three records of a hundred,
+                        // stored as the complete answer. Over HTTP/1.1 and
+                        // HTTP/2 the same handler surfaces the error to hyper,
+                        // which aborts.
+                        //
+                        // Resetting first is what wins the race: after
+                        // `stop_stream` the drop-time finish fails with
+                        // `ClosedStream`, which quinn ignores, so RESET_STREAM
+                        // is what reaches the peer.
+                        Err(e) => {
+                            tracing::debug!(error = %e, "http3 response body failed mid-stream");
+                            stream.stop_stream(h3::error::Code::H3_INTERNAL_ERROR);
+                            return Ok(());
+                        }
                     }
                 }
             }
