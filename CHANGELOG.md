@@ -159,6 +159,20 @@ released together, so every entry below applies to the whole set.
   full `shutdown_timeout_ms` and a rolling restart paid it on every instance.
   A connection with no request in flight now gets a brief window to flush its
   GOAWAY and is then dropped. Connections with work in flight are unaffected.
+- **`churust-cors` merges `Vary` instead of overwriting it, and marks every
+  response.** The plugin wrote `Vary: Origin` with a plain insert, discarding
+  whatever a layer further in had already earned. Install it alongside
+  `churust-compression` and CORS unwinds last, so a gzip response left the
+  server keyed on `Origin` alone: a shared cache stores those compressed bytes
+  and hands them to the next same-origin client that sent no `Accept-Encoding`,
+  which cannot decode them. The merge is now the same one the compression plugin
+  performs — split on commas, compare case-insensitively, leave `*` and an entry
+  already present alone — so the two agree whichever order they are installed
+  in. The mark also no longer depends on the answer being yes: a same-origin or
+  refused request gets a response with no `Access-Control-Allow-Origin`
+  *because* of its `Origin`, and without `Vary` a cache was free to store that
+  header-less answer and replay it to an origin the policy allows, whose browser
+  then blocks a response the server would have permitted.
 
 ### Added
 
