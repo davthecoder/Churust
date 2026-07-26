@@ -245,6 +245,35 @@ released together, so every entry below applies to the whole set.
   alongside the cross-origin credential strip so a client-wide default header
   cannot put one back on the next hop. `307` and `308` keep the body and so keep
   these headers, which is the whole reason those codes exist.
+- **`churust-templates` let a template's filename decide whether its values
+  were escaped, while the response was labelled HTML either way.** minijinja
+  picks the auto-escape mode from the extension and escapes only `.html`,
+  `.htm` and `.xml` — the right default for a library that can render into any
+  format, and the wrong one for `Renderer`, which has a single sink and stamps
+  `text/html; charset=utf-8` on every reply it makes. A template the author
+  called `page.txt`, or `partials/nav` with no extension at all, therefore
+  interpolated its values raw and was then served to a browser as HTML: a
+  mislabelled response by construction, and a stored-XSS sink as soon as one of
+  those values came from a user. Nothing about a request could steer a handler
+  onto such a template — it took the author naming the file — which is why this
+  is listed as hardening rather than a live vulnerability, but a crate that
+  documents its escaping as the reason interpolation is safe should not leave
+  that guarantee resting on a file extension. `Templates::new` now pins the
+  policy to HTML for every template, so the escaping agrees with the
+  `Content-Type` instead of with the name. `.html`, `.htm` and `.xml` are
+  unaffected — the default already escaped all three. A template that is
+  genuinely not HTML can restore the old behaviour with
+  `Templates::configure(|env| env.set_auto_escape_callback(..))`, which must
+  run *before* the template is added: minijinja resolves the mode once, as it
+  parses.
+- **`Templates::from_dir` did not document that every file under the directory
+  is read as a template.** Its `# Errors` section listed a missing directory
+  and a parse failure but not the third way it fails, which is a file that is
+  not valid UTF-8 — a `logo.png` or an editor artefact left beside the
+  templates aborts the boot with the path in the message. The behaviour is
+  deliberate and unchanged: skipping whatever does not look like a template
+  would also skip a real template saved in the wrong encoding, turning a loud
+  startup failure into a `500` on one route. Only the documentation was wrong.
 - **A saturated connection budget no longer blocks shutdown.** The accept loop
   awaited a `max_connections` permit *outside* the shutdown race, so once every
   slot was held the shutdown signal was never polled — `serve()` did not return

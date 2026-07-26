@@ -82,6 +82,30 @@ async fn markup_in_a_value_is_escaped() {
 }
 
 #[tokio::test]
+async fn markup_in_a_value_is_escaped_even_when_the_name_is_not_html() {
+    // `render` stamps `text/html` on every reply it makes, so the name a
+    // template happens to carry cannot be allowed to decide whether the values
+    // interpolated into it are escaped: the sink is HTML either way.
+    let app = Churust::server()
+        .install(Templates::new().add("x.txt", "<p>{{ note }}</p>").unwrap())
+        .routing(|r| {
+            r.get("/", |view: Renderer| async move {
+                view.render("x.txt", context! { note => "<img onerror=alert(1)>" })
+            });
+        })
+        .build();
+
+    let res = TestClient::new(app).get("/").send().await;
+    assert_eq!(res.header("content-type"), Some("text/html; charset=utf-8"));
+    assert!(
+        !res.text().contains("<img"),
+        "a template served as HTML must escape markup whatever it is called: {}",
+        res.text()
+    );
+    assert!(res.text().contains("&lt;img"));
+}
+
+#[tokio::test]
 async fn templates_load_from_a_directory_with_inheritance() {
     let dir = TempDir::new("inherit");
     dir.write(

@@ -28,12 +28,24 @@
 //!
 //! # Escaping
 //!
-//! Auto-escaping follows the template's extension: `.html`, `.htm` and `.xml`
-//! are escaped, everything else is not. Name an HTML template `.html` and
-//! interpolated values cannot inject markup. A template named `page.txt`
-//! rendering into a browser is a stored XSS waiting to happen, which is why
-//! [`Templates::add`] and [`Templates::from_dir`] keep the extension you give
-//! them rather than normalising it away.
+//! Every template is HTML-escaped, whatever it is called. Interpolated values
+//! cannot inject markup, so a `{{ bio }}` holding `<script>` reaches the
+//! browser as text.
+//!
+//! minijinja's own rule is to pick the escaping from the file extension and
+//! escape only `.html`, `.htm` and `.xml`. That is the right default for a
+//! library that can render into any format, and the wrong one here, because
+//! [`Renderer`] has a single sink: every method it offers labels its reply
+//! `text/html; charset=utf-8`. Leaving the filename in charge meant a template
+//! named `page.txt`, or `partials/nav` with no extension at all, was
+//! interpolated raw and then served as HTML anyway — a stored XSS waiting on
+//! whoever named the file. Naming a template `.html` is still the clearer
+//! thing to do, but it is no longer what keeps you safe.
+//!
+//! If you need a template that is genuinely not HTML, install your own policy
+//! with [`Templates::configure`] **before** adding it: minijinja resolves the
+//! escaping once, when a template is parsed, so a callback set afterwards does
+//! not reach templates that are already loaded.
 //!
 //! # Templates are parsed at startup
 //!
@@ -52,7 +64,7 @@ use async_trait::async_trait;
 use churust_core::{AppBuilder, Call, Error, FromCallParts, Plugin, Response, Result};
 use http::header::CONTENT_TYPE;
 use http::{HeaderValue, StatusCode};
-use minijinja::Environment;
+use minijinja::{AutoEscape, Environment};
 use serde::Serialize;
 use std::path::Path;
 use std::sync::Arc;
@@ -95,15 +107,29 @@ impl Default for Templates {
 impl Templates {
     /// An empty environment. Add templates with [`add`](Templates::add).
     pub fn new() -> Self {
-        Self {
-            env: Environment::new(),
-        }
+        let mut env = Environment::new();
+        // minijinja decides auto-escaping from the template's file extension,
+        // escaping only `.html`, `.htm` and `.xml` and leaving everything else
+        // raw. That rule is right for a library that can render into any
+        // format, and wrong here: [`Renderer::render`] has exactly one sink and
+        // stamps `text/html; charset=utf-8` on every reply it makes. Under the
+        // default callback a template the author called `page.txt`, or
+        // `partials/nav` with no extension at all, interpolated its values
+        // unescaped and was then shipped to a browser as HTML — a mislabelled
+        // response by construction, and a stored-XSS sink the moment one of
+        // those values came from a user. Pinning the policy to `Html` makes the
+        // escaping agree with the Content-Type instead of with the filename.
+        // `.html`/`.htm`/`.xml` are unaffected: the default already chose
+        // `Html` for all three.
+        env.set_auto_escape_callback(|_| AutoEscape::Html);
+        Self { env }
     }
 
     /// Add one template from a string, parsing it now.
     ///
-    /// The name carries the extension that decides auto-escaping, so call it
-    /// `something.html` for HTML.
+    /// The name is what handlers and `{% extends %}` refer to. It no longer
+    /// decides escaping — see [Escaping](crate#escaping) — but `something.html`
+    /// still reads better than `something`.
     ///
     /// # Errors
     ///
@@ -123,12 +149,27 @@ impl Templates {
     /// `templates/mail/welcome.html` is `mail/welcome.html`, which is also what
     /// `{% extends %}` and `{% include %}` inside them refer to.
     ///
+    /// Every file under `dir` is a template. There is no extension filter and
+    /// no skip list, so a `logo.png` or an editor artefact left beside the
+    /// templates is read as one too, and fails the boot with an [`Io`] error
+    /// naming the path if it is not valid UTF-8. That is the intended
+    /// behaviour rather than an oversight: a rule that quietly passed over
+    /// whatever did not look like a template would also pass over a real
+    /// template saved in the wrong encoding, and that omission would come back
+    /// as a `500` on the one route nobody exercises until Friday. Loud at boot
+    /// with the offending path in the message is the cheaper failure. Keep the
+    /// directory for templates and serve assets with `StaticFiles` from
+    /// `churust-core`'s `fs` feature.
+    ///
     /// # Errors
     ///
-    /// If `dir` is not a readable directory, or any template fails to parse.
-    /// Both are startup failures on purpose: a template that cannot be parsed
-    /// is a route that cannot answer, and finding that out at boot is cheaper
-    /// than finding out in production.
+    /// If `dir` is not a readable directory, if any file under it cannot be
+    /// read as UTF-8, or if any template fails to parse. All three are startup
+    /// failures on purpose: a template that cannot be parsed is a route that
+    /// cannot answer, and finding that out at boot is cheaper than finding out
+    /// in production.
+    ///
+    /// [`Io`]: TemplateSetupError::Io
     pub fn from_dir(dir: impl AsRef<Path>) -> std::result::Result<Self, TemplateSetupError> {
         let dir = dir.as_ref();
         if !dir.is_dir() {
@@ -171,6 +212,12 @@ impl Templates {
 
     /// Reach the underlying environment to register filters, tests, globals or
     /// a custom auto-escape policy.
+    ///
+    /// Order matters for escaping and only for escaping: minijinja resolves a
+    /// template's auto-escape mode while it parses it, so a
+    /// `set_auto_escape_callback` here reaches only the templates added after
+    /// it. Filters, tests and globals are looked up at render time and can be
+    /// registered whenever.
     ///
     /// ```
     /// use churust_templates::Templates;
@@ -367,6 +414,41 @@ mod tests {
             "an .html template must escape markup: {body}"
         );
         assert!(body.contains("&lt;script&gt;"));
+    }
+
+    #[test]
+    fn a_template_without_an_html_extension_escapes_all_the_same() {
+        // The extension used to decide this and the Content-Type did not, so
+        // the two could disagree. Now only the Content-Type has a say.
+        let templates = Templates::new()
+            .add("x.txt", "{{ value }}")
+            .expect("parses");
+        let view = Renderer(Arc::new(templates.env));
+        let res = view
+            .render("x.txt", context! { value => "<script>alert(1)</script>" })
+            .expect("renders");
+        let body = String::from_utf8(res.body.as_slice().unwrap().to_vec()).unwrap();
+        // The closing slash comes back as `&#x2f;` for the same reason it does
+        // in an `.html` template: the escaper will not leave a value anything
+        // it could use to close a tag with.
+        assert_eq!(body, "&lt;script&gt;alert(1)&lt;&#x2f;script&gt;");
+    }
+
+    #[test]
+    fn configure_can_hand_escaping_back_to_the_extension() {
+        // The escape hatch for an author who really is rendering something
+        // that is not HTML. It has to run before `add`, because minijinja
+        // resolves the mode as it parses.
+        let templates = Templates::new()
+            .configure(|env| env.set_auto_escape_callback(|_| AutoEscape::None))
+            .add("x.txt", "{{ value }}")
+            .expect("parses");
+        let view = Renderer(Arc::new(templates.env));
+        let res = view
+            .render("x.txt", context! { value => "a & b" })
+            .expect("renders");
+        let body = String::from_utf8(res.body.as_slice().unwrap().to_vec()).unwrap();
+        assert_eq!(body, "a & b");
     }
 
     #[test]

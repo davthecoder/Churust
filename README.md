@@ -68,7 +68,7 @@ churust = { version = "0.2", features = ["full", "ws", "fs", "tls"] }
 | `auth` | `churust-auth` | Bearer/Basic/JWT, `Principal<P>` |
 | `ratelimit` | `churust-ratelimit` | `RateLimit`, GCRA, keyed on the peer address |
 | `compression` | `churust-compression` | brotli / gzip / deflate response bodies |
-| `templates` | `churust-templates` | `Templates` + `Renderer`, minijinja, escaping by extension |
+| `templates` | `churust-templates` | `Templates` + `Renderer`, minijinja, HTML-escaped whatever the template is named |
 | `full` | the seven above | the whole plugin set |
 | `redis` | `churust-redis` | `RedisStore`: server-side sessions, revocable |
 | `client` | `churust-client` | an outbound HTTP client (`client-tls` for HTTPS) |
