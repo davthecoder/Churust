@@ -16,6 +16,15 @@ async fn defaults_are_applied_without_being_asked_for() {
     assert_eq!(res.header("x-content-type-options"), Some("nosniff"));
     assert_eq!(res.header("x-frame-options"), Some("DENY"));
     assert_eq!(res.header("referrer-policy"), Some("no-referrer"));
+    assert!(
+        res.header("permissions-policy")
+            .is_some_and(|v| v.contains("camera=()")),
+        "default Permissions-Policy should lock high-risk browser features"
+    );
+    assert_eq!(
+        res.header("cross-origin-resource-policy"),
+        Some("same-origin")
+    );
 }
 
 #[tokio::test]
@@ -69,6 +78,8 @@ async fn headers_can_be_turned_off_entirely() {
     assert!(res.header("x-content-type-options").is_none());
     assert!(res.header("x-frame-options").is_none());
     assert!(res.header("referrer-policy").is_none());
+    assert!(res.header("permissions-policy").is_none());
+    assert!(res.header("cross-origin-resource-policy").is_none());
 }
 
 #[tokio::test]

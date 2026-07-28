@@ -52,11 +52,21 @@ use http::HeaderValue;
 /// | `X-Frame-Options` | `DENY` |
 /// | `Referrer-Policy` | `no-referrer` |
 /// | `Strict-Transport-Security` | `max-age=31536000`, **only when TLS is configured** |
+/// | `Permissions-Policy` | sensors and high-risk features locked off (see below) |
+/// | `Cross-Origin-Resource-Policy` | `same-origin` |
 /// | `Content-Security-Policy` | off |
 ///
 /// There is no default Content-Security-Policy on purpose: a useful one is
 /// application-specific, and a generic one either breaks pages or is so
 /// permissive that it implies protection it does not give.
+///
+/// The default `Permissions-Policy` disables camera, microphone, geolocation,
+/// payment, USB, and interest-cohort (FLoC) access. JSON APIs never need those
+/// browser features, and an HTML app that does can override the header.
+///
+/// `Cross-Origin-Resource-Policy: same-origin` blocks no-cors cross-origin
+/// reads (Spectre-class resource loading). Cross-origin clients that use
+/// CORS still work; only opaque cross-origin embedding is refused.
 #[derive(Debug, Clone)]
 pub struct SecurityHeaders {
     content_type_options: Option<String>,
@@ -64,6 +74,8 @@ pub struct SecurityHeaders {
     referrer_policy: Option<String>,
     hsts: Option<String>,
     csp: Option<String>,
+    permissions_policy: Option<String>,
+    cross_origin_resource_policy: Option<String>,
 }
 
 impl Default for SecurityHeaders {
@@ -74,6 +86,11 @@ impl Default for SecurityHeaders {
             referrer_policy: Some("no-referrer".into()),
             hsts: Some("max-age=31536000".into()),
             csp: None,
+            permissions_policy: Some(
+                "camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()"
+                    .into(),
+            ),
+            cross_origin_resource_policy: Some("same-origin".into()),
         }
     }
 }
@@ -126,6 +143,21 @@ impl SecurityHeaders {
         self
     }
 
+    /// Set or disable `Permissions-Policy` (formerly Feature-Policy).
+    pub fn permissions_policy(mut self, v: Option<&str>) -> Self {
+        self.permissions_policy = v.map(Into::into);
+        self
+    }
+
+    /// Set or disable `Cross-Origin-Resource-Policy`.
+    ///
+    /// Default `same-origin`. Use `cross-origin` only when you deliberately
+    /// serve assets for no-cors embedding from other sites.
+    pub fn cross_origin_resource_policy(mut self, v: Option<&str>) -> Self {
+        self.cross_origin_resource_policy = v.map(Into::into);
+        self
+    }
+
     /// Fill in whichever of these headers a response does not already carry.
     ///
     /// Split out of the middleware so the transports can reuse it verbatim.
@@ -158,6 +190,16 @@ impl SecurityHeaders {
         set(X_FRAME_OPTIONS, &self.frame_options);
         set(REFERRER_POLICY, &self.referrer_policy);
         set(CONTENT_SECURITY_POLICY, &self.csp);
+        // Not in `http::header` constants yet on our MSRV floor; static names
+        // are stable header tokens.
+        set(
+            HeaderName::from_static("permissions-policy"),
+            &self.permissions_policy,
+        );
+        set(
+            HeaderName::from_static("cross-origin-resource-policy"),
+            &self.cross_origin_resource_policy,
+        );
         if over_tls {
             set(STRICT_TRANSPORT_SECURITY, &self.hsts);
         }

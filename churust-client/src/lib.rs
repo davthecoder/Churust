@@ -34,14 +34,26 @@
 //! you do not control is how one slow dependency becomes your own out-of-memory
 //! kill.
 //!
+//! # Compressed responses
+//!
+//! By default the client advertises `Accept-Encoding: gzip, deflate` and
+//! transparently inflates those encodings, so a peer that compresses — CDNs,
+//! many affiliate APIs — is not left as a bag of deflate bits on the caller.
+//! The decompressed size is still bounded by [`Client::max_response_bytes`]:
+//! a tiny compressed bomb that expands past the ceiling is refused, which is
+//! the same limit that protects against an uncompressed flood. Disable with
+//! [`Client::auto_decompress`]`(false)` when you need the raw bytes or want to
+//! negotiate encoding yourself.
+//!
 //! [Churust]: https://docs.rs/churust
 
 #![deny(missing_docs)]
 
 use bytes::Bytes;
+use flate2::read::{GzDecoder, ZlibDecoder};
 use http::header::{
-    HeaderName, HeaderValue, AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_TYPE, COOKIE,
-    LOCATION, PROXY_AUTHORIZATION, TRANSFER_ENCODING, USER_AGENT,
+    HeaderName, HeaderValue, ACCEPT_ENCODING, AUTHORIZATION, CONTENT_ENCODING, CONTENT_LENGTH,
+    CONTENT_TYPE, COOKIE, LOCATION, PROXY_AUTHORIZATION, TRANSFER_ENCODING, USER_AGENT,
 };
 use http::{HeaderMap, Method, Request, StatusCode, Uri};
 use http_body_util::{BodyExt, Full, Limited};
@@ -49,6 +61,7 @@ use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::TokioExecutor;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use std::io::{self, Read, Write};
 use std::time::Duration;
 
 /// Default ceiling on a response body, in bytes.
@@ -117,6 +130,8 @@ pub struct Client {
     max_redirects: usize,
     user_agent: HeaderValue,
     default_headers: HeaderMap,
+    /// When true (the default), advertise and decode gzip/deflate responses.
+    auto_decompress: bool,
 }
 
 impl Default for Client {
@@ -151,6 +166,7 @@ impl Client {
             max_redirects: DEFAULT_MAX_REDIRECTS,
             user_agent: HeaderValue::from_static(concat!("churust/", env!("CARGO_PKG_VERSION"))),
             default_headers: HeaderMap::new(),
+            auto_decompress: true,
         }
     }
 
@@ -164,6 +180,10 @@ impl Client {
     }
 
     /// Refuse a response body larger than `bytes`.
+    ///
+    /// The ceiling applies to the **payload the caller sees**: after transparent
+    /// decompression when that is enabled, so a compressed response cannot
+    /// expand past this limit either.
     pub fn max_response_bytes(mut self, bytes: usize) -> Self {
         self.max_response_bytes = bytes;
         self
@@ -172,6 +192,15 @@ impl Client {
     /// Follow at most `n` redirects. Zero returns the redirect response itself.
     pub fn max_redirects(mut self, n: usize) -> Self {
         self.max_redirects = n;
+        self
+    }
+
+    /// Advertise and decode `gzip` / `deflate` response bodies.
+    ///
+    /// Enabled by default. Set to `false` to leave `Content-Encoding` bodies
+    /// untouched and stop sending `Accept-Encoding`.
+    pub fn auto_decompress(mut self, enabled: bool) -> Self {
+        self.auto_decompress = enabled;
         self
     }
 
@@ -415,6 +444,14 @@ impl RequestBuilder {
             target
                 .entry(USER_AGENT)
                 .or_insert_with(|| client.user_agent.clone());
+            // Only advertise encodings we can actually inflate. Without this,
+            // a peer that compresses by default hands back bytes the caller
+            // cannot read; with it, decompression is the common path.
+            if client.auto_decompress && !stripped.contains(&ACCEPT_ENCODING) {
+                target
+                    .entry(ACCEPT_ENCODING)
+                    .or_insert_with(|| HeaderValue::from_static("gzip, deflate"));
+            }
 
             let response = client
                 .inner
@@ -516,12 +553,95 @@ impl RequestBuilder {
                     }
                 })?;
 
+            let mut headers = parts.headers;
+            let body = if client.auto_decompress {
+                maybe_decompress(
+                    &mut headers,
+                    collected.to_bytes(),
+                    client.max_response_bytes,
+                )?
+            } else {
+                collected.to_bytes()
+            };
+
             return Ok(Response {
                 status: parts.status,
-                headers: parts.headers,
-                body: collected.to_bytes(),
+                headers,
+                body,
             });
         }
+    }
+}
+
+/// Inflate a gzip/deflate body when `Content-Encoding` says so, then strip the
+/// headers that no longer describe the payload.
+///
+/// Unknown encodings are left alone so a future `br` peer still works once a
+/// decoder is added; the caller then sees the raw stream and the header.
+fn maybe_decompress(
+    headers: &mut HeaderMap,
+    body: Bytes,
+    max_bytes: usize,
+) -> Result<Bytes, ClientError> {
+    let Some(raw) = headers.get(CONTENT_ENCODING).and_then(|v| v.to_str().ok()) else {
+        return Ok(body);
+    };
+    // Take the first coding only — multi-layer stacks are rare on the open web
+    // and supporting them without streaming is more code than they are worth.
+    let coding = raw
+        .split(',')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+    let decoded = match coding.as_str() {
+        "gzip" | "x-gzip" => inflate_limited(GzDecoder::new(body.as_ref()), max_bytes)?,
+        // RFC 9110 §8.4.1.2: "deflate" is the zlib wrapper (RFC 1950), not raw
+        // DEFLATE. ZlibDecoder matches that; a peer that sends raw DEFLATE is
+        // non-conformant and fails here rather than silently corrupting data.
+        "deflate" => inflate_limited(ZlibDecoder::new(body.as_ref()), max_bytes)?,
+        "identity" | "" => return Ok(body),
+        _ => return Ok(body),
+    };
+    headers.remove(CONTENT_ENCODING);
+    // Length described the compressed wire form; keep it and every length
+    // check on the body is wrong by exactly the compression ratio.
+    headers.remove(CONTENT_LENGTH);
+    Ok(Bytes::from(decoded))
+}
+
+/// Read from `r` into a buffer that refuses to grow past `max_bytes`.
+fn inflate_limited<R: Read>(mut r: R, max_bytes: usize) -> Result<Vec<u8>, ClientError> {
+    let mut out = LimitedWriter {
+        buf: Vec::new(),
+        max: max_bytes,
+    };
+    match std::io::copy(&mut r, &mut out) {
+        Ok(_) => Ok(out.buf),
+        Err(e) if e.kind() == io::ErrorKind::Other && e.to_string().contains("body too large") => {
+            Err(ClientError::BodyTooLarge(max_bytes))
+        }
+        Err(e) => Err(ClientError::Decode(format!("decompress: {e}"))),
+    }
+}
+
+/// A [`Write`] that errors once the accumulated length would exceed `max`.
+struct LimitedWriter {
+    buf: Vec<u8>,
+    max: usize,
+}
+
+impl Write for LimitedWriter {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        if self.buf.len().saturating_add(data.len()) > self.max {
+            return Err(io::Error::new(io::ErrorKind::Other, "body too large"));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -662,7 +782,10 @@ impl Response {
     ///
     /// If the body is not valid UTF-8.
     pub fn text(&self) -> Result<String, ClientError> {
-        String::from_utf8(self.body.to_vec()).map_err(|e| ClientError::Decode(e.to_string()))
+        // Validate in place, then allocate once — avoid `to_vec` + from_utf8.
+        std::str::from_utf8(&self.body)
+            .map(str::to_owned)
+            .map_err(|e| ClientError::Decode(e.to_string()))
     }
 
     /// The body deserialized from JSON.
