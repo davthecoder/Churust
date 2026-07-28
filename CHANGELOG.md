@@ -15,6 +15,18 @@ whole set.
 
 Nothing yet.
 
+## [0.3.2] - 2026-07-29
+
+### Changed
+
+- **Security headers parse once at config time.** `SecurityHeaders` stores
+  ready-made `HeaderValue`s (and static header names for Permissions-Policy /
+  CORP), so each response only does contains-key + insert instead of
+  re-parsing the same constant strings on the hot path.
+
+- **`CallLogging` prepares the `x-request-id` header value before dispatch**,
+  avoiding a second string parse on the response path.
+
 ## [0.3.1] - 2026-07-28
 
 ### Added
@@ -1241,7 +1253,8 @@ First public release.
   panicking handler returns 500 rather than killing the server), and no version
   banner.
 
-[Unreleased]: https://github.com/davthecoder/Churust/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/davthecoder/Churust/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/davthecoder/Churust/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/davthecoder/Churust/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/davthecoder/Churust/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/davthecoder/Churust/compare/v0.1.1...v0.2.0
