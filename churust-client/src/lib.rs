@@ -634,7 +634,7 @@ struct LimitedWriter {
 impl Write for LimitedWriter {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         if self.buf.len().saturating_add(data.len()) > self.max {
-            return Err(io::Error::new(io::ErrorKind::Other, "body too large"));
+            return Err(io::Error::other("body too large"));
         }
         self.buf.extend_from_slice(data);
         Ok(data.len())
