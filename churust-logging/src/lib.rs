@@ -203,14 +203,17 @@ struct LogMiddleware {
 impl Middleware for LogMiddleware {
     async fn handle(&self, mut call: Call, next: Next) -> Response {
         let method = call.method().clone();
-        let path = call.path().to_string();
+        // Owned before dispatch: `next.run` consumes `call`.
+        let path = call.path().to_owned();
 
         // Continue an inbound trace when the caller supplied one, so a request
         // crossing service boundaries keeps a single trace id. Otherwise start
         // one, which is what makes correlation possible at all.
         let id = RequestId::from_call(&call);
-        let trace_id = id.trace_id.clone();
         let request_id = id.request_id.clone();
+        let trace_id = id.trace_id.clone();
+        // Build the response header once; hex ids are always valid header values.
+        let request_id_header = http::HeaderValue::from_str(&request_id).ok();
         call.insert(id);
 
         let start = Instant::now();
@@ -219,7 +222,7 @@ impl Middleware for LogMiddleware {
         let status = res.status.as_u16();
 
         // Echo it back so a client can quote the id in a bug report.
-        if let Ok(v) = http::HeaderValue::from_str(&request_id) {
+        if let Some(v) = request_id_header {
             res.headers
                 .insert(http::header::HeaderName::from_static("x-request-id"), v);
         }

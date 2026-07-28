@@ -42,6 +42,17 @@ use http::header::{
 };
 use http::HeaderValue;
 
+/// Header names not yet on our MSRV floor of `http::header` constants.
+static PERMISSIONS_POLICY: HeaderName = HeaderName::from_static("permissions-policy");
+static CROSS_ORIGIN_RESOURCE_POLICY: HeaderName =
+    HeaderName::from_static("cross-origin-resource-policy");
+
+/// Parse a header value once at configuration time. Invalid tokens become
+/// `None` so a bad override cannot panic on every request.
+fn header_value(v: &str) -> Option<HeaderValue> {
+    HeaderValue::from_str(v).ok()
+}
+
 /// Which security headers to add, and with what values.
 ///
 /// `None` for any field disables that header. Defaults:
@@ -67,30 +78,33 @@ use http::HeaderValue;
 /// `Cross-Origin-Resource-Policy: same-origin` blocks no-cors cross-origin
 /// reads (Spectre-class resource loading). Cross-origin clients that use
 /// CORS still work; only opaque cross-origin embedding is refused.
+///
+/// Values are parsed into [`HeaderValue`]s when the config is built, so the
+/// per-response path is only a contains-key check and an insert — not
+/// re-parsing the same constant strings on every request.
 #[derive(Debug, Clone)]
 pub struct SecurityHeaders {
-    content_type_options: Option<String>,
-    frame_options: Option<String>,
-    referrer_policy: Option<String>,
-    hsts: Option<String>,
-    csp: Option<String>,
-    permissions_policy: Option<String>,
-    cross_origin_resource_policy: Option<String>,
+    content_type_options: Option<HeaderValue>,
+    frame_options: Option<HeaderValue>,
+    referrer_policy: Option<HeaderValue>,
+    hsts: Option<HeaderValue>,
+    csp: Option<HeaderValue>,
+    permissions_policy: Option<HeaderValue>,
+    cross_origin_resource_policy: Option<HeaderValue>,
 }
 
 impl Default for SecurityHeaders {
     fn default() -> Self {
         Self {
-            content_type_options: Some("nosniff".into()),
-            frame_options: Some("DENY".into()),
-            referrer_policy: Some("no-referrer".into()),
-            hsts: Some("max-age=31536000".into()),
+            content_type_options: header_value("nosniff"),
+            frame_options: header_value("DENY"),
+            referrer_policy: header_value("no-referrer"),
+            hsts: header_value("max-age=31536000"),
             csp: None,
-            permissions_policy: Some(
-                "camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()"
-                    .into(),
+            permissions_policy: header_value(
+                "camera=(), microphone=(), geolocation=(), payment=(), usb=(), interest-cohort=()",
             ),
-            cross_origin_resource_policy: Some("same-origin".into()),
+            cross_origin_resource_policy: header_value("same-origin"),
         }
     }
 }
@@ -103,19 +117,19 @@ impl SecurityHeaders {
 
     /// Set or disable `X-Content-Type-Options`.
     pub fn content_type_options(mut self, v: Option<&str>) -> Self {
-        self.content_type_options = v.map(Into::into);
+        self.content_type_options = v.and_then(header_value);
         self
     }
 
     /// Set or disable `X-Frame-Options`.
     pub fn frame_options(mut self, v: Option<&str>) -> Self {
-        self.frame_options = v.map(Into::into);
+        self.frame_options = v.and_then(header_value);
         self
     }
 
     /// Set or disable `Referrer-Policy`.
     pub fn referrer_policy(mut self, v: Option<&str>) -> Self {
-        self.referrer_policy = v.map(Into::into);
+        self.referrer_policy = v.and_then(header_value);
         self
     }
 
@@ -133,19 +147,19 @@ impl SecurityHeaders {
     /// mode — `server_config_from_pem` pins TLS 1.3 — so an h3 response is
     /// encrypted whether or not the builder was ever told about a certificate.
     pub fn hsts(mut self, v: Option<&str>) -> Self {
-        self.hsts = v.map(Into::into);
+        self.hsts = v.and_then(header_value);
         self
     }
 
     /// Set a `Content-Security-Policy`. Off by default.
     pub fn content_security_policy(mut self, v: Option<&str>) -> Self {
-        self.csp = v.map(Into::into);
+        self.csp = v.and_then(header_value);
         self
     }
 
     /// Set or disable `Permissions-Policy` (formerly Feature-Policy).
     pub fn permissions_policy(mut self, v: Option<&str>) -> Self {
-        self.permissions_policy = v.map(Into::into);
+        self.permissions_policy = v.and_then(header_value);
         self
     }
 
@@ -154,7 +168,7 @@ impl SecurityHeaders {
     /// Default `same-origin`. Use `cross-origin` only when you deliberately
     /// serve assets for no-cors embedding from other sites.
     pub fn cross_origin_resource_policy(mut self, v: Option<&str>) -> Self {
-        self.cross_origin_resource_policy = v.map(Into::into);
+        self.cross_origin_resource_policy = v.and_then(header_value);
         self
     }
 
@@ -174,34 +188,27 @@ impl SecurityHeaders {
     /// present, which is the same rule that lets a handler override a default,
     /// so calling it twice on one response cannot change the result.
     pub(crate) fn apply_to(&self, headers: &mut http::HeaderMap, over_tls: bool) {
-        let mut set = |name: HeaderName, value: &Option<String>| {
+        let mut set = |name: &HeaderName, value: &Option<HeaderValue>| {
             let Some(v) = value else { return };
             // The application wins. A handler that set this header did so on
             // purpose, and silently overwriting it would be a trap.
-            if headers.contains_key(&name) {
+            if headers.contains_key(name) {
                 return;
             }
-            if let Ok(hv) = HeaderValue::from_str(v) {
-                headers.insert(name, hv);
-            }
+            headers.insert(name, v.clone());
         };
 
-        set(X_CONTENT_TYPE_OPTIONS, &self.content_type_options);
-        set(X_FRAME_OPTIONS, &self.frame_options);
-        set(REFERRER_POLICY, &self.referrer_policy);
-        set(CONTENT_SECURITY_POLICY, &self.csp);
-        // Not in `http::header` constants yet on our MSRV floor; static names
-        // are stable header tokens.
+        set(&X_CONTENT_TYPE_OPTIONS, &self.content_type_options);
+        set(&X_FRAME_OPTIONS, &self.frame_options);
+        set(&REFERRER_POLICY, &self.referrer_policy);
+        set(&CONTENT_SECURITY_POLICY, &self.csp);
+        set(&PERMISSIONS_POLICY, &self.permissions_policy);
         set(
-            HeaderName::from_static("permissions-policy"),
-            &self.permissions_policy,
-        );
-        set(
-            HeaderName::from_static("cross-origin-resource-policy"),
+            &CROSS_ORIGIN_RESOURCE_POLICY,
             &self.cross_origin_resource_policy,
         );
         if over_tls {
-            set(STRICT_TRANSPORT_SECURITY, &self.hsts);
+            set(&STRICT_TRANSPORT_SECURITY, &self.hsts);
         }
     }
 
