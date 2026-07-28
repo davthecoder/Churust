@@ -19,6 +19,9 @@ routing DSL, an `install(plugin)` system, and a phased interceptor pipeline —
 built on a battle-tested async stack (**tokio + hyper + rustls**). Churust owns
 the ergonomic layer; it does not reinvent HTTP parsing or TLS.
 
+Coming from Kotlin/Ktor? See **[From Ktor to Churust](getting-started/from-ktor.md)**
+for side-by-side examples (routes, `install`, JSON, auth, config, tests).
+
 ```rust
 use churust::prelude::*;
 
@@ -52,6 +55,7 @@ async fn main() -> std::io::Result<()> {
 | Section | Purpose |
 | --- | --- |
 | [Getting started](getting-started/quick-start.md) | Install, run your first server |
+| [From Ktor to Churust](getting-started/from-ktor.md) | Side-by-side Ktor (Kotlin) ↔ Churust (Rust) |
 | [Fundamentals](fundamentals/routing.md) | Routing, extractors, plugins, config, tests |
 | [Plugins & features](plugins/overview.md) | One page per optional capability |
 | [Recipes](recipes/json-api.md) | End-to-end examples from the repo |
