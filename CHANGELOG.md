@@ -13,7 +13,40 @@ whole set.
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **`churust-client` transparently decodes `gzip` and `deflate` response bodies.**
+  The client advertises `Accept-Encoding: gzip, deflate` by default and inflates
+  those encodings before handing the body to the caller, so a peer that
+  compresses (CDNs, many affiliate APIs) is usable without application-side
+  `flate2`. Decompressed size is still capped by `max_response_bytes`, which
+  closes the classic compression-bomb path of a tiny payload that expands past
+  memory. Opt out with `Client::auto_decompress(false)`.
+
+- **Default `Permissions-Policy` and `Cross-Origin-Resource-Policy` on every
+  response.** New secure defaults on `SecurityHeaders`:
+  - `Permissions-Policy: camera=(), microphone=(), geolocation=(), payment=(),
+    usb=(), interest-cohort=()` — browser features a JSON API never needs.
+  - `Cross-Origin-Resource-Policy: same-origin` — blocks no-cors cross-origin
+    reads; CORS clients are unaffected.
+  Override or disable with `SecurityHeaders::permissions_policy` /
+  `cross_origin_resource_policy`, or turn the whole set off with
+  `without_security_headers()`.
+
+### Changed
+
+- **`Client::max_response_bytes` is documented and enforced on the payload the
+  caller sees**, including after decompression, not only on the compressed wire
+  form.
+
+- **`Response::text` validates UTF-8 without an intermediate `to_vec`**, saving
+  one allocation on every successful text body.
+
+### Security
+
+- Default response headers now include `Permissions-Policy` and
+  `Cross-Origin-Resource-Policy` as above. Existing apps that relied on the
+  *absence* of those headers should set them explicitly or disable the defaults.
 
 ## [0.3.0] - 2026-07-26
 

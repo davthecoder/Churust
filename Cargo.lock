@@ -222,6 +222,7 @@ version = "0.3.0"
 dependencies = [
  "bytes",
  "churust-core",
+ "flate2",
  "http",
  "http-body-util",
  "hyper",

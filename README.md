@@ -71,7 +71,7 @@ churust = { version = "0.3", features = ["full", "ws", "fs", "tls"] }
 | `templates` | `churust-templates` | `Templates` + `Renderer`, minijinja, HTML-escaped whatever the template is named |
 | `full` | the seven above | the whole plugin set |
 | `redis` | `churust-redis` | `RedisStore`: server-side sessions, revocable |
-| `client` | `churust-client` | an outbound HTTP client (`client-tls` for HTTPS) |
+| `client` | `churust-client` | outbound HTTP client with transparent gzip/deflate decode (`client-tls` for HTTPS) |
 | `openapi` | `churust-openapi` | an OpenAPI 3.1 document from the router |
 | `ws` | `churust-core/ws` | WebSocket upgrade + `WebSocket`/`Message` |
 | `fs` | `churust-core/fs` | `StaticFiles`, conditional GET, byte ranges |
@@ -143,7 +143,8 @@ Every Churust crate is released in lockstep on one version number, so
 - **Server-side sessions** — Redis-backed, so logging out actually revokes, and
   a revocation that could not be carried out is an error rather than a cheerful
   `200` over a session that is still live (feature `redis`).
-- **An HTTP client** — pooled, bounded, on the same hyper the server runs on
+- **An HTTP client** — pooled, bounded, on the same hyper the server runs on;
+  transparent gzip/deflate decode with a decompression-bomb ceiling
   (feature `client`).
 - **OpenAPI 3.1** — paths and parameters from the router, prose and schemas from
   you, with drift reported in both directions (feature `openapi`).

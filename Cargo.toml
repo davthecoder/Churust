@@ -104,6 +104,10 @@ sha2 = "0.10"
 # as the zlib format of RFC 1950, and async-compression's `DeflateEncoder`
 # emits raw RFC 1951 instead, which several clients reject.
 async-compression = { version = "0.4", features = ["tokio", "gzip", "zlib", "brotli"] }
+# Synchronous gzip/zlib inflate for the outbound client: the body is already
+# buffered (see `max_response_bytes`), so an async decoder would only add
+# ceremony. Same RFC 1950 deflate shape as the response compression plugin.
+flate2 = "1"
 # Bridges a `Stream` of chunks and an `AsyncRead`, in both directions. Only the
 # `io` feature; the rest of tokio-util is not used.
 tokio-util = { version = "0.7", features = ["io"] }
