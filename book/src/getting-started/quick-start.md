@@ -94,6 +94,7 @@ That example also shows query parameters and typed app state. See
 
 ## Next steps
 
+- Know Ktor already? → [From Ktor to Churust](from-ktor.md)
 - Enable plugins and transports → [Installation & features](installation.md)
 - Learn extractors in depth → [Handlers & extractors](../fundamentals/handlers-extractors.md)
 - Build a JSON API → [JSON API recipe](../recipes/json-api.md)

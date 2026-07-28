@@ -5,6 +5,7 @@
 # Getting started
 
 - [Quick start](getting-started/quick-start.md)
+- [From Ktor to Churust](getting-started/from-ktor.md)
 - [Installation & features](getting-started/installation.md)
 - [Project layout](getting-started/project-layout.md)
 
