@@ -21,20 +21,16 @@ async fn serve_compressed() -> String {
                 let mut enc = GzEncoder::new(Vec::new(), Compression::default());
                 enc.write_all(b"hello gzip").unwrap();
                 let body = enc.finish().unwrap();
-                Response::bytes("text/plain", body).with_header(
-                    CONTENT_ENCODING,
-                    HeaderValue::from_static("gzip"),
-                )
+                Response::bytes("text/plain", body)
+                    .with_header(CONTENT_ENCODING, HeaderValue::from_static("gzip"))
             });
             r.get("/deflate", |_c: Call| async {
                 // zlib-wrapped DEFLATE — RFC 9110's "deflate" content coding.
                 let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
                 enc.write_all(b"hello deflate").unwrap();
                 let body = enc.finish().unwrap();
-                Response::bytes("text/plain", body).with_header(
-                    CONTENT_ENCODING,
-                    HeaderValue::from_static("deflate"),
-                )
+                Response::bytes("text/plain", body)
+                    .with_header(CONTENT_ENCODING, HeaderValue::from_static("deflate"))
             });
             r.get("/plain", |_c: Call| async {
                 Response::bytes("text/plain", "already clear")
@@ -48,10 +44,8 @@ async fn serve_compressed() -> String {
                     enc.write_all(&chunk).unwrap();
                 }
                 let body = enc.finish().unwrap();
-                Response::bytes("application/octet-stream", body).with_header(
-                    CONTENT_ENCODING,
-                    HeaderValue::from_static("gzip"),
-                )
+                Response::bytes("application/octet-stream", body)
+                    .with_header(CONTENT_ENCODING, HeaderValue::from_static("gzip"))
             });
             r.get("/accept", |c: Call| async move {
                 c.header("accept-encoding").unwrap_or("none").to_string()
@@ -77,7 +71,11 @@ async fn serve_compressed() -> String {
 #[tokio::test]
 async fn gzip_body_is_inflated() {
     let base = serve_compressed().await;
-    let res = Client::new().get(format!("{base}/gzip")).send().await.unwrap();
+    let res = Client::new()
+        .get(format!("{base}/gzip"))
+        .send()
+        .await
+        .unwrap();
     assert_eq!(res.status().as_u16(), 200);
     assert_eq!(res.text().unwrap(), "hello gzip");
     assert!(

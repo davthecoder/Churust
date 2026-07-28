@@ -448,9 +448,9 @@ impl RequestBuilder {
             // a peer that compresses by default hands back bytes the caller
             // cannot read; with it, decompression is the common path.
             if client.auto_decompress && !stripped.contains(&ACCEPT_ENCODING) {
-                target.entry(ACCEPT_ENCODING).or_insert_with(|| {
-                    HeaderValue::from_static("gzip, deflate")
-                });
+                target
+                    .entry(ACCEPT_ENCODING)
+                    .or_insert_with(|| HeaderValue::from_static("gzip, deflate"));
             }
 
             let response = client
@@ -555,7 +555,11 @@ impl RequestBuilder {
 
             let mut headers = parts.headers;
             let body = if client.auto_decompress {
-                maybe_decompress(&mut headers, collected.to_bytes(), client.max_response_bytes)?
+                maybe_decompress(
+                    &mut headers,
+                    collected.to_bytes(),
+                    client.max_response_bytes,
+                )?
             } else {
                 collected.to_bytes()
             };
