@@ -1,0 +1,98 @@
+/* Churust docs — light brand accents on mdBook defaults */
+
+:root {
+  --churust-accent: #c45c26;
+  --churust-accent-soft: rgba(196, 92, 38, 0.12);
+  --churust-ink: #1a1410;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+.sidebar .sidebar-scrollbox {
+  padding-top: 0.5rem;
+}
+
+.chapter li.chapter-item.expanded > a,
+.chapter li.chapter-item > a:hover {
+  color: var(--churust-accent);
+}
+
+.menu-title {
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.content a {
+  color: var(--churust-accent);
+}
+
+.content a:hover {
+  text-decoration: underline;
+}
+
+.content h1,
+.content h2 {
+  border-bottom: 1px solid var(--churust-accent-soft);
+  padding-bottom: 0.25em;
+}
+
+.content table {
+  width: 100%;
+  display: table;
+}
+
+.content table th {
+  background: var(--churust-accent-soft);
+}
+
+.content blockquote {
+  border-left-color: var(--churust-accent);
+  background: var(--churust-accent-soft);
+}
+
+.hero-logo {
+  display: block;
+  margin: 0 auto 1.25rem;
+  max-width: 220px;
+  height: auto;
+}
+
+.badge-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  justify-content: center;
+  margin: 1rem 0 1.5rem;
+}
+
+.badge-row img {
+  height: 20px;
+}
+
+.feature-tag {
+  display: inline-block;
+  font-size: 0.75rem;
+  font-weight: 600;
+  padding: 0.1rem 0.45rem;
+  border-radius: 999px;
+  background: var(--churust-accent-soft);
+  color: var(--churust-accent);
+  vertical-align: middle;
+  margin-left: 0.35rem;
+}
+
+.warning-box {
+  border-left: 4px solid #b45309;
+  background: rgba(180, 83, 9, 0.08);
+  padding: 0.75rem 1rem;
+  margin: 1rem 0;
+}
+
+.tip-box {
+  border-left: 4px solid #0f766e;
+  background: rgba(15, 118, 110, 0.08);
+  padding: 0.75rem 1rem;
+  margin: 1rem 0;
+}

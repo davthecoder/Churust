@@ -2,6 +2,9 @@
 /target
 **/target
 
+# mdBook output (source lives in book/src; build with `mdbook build` in book/)
+/book/book
+
 # Cargo.lock *is* committed, and it changes nothing for consumers: cargo ignores
 # a dependency's lockfile, so every downstream application still resolves its
 # own versions. What it buys is CI testing the dependency set the author tested,

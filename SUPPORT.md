@@ -4,6 +4,7 @@
 
 | You want to | Go to |
 | --- | --- |
+| Follow a how-to guide | [User documentation](https://davthecoder.github.io/Churust/) (`book/` in this repo) |
 | Learn the API | [docs.rs/churust](https://docs.rs/churust) |
 | See working code | [`examples/`](https://github.com/davthecoder/Churust/tree/main/examples) — hello, api, chat, static |
 | Understand a design decision | [`docs/design/`](https://github.com/davthecoder/Churust/tree/main/docs/design) |
