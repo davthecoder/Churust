@@ -12,10 +12,13 @@
 <p align="center">
   <a href="https://crates.io/crates/churust"><img src="https://img.shields.io/crates/v/churust.svg" alt="crates.io" /></a>
   <a href="https://docs.rs/churust"><img src="https://docs.rs/churust/badge.svg" alt="docs.rs" /></a>
+  <a href="https://davthecoder.github.io/Churust/"><img src="https://img.shields.io/badge/guide-GitHub%20Pages-orange.svg" alt="User guide" /></a>
   <a href="https://github.com/davthecoder/Churust/actions/workflows/ci.yml"><img src="https://github.com/davthecoder/Churust/actions/workflows/ci.yml/badge.svg" alt="CI" /></a>
   <img src="https://img.shields.io/badge/rust-1.96%2B-blue.svg" alt="MSRV 1.96" />
   <a href="https://github.com/davthecoder/Churust/blob/main/LICENSE"><img src="https://img.shields.io/crates/l/churust.svg" alt="MIT" /></a>
 </p>
+
+**Guides:** [User documentation](https://davthecoder.github.io/Churust/) (quick start, plugins, recipes) · **API:** [docs.rs/churust](https://docs.rs/churust)
 
 Churust gives you Ktor's developer experience in Rust: an application engine, a
 routing DSL, an `install(plugin)` system, and a phased interceptor pipeline —
