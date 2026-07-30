@@ -119,3 +119,7 @@ socket2 = { workspace = true }
 [[bench]]
 name = "dispatch"
 harness = false
+
+[[bench]]
+name = "routing"
+harness = false
