@@ -11,5 +11,9 @@ publish = false
 #
 # This example uses tokio's `broadcast` and `select!` and still needs no tokio
 # dependency — it reaches them through `churust::tokio`.
+# Inherits `unsafe_code = "forbid"` from the workspace.
+[lints]
+workspace = true
+
 [dependencies]
 churust = { workspace = true, features = ["ws"] }

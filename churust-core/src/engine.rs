@@ -137,6 +137,30 @@ fn bind_tcp(addr: SocketAddr, backlog: u32) -> std::io::Result<tokio::net::TcpLi
     socket.listen(backlog)
 }
 
+/// Bind a Unix socket, with the backlog Churust was told to use.
+///
+/// Bound through a socket for the same reason `bind_tcp` is: neither std's nor
+/// tokio's `UnixListener::bind` lets the backlog be chosen, so this listener
+/// silently used the platform default — 128 on Linux — however `backlog` was
+/// set. tokio has a `TcpSocket` but no `UnixSocket`, hence `socket2` here and
+/// not there.
+///
+/// The caller is responsible for having established that any node already at
+/// `path` is stale; this only binds.
+#[cfg(unix)]
+fn bind_unix(path: &std::path::Path, backlog: u32) -> std::io::Result<tokio::net::UnixListener> {
+    let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
+    socket.bind(&socket2::SockAddr::unix(path)?)?;
+    // Saturating rather than `as`: `backlog` is a `u32` an operator fills in, and
+    // wrapping a large one into a negative `c_int` would ask the kernel for a
+    // backlog of nonsense.
+    socket.listen(backlog.min(i32::MAX as u32) as i32)?;
+    // tokio requires a non-blocking listener; `from_std` documents this as the
+    // caller's job.
+    socket.set_nonblocking(true)?;
+    tokio::net::UnixListener::from_std(std::os::unix::net::UnixListener::from(socket))
+}
+
 /// Serve on an already-bound listener until `shutdown` resolves.
 async fn serve_listener<F>(
     app: App,
@@ -412,6 +436,9 @@ pub(crate) struct ConnGuard(#[allow(dead_code)] std::sync::Arc<ConnGuardInner>);
 
 pub(crate) struct ConnGuardInner {
     _slot: ConnSlot,
+    /// Underscored because only the `ws` build reads it: for an HTTP connection
+    /// the token is held, not watched — `serve_stream` watches the signal
+    /// directly — and merely holding it is what makes the drain wait.
     _token: DrainToken,
 }
 
@@ -421,6 +448,24 @@ impl ConnGuard {
             _slot: slot,
             _token: token,
         }))
+    }
+
+    /// Resolves when the server has been asked to shut down.
+    ///
+    /// Holding a drain token makes the drain *wait* for this connection; it does
+    /// not tell the connection to wind down. For an HTTP connection the loop in
+    /// `serve_stream` watches the signal and does that. An upgraded WebSocket
+    /// leaves that loop the moment the `101` is dispatched — hyper resolves the
+    /// connection there and the socket lives on in a detached task — so the task
+    /// has to watch the signal itself, and until it could, every shutdown waited
+    /// out the full grace period for any live WebSocket and never returned at all
+    /// at `shutdown_timeout_ms = 0`.
+    #[cfg(feature = "ws")]
+    pub(crate) async fn draining(&self) {
+        let mut signal = self.0._token.signal.clone();
+        // `wait_for` rather than `changed`, so a signal that fired before this
+        // was called is still seen — the same reason `serve_stream` uses it.
+        let _ = signal.wait_for(|fired| *fired).await;
     }
 }
 
@@ -507,9 +552,26 @@ struct ConnActivity {
     in_flight: std::sync::atomic::AtomicUsize,
     /// Milliseconds since `origin` at the end of the last request.
     last_ms: std::sync::atomic::AtomicU64,
+    /// Whether any request has finished on this connection.
+    ///
+    /// Separate from `last_ms` rather than derived from it, because `last_ms` is
+    /// a millisecond count from `origin` and a request served in under a
+    /// millisecond stores `0` — indistinguishable from "nothing has run yet".
+    /// The `keep_alive_ms == 0` close needs exactly that distinction, and it is
+    /// the fast request that would get it wrong.
+    served: std::sync::atomic::AtomicBool,
     /// Fixed reference point, so activity is a cheap integer rather than a
     /// mutex around an `Instant`.
     origin: tokio::time::Instant,
+    /// Signalled when a request finishes, for the `keep_alive_ms == 0` close.
+    ///
+    /// `notify_one` rather than `notify_waiters`, because the two are not
+    /// equivalent under a `select!`: the loop re-creates its `notified()` future
+    /// on every iteration, so a wake delivered while it was polling another
+    /// branch would be lost. `notify_one` stores a permit instead, and the next
+    /// `notified()` consumes it — the completion cannot be missed whatever the
+    /// loop happened to be doing.
+    request_finished: tokio::sync::Notify,
 }
 
 /// Holds a connection's "a request is in flight" count for as long as it lives.
@@ -536,8 +598,14 @@ impl Drop for InFlight {
             std::sync::atomic::Ordering::Relaxed,
         );
         self.0
+            .served
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.0
             .in_flight
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        // After the decrement, so a loop woken by this observes the count it is
+        // about to act on rather than the one that was still standing.
+        self.0.request_finished.notify_one();
     }
 }
 
@@ -591,13 +659,35 @@ impl ConnActivity {
         Self {
             in_flight: std::sync::atomic::AtomicUsize::new(0),
             last_ms: std::sync::atomic::AtomicU64::new(0),
+            served: std::sync::atomic::AtomicBool::new(false),
             origin: tokio::time::Instant::now(),
+            request_finished: tokio::sync::Notify::new(),
         }
     }
 
     /// Whether a request is being served right now.
     fn busy(&self) -> bool {
         self.in_flight.load(std::sync::atomic::Ordering::Relaxed) > 0
+    }
+
+    /// Whether any request on this connection has finished.
+    ///
+    /// Set when an [`InFlight`] guard drops, which is after the response body
+    /// has been written.
+    ///
+    /// Used by the `keep_alive_ms == 0` branch of the connection loop, which must
+    /// close *after* a response and not before the first one. Deliberately not
+    /// `last_ms > 0`: that is a millisecond count from the connection's own
+    /// start, so a request served in under a millisecond records `0` and would
+    /// read as "nothing has run yet" — leaving the fast connections, which is to
+    /// say most of them, never closed.
+    fn has_served(&self) -> bool {
+        self.served.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Resolves when a request has finished since the last time it was awaited.
+    async fn request_finished(&self) {
+        self.request_finished.notified().await;
     }
 
     /// `None` if the connection has been idle for at least `keep_alive_ms`,
@@ -902,9 +992,31 @@ where
     // second. Probing with a connect distinguishes the two cases the way any
     // other server does it — a refused connection means nobody is listening,
     // and an accepted one means the path is genuinely in use.
+    // A Unix socket carries no TLS, and this listener never consulted the
+    // setting — so an application configured with `tls` served *plaintext* here
+    // while `apply_security_headers` kept asserting HSTS on every response,
+    // because that gate reads `config.tls.is_some()` rather than the transport.
+    // The result was a cleartext service telling its clients it was
+    // HTTPS-only.
+    //
+    // Refused rather than downgraded. The two settings contradict each other —
+    // "terminate TLS with this certificate" and "listen on a Unix socket" cannot
+    // both be honoured — and silently picking one is how the mismatch went
+    // unnoticed. An application fronted by a TLS-terminating proxy should not be
+    // configuring `tls` at all; one that is has said something it does not mean.
+    if app.config().tls.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "this app is configured for TLS, which a Unix socket cannot carry: \
+             serving it here would be cleartext while still advertising HSTS. \
+             Drop the `tls` configuration to serve over a Unix socket, or use \
+             `serve`/`start` to terminate TLS on a TCP listener.",
+        ));
+    }
+
     unlink_if_stale(path).await?;
 
-    let listener = tokio::net::UnixListener::bind(path)?;
+    let listener = bind_unix(path, app.config().backlog)?;
     // Remember which inode this bind produced. At shutdown the node at `path`
     // may no longer be ours, and removing whatever happens to be there then
     // would leave a live successor serving a path with no socket on it. See
@@ -1133,7 +1245,12 @@ async fn serve_stream<S>(
         // The idle deadline. Re-armed on every wake that finds the connection
         // busy or recently active, so the common case costs one timer per
         // connection rather than one per request.
+        //
+        // `keep_alive_ms == 0` is handled by its own branch below rather than by
+        // this timer, because it is not a deadline: it means "answer and close",
+        // so the moment to act is a request finishing, not a period elapsing.
         let idle_enabled = cfg.keep_alive_ms > 0;
+        let zero_keep_alive = cfg.keep_alive_ms == 0;
         let idle = tokio::time::sleep(std::time::Duration::from_millis(if idle_enabled {
             cfg.keep_alive_ms
         } else {
@@ -1153,8 +1270,9 @@ async fn serve_stream<S>(
         // and the sniffing it does first carries no timer, so this is the only
         // thing standing between a silent socket and a permit held for the life
         // of the process — the idle watchdog is a backstop at `keep_alive_ms`
-        // rather than at the advertised deadline, and `keep_alive_ms` of 0
-        // disables it outright.
+        // rather than at the advertised deadline, and at `keep_alive_ms` of 0 it
+        // deliberately waits for a first response before closing anything, so it
+        // does not cover this phase either.
         //
         // It stops applying at negotiation, not at the first request: an HTTP/2
         // client that has handshaken is entitled to idle for far longer than
@@ -1247,6 +1365,47 @@ async fn serve_stream<S>(
                         // — but an idle connection does not necessarily close
                         // on its own, which is what this linger is for
                         // elsewhere too.
+                        linger
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + GOAWAY_LINGER);
+                        lingering = true;
+                    }
+                }
+                // `keep_alive_ms == 0` means "answer and close". hyper does that
+                // for HTTP/1 via `keep_alive(false)` above and has no h2
+                // counterpart, and the idle watchdog used to be switched off
+                // entirely at 0 — so an HTTP/2 connection got neither, and was
+                // held for the life of the process. That is the "never expires"
+                // reading `http3::idle_ms_for` refused for QUIC, and it made the
+                // strictest setting available *weaker* than the 75s default.
+                //
+                // Woken by a request finishing rather than by a timer: the moment
+                // to close is when nothing is in flight, and `InFlight`'s `Drop`
+                // is what knows when that is. A timer would have to guess an
+                // interval, and the obvious small one costs a wake every interval
+                // for as long as a handler runs — measured at ~40/second against a
+                // one-second handler, and `request_timeout_ms` allows thirty. This
+                // is one wake per completed request instead.
+                //
+                // Gated on `has_served` so the pre-protocol phase stays the
+                // negotiation deadline's job. A connection that negotiates and
+                // never sends a request is left to the h2 keep-alive ping, as at
+                // any other value of this knob.
+                //
+                // `!busy()` is belt-and-braces rather than what prevents a
+                // truncation, and worth saying so: the wake arrives *after* the
+                // finishing request's own count is gone, so with one request in
+                // flight it is true either way, and an HTTP/2 connection that has
+                // several would still drain them — `graceful_shutdown` finishes
+                // in-flight streams, and the linger below re-checks `busy()`
+                // before it breaks. Keeping the condition here means this branch
+                // states its own precondition instead of inheriting it from
+                // hyper's drain semantics and a check two branches away, either of
+                // which could change without this one noticing.
+                _ = activity.request_finished(), if zero_keep_alive && !winding_down => {
+                    if activity.has_served() && !activity.busy() {
+                        winding_down = true;
+                        conn.as_mut().graceful_shutdown();
                         linger
                             .as_mut()
                             .reset(tokio::time::Instant::now() + GOAWAY_LINGER);
@@ -1428,6 +1587,46 @@ async fn respond(
             ))))
             .expect("response build is infallible");
         return Ok(res);
+    }
+
+    // RFC 9112 §3.2: an HTTP/1.1 request must carry exactly one `Host`, and a
+    // server must answer `400` to one that carries none or several.
+    //
+    // The reason is the same as the framing check above, and so is the risk. A
+    // request with two `Host` fields is one where this server and an
+    // intermediary can disagree about which site it was for — the intermediary
+    // routes or authorizes on one, the origin serves the other — and a request
+    // with none leaves `Call::host` and every `guard::host` route deciding on
+    // nothing at all.
+    //
+    // Gated on the version, because the other transports do not carry it there:
+    // HTTP/2 and HTTP/3 replaced the field with `:authority`, which hyper and h3
+    // put in the URI, and an ungated check would refuse every request on them.
+    // HTTP/1.0 predates the requirement. An absolute-form target is accepted
+    // without the field for the same reason `Call::host` prefers the URI: the
+    // authority is already there and it is the one that wins.
+    if req.version() == http::Version::HTTP_11 {
+        let hosts = req.headers().get_all(http::header::HOST).iter().count();
+        let bad = hosts > 1 || (hosts == 0 && req.uri().authority().is_none());
+        if bad {
+            tracing::warn!(
+                path = %req.uri().path(),
+                hosts,
+                "rejected an HTTP/1.1 request without exactly one Host"
+            );
+            let res = HyperResponse::builder()
+                .status(StatusCode::BAD_REQUEST)
+                // Closing for the same reason as the framing refusal: the
+                // disagreement is about what the message meant, so nothing after
+                // it on this connection can be trusted to mean what it says.
+                .header(http::header::CONNECTION, "close")
+                .header(http::header::CONTENT_TYPE, TEXT_PLAIN)
+                .body(into_boxed_body(Body::Bytes(bytes::Bytes::from_static(
+                    b"Bad Request",
+                ))))
+                .expect("response build is infallible");
+            return Ok(res);
+        }
     }
 
     #[cfg(feature = "ws")]

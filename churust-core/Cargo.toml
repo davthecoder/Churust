@@ -12,6 +12,10 @@ homepage.workspace = true
 readme.workspace = true
 description = "Core engine, routing, pipeline, and extractors for the Churust web framework."
 
+# Inherits `unsafe_code = "forbid"` from the workspace.
+[lints]
+workspace = true
+
 [package.metadata.docs.rs]
 all-features = true
 
@@ -102,3 +106,6 @@ multipart = []
 # HTTP/3 over QUIC. Implies `tls`: QUIC has no plaintext mode, so there is no
 # such thing as h3 without a certificate.
 http3 = ["tls", "dep:quinn", "dep:h3", "dep:h3-quinn"]
+
+[target.'cfg(unix)'.dependencies]
+socket2 = { workspace = true }

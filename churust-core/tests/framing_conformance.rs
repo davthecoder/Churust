@@ -225,3 +225,44 @@ async fn transfer_encoding_first_is_refused_too() {
         "the connection stayed reusable after an ambiguous message: {res}"
     );
 }
+
+#[tokio::test]
+async fn an_http11_request_without_a_host_is_refused() {
+    // RFC 9112 §3.2. A request with no `Host` leaves `Call::host` and every
+    // `guard::host` route deciding on nothing.
+    let got = exchange(b"GET / HTTP/1.1\r\n\r\n").await;
+    assert!(got.contains("400"), "{got}");
+    assert!(
+        got.to_ascii_lowercase().contains("connection: close"),
+        "the connection must not be reused after a message this ambiguous: {got}"
+    );
+}
+
+#[tokio::test]
+async fn an_http11_request_with_two_hosts_is_refused() {
+    // The dangerous half: an intermediary routes or authorizes on one of them
+    // and this server would have served the other.
+    let got = exchange(b"GET / HTTP/1.1\r\nHost: a.example\r\nHost: b.example\r\n\r\n").await;
+    assert!(got.contains("400"), "{got}");
+}
+
+#[tokio::test]
+async fn an_http11_request_with_one_host_is_still_served() {
+    // The guard against refusing the ordinary request.
+    let got = exchange(b"GET / HTTP/1.1\r\nHost: a.example\r\n\r\n").await;
+    assert!(got.contains("200"), "{got}");
+}
+
+#[tokio::test]
+async fn an_http10_request_without_a_host_is_still_served() {
+    // HTTP/1.0 predates the requirement, so the check must not reach it.
+    let got = exchange(b"GET / HTTP/1.0\r\n\r\n").await;
+    assert!(got.contains("200"), "{got}");
+}
+
+#[tokio::test]
+async fn an_absolute_form_target_is_served_without_a_host_field() {
+    // The authority is already in the target, and it is the one that wins.
+    let got = exchange(b"GET http://a.example/ HTTP/1.1\r\n\r\n").await;
+    assert!(got.contains("200"), "{got}");
+}

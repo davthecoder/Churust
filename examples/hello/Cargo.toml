@@ -11,6 +11,10 @@ publish = false
 #     serde   = { version = "1", features = ["derive"] }
 #
 # There is deliberately no `tokio` entry — see the note at the top of main.rs.
+# Inherits `unsafe_code = "forbid"` from the workspace.
+[lints]
+workspace = true
+
 [dependencies]
 churust = { workspace = true }
 serde = { workspace = true }

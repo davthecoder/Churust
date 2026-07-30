@@ -337,7 +337,7 @@ impl WebSocketUpgrade {
         tokio::spawn(async move {
             // Held for the socket's lifetime, so the budget is returned when
             // the WebSocket ends rather than when the handshake finished.
-            let _conn_guard = conn_guard;
+            let conn_guard = conn_guard;
             if let Ok(upgraded) = on_upgrade.await {
                 // Bound both a single frame and a reassembled message: a peer
                 // respecting the frame cap can still stream unbounded
@@ -369,8 +369,43 @@ impl WebSocketUpgrade {
                 // Dropping the callback future closes the socket and releases
                 // the guard. That is abrupt by design: the peer is not
                 // answering, so there is nobody to negotiate a close with.
+                // The drain signal is a third way this socket can end, and it
+                // has to be watched here. Holding a drain token makes the
+                // shutdown *wait* for this socket; nothing was telling the socket
+                // to stop. The connection loop that watches the signal for an
+                // HTTP connection has already exited for an upgraded one — hyper
+                // resolves the connection when the `101` goes out — so every
+                // shutdown burned the whole grace period whenever a WebSocket was
+                // live, and at `shutdown_timeout_ms = 0`, which means "wait as
+                // long as it takes", it never returned at all.
+                //
+                // Dropping the callback future is what ends the socket, and doing
+                // that closes it. A WebSocket has no request boundary to finish
+                // at: an application that wants a clean `Close` frame and a
+                // last word to its peer has to be the one to send it, which it
+                // can do because it is holding the socket.
+                // `None` when there is no connection budget to belong to — a
+                // `TestClient` call, or any path that never went through the
+                // accept loop. Nothing can signal such a socket, so its drain
+                // branch simply never fires.
+                let drain_watch = conn_guard.clone();
+                let draining = async move {
+                    match drain_watch {
+                        Some(guard) => guard.draining().await,
+                        None => std::future::pending::<()>().await,
+                    }
+                };
+                tokio::pin!(draining);
+
                 if idle_timeout_ms == 0 {
-                    callback(socket).await;
+                    let work = callback(socket);
+                    tokio::pin!(work);
+                    tokio::select! {
+                        _ = &mut work => {}
+                        _ = draining.as_mut() => {
+                            tracing::debug!("closing a WebSocket for shutdown");
+                        }
+                    }
                 } else {
                     let work = callback(socket);
                     tokio::pin!(work);
@@ -380,6 +415,10 @@ impl WebSocketUpgrade {
                     loop {
                         tokio::select! {
                             _ = &mut work => break,
+                            _ = draining.as_mut() => {
+                                tracing::debug!("closing a WebSocket for shutdown");
+                                break;
+                            }
                             _ = reaper.as_mut() => match activity.idle_for(idle_timeout_ms) {
                                 // Quiet for the whole period: drop it.
                                 None => {
@@ -394,6 +433,10 @@ impl WebSocketUpgrade {
                         }
                     }
                 }
+                // Dropped here rather than at the top of the task, so the permit
+                // and the drain token are returned only once the socket is
+                // genuinely finished.
+                drop(conn_guard);
             }
         });
 

@@ -77,7 +77,7 @@ use churust_core::{AppBuilder, Body, Call, Middleware, Next, Phase, Plugin, Resp
 use futures_util::StreamExt;
 use http::header::{
     HeaderValue, ACCEPT_ENCODING, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE,
-    ETAG, VARY,
+    ETAG,
 };
 use http::{Method, StatusCode};
 use std::sync::Arc;
@@ -525,26 +525,12 @@ fn encode(body: Body, encoding: Encoding, level: Level) -> Body {
 }
 
 /// Append `Accept-Encoding` to `Vary` without disturbing what is already there.
+///
+/// The merge is `Response::vary_on`, shared with the CORS plugin: a response can
+/// pass through both, and it only reads as one consistent list if they agree on
+/// how to merge.
 fn vary_on_accept_encoding(res: &mut Response) {
-    let existing: Vec<String> = res
-        .headers
-        .get_all(VARY)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .map(|v| v.trim().to_ascii_lowercase())
-        .filter(|v| !v.is_empty())
-        .collect();
-
-    if existing.iter().any(|v| v == "*" || v == "accept-encoding") {
-        return;
-    }
-
-    let mut merged = existing;
-    merged.push("accept-encoding".to_string());
-    if let Ok(value) = HeaderValue::from_str(&merged.join(", ")) {
-        res.headers.insert(VARY, value);
-    }
+    res.vary_on("accept-encoding");
 }
 
 /// Downgrade a strong `ETag` to a weak one.
@@ -667,6 +653,8 @@ impl Plugin for Compression {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the tests name it now that merging lives in churust-core.
+    use http::header::VARY;
 
     fn plugin() -> Compression {
         Compression::new()

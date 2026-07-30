@@ -305,17 +305,7 @@ impl RedisBackend {
     /// shrugged off.
     async fn run<T: redis::FromRedisValue>(&self, cmd: &redis::Cmd) -> Option<T> {
         for attempt in 0..2 {
-            let mut guard = self.connection.lock().await;
-            if guard.is_none() {
-                match self.client.get_multiplexed_async_connection().await {
-                    Ok(fresh) => *guard = Some(fresh),
-                    Err(_) => return None,
-                }
-            }
-            // Cloning the multiplexed connection is how concurrent commands
-            // share the socket, so the lock is released before the round trip.
-            let mut conn = guard.as_ref()?.clone();
-            drop(guard);
+            let mut conn = self.connection().await?;
 
             match cmd.query_async::<T>(&mut conn).await {
                 Ok(value) => return Some(value),
@@ -327,6 +317,43 @@ impl RedisBackend {
             }
         }
         None
+    }
+
+    /// The shared connection, dialling one if there is not one yet.
+    ///
+    /// The dial happens with the mutex *released*. Holding it across
+    /// `get_multiplexed_async_connection` is what made an unreachable Redis take
+    /// the application down with it after all: every session operation in the
+    /// process queued behind one in-progress dial, so throughput collapsed to one
+    /// operation per dial attempt — and a dial to a host that blackholes packets
+    /// rather than refusing them takes as long as the OS says it does. The
+    /// comment on the round trip below already knew the lock must not span an
+    /// await; the dial was inside it.
+    ///
+    /// Racing dials are the deliberate trade. Several tasks arriving at a cold
+    /// cache will each dial, and the first to finish is the one everybody keeps —
+    /// the losers drop theirs. That costs a few extra sockets exactly once,
+    /// against serialising every session operation for as long as Redis is
+    /// unwell, which is the failure this exists to avoid.
+    async fn connection(&self) -> Option<redis::aio::MultiplexedConnection> {
+        // Cloning the multiplexed connection is how concurrent commands share
+        // the socket, so the lock is only ever held for the clone.
+        if let Some(conn) = self.connection.lock().await.as_ref().cloned() {
+            return Some(conn);
+        }
+
+        let fresh = self.client.get_multiplexed_async_connection().await.ok()?;
+
+        let mut guard = self.connection.lock().await;
+        match guard.as_ref() {
+            // Someone else got there first. Keep theirs, so the process still
+            // converges on one shared socket.
+            Some(existing) => Some(existing.clone()),
+            None => {
+                *guard = Some(fresh.clone());
+                Some(fresh)
+            }
+        }
     }
 }
 
@@ -747,5 +774,63 @@ mod tests {
     fn a_zero_ttl_is_refused() {
         let (store, _) = store();
         let _ = store.ttl(0);
+    }
+
+    /// Several session operations against an unreachable Redis must dial
+    /// concurrently, not queue behind one another.
+    ///
+    /// The dial used to happen with the connection mutex held, so every session
+    /// operation in the process waited for whichever one was currently trying to
+    /// reach Redis. That is invisible while Redis is healthy — the cache is warm
+    /// after the first call — and is exactly the wrong behaviour when it is not,
+    /// which is when a session store most needs to degrade rather than block.
+    ///
+    /// Counting connection attempts is what discriminates it. A timing assertion
+    /// would not: with the dial never completing, both the serialised and the
+    /// concurrent version leave every caller waiting, and the difference only
+    /// shows in how many of them got as far as opening a socket. The listener
+    /// accepts and then says nothing, so the dial hangs in the Redis handshake
+    /// rather than failing fast the way a closed port would.
+    #[tokio::test]
+    async fn a_cold_dial_does_not_serialise_every_other_session_operation() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = seen.clone();
+        tokio::spawn(async move {
+            // Held, never spoken to: the Redis handshake never completes.
+            while let Ok((sock, _)) = listener.accept().await {
+                counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                std::mem::forget(sock);
+            }
+        });
+
+        let client = redis::Client::open(format!("redis://{addr}")).expect("a client");
+        let backend = Arc::new(RedisBackend {
+            client,
+            connection: tokio::sync::Mutex::new(None),
+        });
+
+        const CALLERS: usize = 5;
+        let mut tasks = Vec::new();
+        for _ in 0..CALLERS {
+            let backend = backend.clone();
+            tasks.push(tokio::spawn(async move { backend.get("k").await }));
+        }
+
+        // Long enough for every caller to reach its dial, short enough that the
+        // test does not wait on anything completing — nothing will.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let dials = seen.load(std::sync::atomic::Ordering::Relaxed);
+        for t in tasks {
+            t.abort();
+        }
+
+        assert!(
+            dials > 1,
+            "only {dials} of {CALLERS} callers reached a dial: they are queued \
+             behind one another on the connection lock"
+        );
     }
 }

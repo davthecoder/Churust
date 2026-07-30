@@ -267,6 +267,18 @@ impl AppBuilder {
     /// A connection with a request in flight is not idle, however long the
     /// handler takes. Lower this when connection count matters more than
     /// round-trip latency; raise it for chatty clients on slow links.
+    ///
+    /// Over HTTP/3 this becomes the QUIC idle timeout, so a lowered bound
+    /// applies there too. The one exception is `0`: a QUIC connection
+    /// multiplexes streams and cannot be closed after a single response, so
+    /// there is nothing for "answer and close" to mean and the HTTP/3 listener
+    /// keeps the default `75000` ms bound rather than never expiring.
+    ///
+    /// `0` reaches HTTP/2 as well, where hyper has no reuse switch to turn off:
+    /// the connection is closed once a response has been written and nothing
+    /// else is in flight. A connection that has not answered anything yet is
+    /// left to `header_read_timeout_ms`, which is what bounds a peer that has
+    /// not made a request.
     pub fn keep_alive_ms(mut self, ms: u64) -> Self {
         self.config.keep_alive_ms = ms;
         self
@@ -349,6 +361,9 @@ impl AppBuilder {
     /// Deliberately far below `max_connections`: a handshake is asymmetric
     /// work, cheap for the client to request and expensive for the server to
     /// perform, so it gets its own tighter bound.
+    ///
+    /// Applies to HTTP/3 as well, whose QUIC handshake is a TLS 1.3 handshake
+    /// and asymmetric in the same way.
     pub fn max_tls_handshakes(mut self, n: usize) -> Self {
         self.config.max_tls_handshakes = n;
         self
@@ -361,6 +376,12 @@ impl AppBuilder {
     /// finishes there is no HTTP layer to time out. Without it, a client that
     /// completes the TCP handshake and then dribbles bytes holds a connection
     /// open indefinitely.
+    ///
+    /// Applies to HTTP/3 too, and bounds the wait for the
+    /// [`max_tls_handshakes`](Self::max_tls_handshakes) budget as well as the
+    /// handshake itself — a peer queued for that budget is already holding a
+    /// connection permit, so timing only the handshake would leave the wait
+    /// unbounded.
     pub fn tls_handshake_timeout_ms(mut self, ms: u64) -> Self {
         self.config.tls_handshake_timeout_ms = ms;
         self

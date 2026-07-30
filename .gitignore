@@ -72,3 +72,6 @@ $RECYCLE.BIN/
 # Linux
 .directory
 .Trash-*
+/graphify-out
+/.agents
+skills-lock.json

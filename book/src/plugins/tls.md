@@ -36,6 +36,9 @@ Use the core helper to build a rustls acceptor from PEM files (see
 | `max_tls_handshakes` | Concurrent handshakes (asymmetric work) |
 | `tls_handshake_timeout_ms` | Bounds queueing **and** the handshake itself |
 
+Both also bound QUIC handshakes when the `http3` feature is on: a QUIC handshake
+is a TLS 1.3 handshake, asymmetric in the same way.
+
 HTTP/2 over TLS is negotiated via ALPN. Plaintext h2c uses prior knowledge.
 
 ## Production tips

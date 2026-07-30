@@ -50,6 +50,33 @@ async fn serve(app: churust_core::App, cert: &Cert) -> SocketAddr {
     addr
 }
 
+/// Complete a QUIC handshake and hand the connection back still open.
+///
+/// The h3 layer is deliberately not built on top: what this establishes is the
+/// state *just after* the handshake the budget guards, which is what a test of
+/// that budget needs to hold open.
+async fn connect_only(addr: SocketAddr, cert: &Cert) -> quinn::Connection {
+    let mut roots = rustls::RootCertStore::empty();
+    for der in &cert.chain {
+        roots.add(der.clone()).expect("trust the test certificate");
+    }
+    let mut tls = rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+
+    let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("quic client config");
+    let mut endpoint =
+        quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("a client socket");
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic)));
+
+    endpoint
+        .connect(addr, "localhost")
+        .expect("a connect attempt")
+        .await
+        .expect("a completed handshake")
+}
+
 /// Send one h3 request and return the status and body.
 async fn request(
     addr: SocketAddr,
@@ -72,6 +99,21 @@ async fn request_head(
     cert: &Cert,
     method: http::Method,
     path: &str,
+    body: Option<Bytes>,
+) -> (http::Response<()>, String) {
+    request_head_with_headers(addr, cert, method, path, &[], body).await
+}
+
+/// As [`request_head`], but with request headers of your own.
+///
+/// Separate because one thing a test needs to be able to say is what the client
+/// *claimed* about its body, which is not always what it then sent.
+async fn request_head_with_headers(
+    addr: SocketAddr,
+    cert: &Cert,
+    method: http::Method,
+    path: &str,
+    headers: &[(&str, &str)],
     body: Option<Bytes>,
 ) -> (http::Response<()>, String) {
     let mut roots = rustls::RootCertStore::empty();
@@ -103,11 +145,11 @@ async fn request_head(
     let drive = tokio::spawn(async move { std::future::poll_fn(|cx| driver.poll_close(cx)).await });
 
     let uri: http::Uri = format!("https://localhost{path}").parse().unwrap();
-    let req = http::Request::builder()
-        .method(method)
-        .uri(uri)
-        .body(())
-        .unwrap();
+    let mut builder = http::Request::builder().method(method).uri(uri);
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let req = builder.body(()).unwrap();
 
     let mut stream = send.send_request(req).await.expect("a request stream");
     if let Some(body) = body {
@@ -162,6 +204,422 @@ fn app() -> churust_core::App {
             });
         })
         .build()
+}
+
+/// The handshake budget releases its slot once the handshake is done, rather
+/// than holding it for as long as the connection lives.
+///
+/// With a cap of one, an unreleased slot would mean the first connection had to
+/// *end* before a second could shake hands. That is the failure this guards:
+/// the slot is scoped to the handshake, and `max_connections` is the bound that
+/// takes over afterwards.
+#[tokio::test]
+async fn a_completed_handshake_releases_its_slot_in_the_budget() {
+    let cert = self_signed();
+    let app = Churust::server()
+        .max_tls_handshakes(1)
+        .routing(|r| {
+            r.get("/hello", |_c: Call| async { "hello over quic" });
+        })
+        .build();
+    let addr = serve(app, &cert).await;
+
+    // Held open for the rest of the test, so its handshake slot would still be
+    // taken if the slot outlived the handshake.
+    let held = connect_only(addr, &cert).await;
+
+    let answered = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        request(addr, &cert, http::Method::GET, "/hello", None),
+    )
+    .await
+    .expect("a second handshake should not have to wait for the first connection to close");
+
+    assert_eq!(answered.0, StatusCode::OK);
+    assert_eq!(answered.1, "hello over quic");
+    drop(held);
+}
+
+/// The target authority reaches the handler over h3, so `Call::host` works.
+///
+/// HTTP/3 carries the authority in `:authority`, which lands in the URI, and
+/// there is no `Host` field beside it. Normalising the target to origin form
+/// dropped the authority, and with it the only signal `Call::host` had.
+#[tokio::test]
+async fn the_target_host_reaches_the_handler_over_h3() {
+    let cert = self_signed();
+    let app = Churust::server()
+        .routing(|r| {
+            r.get("/whoishost", |c: Call| async move {
+                match c.host() {
+                    Some(h) => format!("host {h}"),
+                    None => "host unknown".to_string(),
+                }
+            });
+        })
+        .build();
+    let addr = serve(app, &cert).await;
+
+    let (status, body) = request(addr, &cert, http::Method::GET, "/whoishost", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body, "host localhost",
+        "the `:authority` should survive into `Call::host`"
+    );
+}
+
+/// A host guard selects the right handler over h3.
+///
+/// The dangerous shape, and the reason this is not merely a missing `404`: a
+/// host-scoped route with an unguarded sibling on the same method and path is
+/// the ordinary virtual-host arrangement. With no authority to match on, the
+/// guard failed and the fallback answered — the wrong tenant's handler, with a
+/// `200`.
+#[tokio::test]
+async fn a_host_guarded_route_wins_over_its_fallback_on_h3() {
+    let cert = self_signed();
+    let app = Churust::server()
+        .routing(|r| {
+            r.get("/tenant", |_c: Call| async { "the localhost tenant" });
+            r.guard(churust_core::guard::host("localhost"));
+            r.get("/tenant", |_c: Call| async { "public fallback" });
+        })
+        .build();
+    let addr = serve(app, &cert).await;
+
+    let (status, body) = request(addr, &cert, http::Method::GET, "/tenant", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body, "the localhost tenant",
+        "the host-guarded route should have matched, not the fallback"
+    );
+}
+
+/// A guard for a host this request is not for still does not match.
+///
+/// The companion to the test above: seeding the `Host` field must not make every
+/// host guard pass.
+#[tokio::test]
+async fn a_guard_for_another_host_does_not_match_on_h3() {
+    let cert = self_signed();
+    let app = Churust::server()
+        .routing(|r| {
+            r.get("/tenant", |_c: Call| async { "someone else's tenant" });
+            r.guard(churust_core::guard::host("elsewhere.example"));
+        })
+        .build();
+    let addr = serve(app, &cert).await;
+
+    let (status, _) = request(addr, &cert, http::Method::GET, "/tenant", None).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a guard naming another host must not match this request"
+    );
+}
+
+/// A body the client declares too large is refused before any of it is read.
+///
+/// The discriminating case is a declaration with nothing behind it: counting
+/// chunks as they arrive never sees a byte, so `read_body` alone would hand the
+/// handler an empty body and answer `200` for a request the server had already
+/// said it would refuse. The TCP path makes the same check for the same reason.
+#[tokio::test]
+async fn a_declared_oversized_body_is_refused_without_being_read() {
+    let cert = self_signed();
+    let app = Churust::server()
+        .max_body_bytes(16)
+        .routing(|r| {
+            r.post("/echo", |body: String| async move { body });
+        })
+        .build();
+    let addr = serve(app, &cert).await;
+
+    let (head, _) = request_head_with_headers(
+        addr,
+        &cert,
+        http::Method::POST,
+        "/echo",
+        &[("content-length", "4096")],
+        // Nothing sent: the declaration is the whole of what the server has to
+        // go on, which is the point.
+        None,
+    )
+    .await;
+
+    assert_eq!(head.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+/// A request carrying a connection-specific field is refused.
+///
+/// RFC 9114 §4.2 requires an endpoint to treat such a message as malformed. The
+/// response path already stripped these on the way out; nothing checked them on
+/// the way in, so a `Transfer-Encoding` — a framing claim on a transport that
+/// frames the body itself — was accepted and ignored. That is how the same bytes
+/// come to mean two things to a proxy in front and this server behind, which is
+/// the disagreement the TCP path refuses outright in its HTTP/1.1 form.
+#[tokio::test]
+async fn a_request_with_a_connection_specific_field_is_refused_over_h3() {
+    let cert = self_signed();
+    for field in [
+        "connection",
+        "keep-alive",
+        "proxy-connection",
+        "transfer-encoding",
+        "upgrade",
+    ] {
+        let app = Churust::server()
+            .routing(|r| {
+                r.get("/hello", |_c: Call| async { "hello over quic" });
+            })
+            .build();
+        let addr = serve(app, &cert).await;
+
+        let (head, _) = request_head_with_headers(
+            addr,
+            &cert,
+            http::Method::GET,
+            "/hello",
+            &[(field, "whatever")],
+            None,
+        )
+        .await;
+        assert_eq!(
+            head.status(),
+            StatusCode::BAD_REQUEST,
+            "`{field}` should make the message malformed"
+        );
+    }
+}
+
+/// `TE: trailers` is the one allowance §4.2 makes, and it must survive.
+///
+/// The guard against banning the whole list blindly: `TE` is permitted when its
+/// value is exactly `trailers`, and refused otherwise.
+#[tokio::test]
+async fn te_trailers_is_allowed_over_h3_but_other_te_values_are_not() {
+    let cert = self_signed();
+
+    let app = Churust::server()
+        .routing(|r| {
+            r.get("/hello", |_c: Call| async { "hello over quic" });
+        })
+        .build();
+    let addr = serve(app, &cert).await;
+    let (head, body) = request_head_with_headers(
+        addr,
+        &cert,
+        http::Method::GET,
+        "/hello",
+        &[("te", "trailers")],
+        None,
+    )
+    .await;
+    assert_eq!(head.status(), StatusCode::OK, "`TE: trailers` is permitted");
+    assert_eq!(body, "hello over quic");
+
+    let app = Churust::server()
+        .routing(|r| {
+            r.get("/hello", |_c: Call| async { "hello over quic" });
+        })
+        .build();
+    let addr = serve(app, &cert).await;
+    let (head, _) = request_head_with_headers(
+        addr,
+        &cert,
+        http::Method::GET,
+        "/hello",
+        &[("te", "gzip")],
+        None,
+    )
+    .await;
+    assert_eq!(
+        head.status(),
+        StatusCode::BAD_REQUEST,
+        "any other `TE` value is malformed"
+    );
+}
+
+/// A body that ends cleanly short of its `Content-Length` is not served.
+///
+/// The FIN half of `a_request_body_cut_short_by_a_reset_is_not_served_as_complete`.
+/// That test covers a peer that resets; this one covers a peer that finishes its
+/// side deliberately having sent less than it announced. `read_body` treated a
+/// clean end as proof the body was whole, so the fragment was dispatched and the
+/// handler answered `200` — the exact failure the module's own comments say
+/// buffering exists to prevent, arriving by the one route they did not check.
+/// HTTP/1.1 answers `400` for the same request.
+#[tokio::test]
+async fn a_request_body_short_of_its_content_length_is_not_served() {
+    let cert = self_signed();
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = hits.clone();
+    let app = Churust::server()
+        .routing(move |r| {
+            r.post("/echo", move |body: String| {
+                let seen = seen.clone();
+                async move {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    format!("saw {}", body.len())
+                }
+            });
+        })
+        .build();
+    let addr = serve(app, &cert).await;
+
+    let (head, _) = request_head_with_headers(
+        addr,
+        &cert,
+        http::Method::POST,
+        "/echo",
+        &[("content-length", "5000")],
+        // Far less than declared, then a clean finish.
+        Some(Bytes::from(vec![b'x'; 1200])),
+    )
+    .await;
+
+    assert_eq!(head.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "the handler ran on a fragment: refusing after dispatch is not refusing"
+    );
+}
+
+/// A body longer than its `Content-Length` is refused too.
+///
+/// The other side of the disagreement. Whichever number is wrong, the two cannot
+/// both be believed, and taking the body's word for it is how a proxy in front
+/// and this server behind end up framing one byte stream differently.
+#[tokio::test]
+async fn a_request_body_longer_than_its_content_length_is_not_served() {
+    let cert = self_signed();
+    let app = Churust::server()
+        .routing(|r| {
+            r.post("/echo", |body: String| async move {
+                format!("saw {}", body.len())
+            });
+        })
+        .build();
+    let addr = serve(app, &cert).await;
+
+    let (head, _) = request_head_with_headers(
+        addr,
+        &cert,
+        http::Method::POST,
+        "/echo",
+        &[("content-length", "5")],
+        Some(Bytes::from_static(b"much longer than five")),
+    )
+    .await;
+
+    assert_eq!(head.status(), StatusCode::BAD_REQUEST);
+}
+
+/// A body that matches its declaration exactly is served.
+///
+/// The guard against refusing everything: the check has to compare, not reject.
+#[tokio::test]
+async fn a_request_body_matching_its_content_length_is_served() {
+    let cert = self_signed();
+    let app = Churust::server()
+        .routing(|r| {
+            r.post("/echo", |body: String| async move { body });
+        })
+        .build();
+    let addr = serve(app, &cert).await;
+
+    let (head, body) = request_head_with_headers(
+        addr,
+        &cert,
+        http::Method::POST,
+        "/echo",
+        &[("content-length", "5")],
+        Some(Bytes::from_static(b"hello")),
+    )
+    .await;
+
+    assert_eq!(head.status(), StatusCode::OK);
+    assert_eq!(body, "hello");
+}
+
+/// A declared body within the cap is served normally.
+#[tokio::test]
+async fn a_declared_body_within_the_cap_is_served() {
+    let cert = self_signed();
+    let app = Churust::server()
+        .max_body_bytes(4096)
+        .routing(|r| {
+            r.post("/echo", |body: String| async move { body });
+        })
+        .build();
+    let addr = serve(app, &cert).await;
+
+    let (head, body) = request_head_with_headers(
+        addr,
+        &cert,
+        http::Method::POST,
+        "/echo",
+        &[("content-length", "5")],
+        Some(Bytes::from_static(b"hello")),
+    )
+    .await;
+
+    assert_eq!(head.status(), StatusCode::OK);
+    assert_eq!(body, "hello");
+}
+
+/// A handshake budget of `0` means unlimited, as it does on TCP.
+#[tokio::test]
+async fn a_zero_handshake_budget_does_not_refuse_the_handshake() {
+    let cert = self_signed();
+    let app = Churust::server()
+        .max_tls_handshakes(0)
+        .routing(|r| {
+            r.get("/hello", |_c: Call| async { "hello over quic" });
+        })
+        .build();
+    let addr = serve(app, &cert).await;
+
+    let (status, body) = request(addr, &cert, http::Method::GET, "/hello", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "hello over quic");
+}
+
+/// A handshake deadline that is set does not cut short a handshake that
+/// completes well inside it.
+#[tokio::test]
+async fn a_handshake_inside_the_deadline_is_served() {
+    let cert = self_signed();
+    let app = Churust::server()
+        .tls_handshake_timeout_ms(10_000)
+        .routing(|r| {
+            r.get("/hello", |_c: Call| async { "hello over quic" });
+        })
+        .build();
+    let addr = serve(app, &cert).await;
+
+    let (status, body) = request(addr, &cert, http::Method::GET, "/hello", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "hello over quic");
+}
+
+/// A disabled handshake deadline leaves the handshake unbounded rather than
+/// expiring it immediately.
+#[tokio::test]
+async fn a_zero_handshake_deadline_does_not_expire_the_handshake() {
+    let cert = self_signed();
+    let app = Churust::server()
+        .tls_handshake_timeout_ms(0)
+        .routing(|r| {
+            r.get("/hello", |_c: Call| async { "hello over quic" });
+        })
+        .build();
+    let addr = serve(app, &cert).await;
+
+    let (status, body) = request(addr, &cert, http::Method::GET, "/hello", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "hello over quic");
 }
 
 #[tokio::test]

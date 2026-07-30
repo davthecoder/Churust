@@ -16,7 +16,25 @@ repository = "https://github.com/davthecoder/Churust"
 homepage = "https://github.com/davthecoder/Churust"
 readme = "README.md"
 
+# Churust contains no `unsafe` anywhere, and this is what keeps that true rather
+# than merely so far. A web framework parses hostile input for a living, so the
+# absence of manual memory management is a property worth being able to state
+# about the whole workspace instead of a fact that happened to hold at the last
+# time anyone looked.
+#
+# `forbid` rather than `deny` deliberately: `deny` can be turned off again with a
+# local `#[allow]`, which is exactly the edit that would slip through. Anything
+# that genuinely needs `unsafe` has to change this line, in a diff someone reads.
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
 [workspace.dependencies]
+# Unix-socket bind, so `backlog` means the same thing on that listener as on a
+# TCP one. tokio exposes `TcpSocket` but has no `UnixSocket`, and neither std's
+# nor tokio's `UnixListener::bind` lets the backlog be chosen. Already in the
+# tree as a tokio dependency, so this is a direct use of a crate that was being
+# compiled either way.
+socket2 = "0.6"
 # Internal crates. `version` is what gets published; `path` is what builds
 # locally. cargo-release rewrites these in step with workspace.package.version.
 churust = { path = "churust", version = "0.3.2" }

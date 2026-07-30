@@ -52,19 +52,29 @@
 
 use crate::app::App;
 use crate::body::Body;
+use crate::pem::{load_certs, load_key};
 use bytes::{Buf, Bytes};
 use http::{HeaderMap, Method, Request, Uri};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-/// How long a QUIC connection may sit idle before quinn closes it.
+/// How long a QUIC connection may sit idle before quinn closes it, when no
+/// value is supplied.
 ///
 /// Matches the default `keep_alive_ms`, so an idle connection costs the same
-/// whichever transport it arrived on. `server_config_from_pem` is a free
-/// function with no access to the app config; a caller that needs a different
-/// value builds its own `quinn::ServerConfig` and uses `serve_with_config`.
+/// whichever transport it arrived on. [`serve`] passes the app's own
+/// `keep_alive_ms` instead; this is what [`server_config_from_pem`] uses, since
+/// it is a free function with no access to the app config.
 const DEFAULT_IDLE_MS: u64 = 75_000;
+
+/// The per-connection request-stream cap used when `h2_max_concurrent_streams`
+/// is `0`.
+///
+/// Matches the default `h2_max_concurrent_streams`, for the reason spelled out on
+/// [`max_streams_for`]: HTTP/2's "no limit" has no safe QUIC translation, because
+/// quinn allocates eagerly against whatever is advertised.
+const DEFAULT_MAX_STREAMS: u32 = 200;
 
 /// Build a QUIC server configuration from a PEM certificate chain and key.
 ///
@@ -72,11 +82,130 @@ const DEFAULT_IDLE_MS: u64 = 75_000;
 /// negotiated anything else would not be HTTP/3, and there is nothing here to
 /// hand it to.
 ///
+/// The transport bounds are the defaults, because there is no app here to ask.
+/// [`serve`] builds its config through the same code with the app's own
+/// settings, so the knobs are honoured on the ordinary path; a caller reaching
+/// for this function directly and wanting other values adjusts the returned
+/// config's transport before handing it to [`serve_with_config`].
+///
 /// # Errors
 ///
 /// If either file is missing or unreadable, if no private key is found, or if
 /// rustls rejects the pair.
 pub fn server_config_from_pem(cert_path: &str, key_path: &str) -> io::Result<quinn::ServerConfig> {
+    server_config_from_pem_with_limits(cert_path, key_path, TransportLimits::defaults())
+}
+
+/// The QUIC idle bound for a configured `keep_alive_ms`.
+///
+/// `0` means "answer and close" on TCP. QUIC has no equivalent: a connection
+/// multiplexes streams, and `max_idle_timeout(None)` is the opposite — it never
+/// expires, which would unbound the `max_connections` slot the timeout exists to
+/// release. Fall back to the default bound rather than invent a QUIC meaning for
+/// a TCP-shaped setting.
+fn idle_ms_for(keep_alive_ms: u64) -> u64 {
+    match keep_alive_ms {
+        0 => DEFAULT_IDLE_MS,
+        ms => ms,
+    }
+}
+
+/// Convert milliseconds into a QUIC idle timeout.
+///
+/// An error rather than an `expect`, because the value is no longer a constant:
+/// a QUIC idle timeout is carried as a varint and rejects anything past its
+/// range, and `keep_alive_ms` is a `u64` an operator fills in. Refusing at
+/// startup names the bad setting; panicking would take the process down for it.
+fn idle_timeout(idle_ms: u64) -> io::Result<quinn::IdleTimeout> {
+    std::time::Duration::from_millis(idle_ms)
+        .try_into()
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("keep_alive_ms = {idle_ms} is too large for a QUIC idle timeout: {e}"),
+            )
+        })
+}
+
+/// The per-connection stream cap for a configured `h2_max_concurrent_streams`.
+///
+/// A cap matters more here than the name suggests. Every in-flight request
+/// buffers its body up to `max_body_bytes`, so what a single connection can make
+/// this process hold is that cap multiplied by the streams it may open at once —
+/// and quinn's own default of 100 applied however `h2_max_concurrent_streams`
+/// was set, which is the same knob-ignored-on-one-transport shape as the idle
+/// timeout above.
+///
+/// # Why `0` is not passed through
+///
+/// `0` removes the limit on HTTP/2, and the QUIC transport parameter has a
+/// maximum that looks like the natural translation. It is not: quinn *allocates
+/// against this number eagerly*. `quinn_proto::connection::streams::state::State`
+/// pre-inserts one map entry per advertised remote stream when the connection
+/// state is built — `for i in 0..max_remote[dir] { insert(...) }` — so a varint
+/// maximum of `2^62 - 1` is a four-quintillion-iteration loop that runs on the
+/// first Initial packet from any peer, before the handshake completes and before
+/// anything is authenticated. Advertising it does not fail cleanly at the far
+/// end; it pins a core and grows memory locally, on one unauthenticated UDP
+/// packet. Measured: a listener built this way never completed a handshake.
+///
+/// That rules out "large but not maximal" too — the loop is linear in whatever is
+/// advertised, so `1 << 60` is the same hang with a different constant.
+///
+/// So `0` falls back to the default, the same shape [`idle_ms_for`] uses for a
+/// `keep_alive_ms` of `0`: a setting whose HTTP/2 meaning has no safe QUIC
+/// translation keeps the documented default rather than being invented.
+fn max_streams_for(h2_max_concurrent_streams: u32) -> quinn::VarInt {
+    match h2_max_concurrent_streams {
+        0 => quinn::VarInt::from_u32(DEFAULT_MAX_STREAMS),
+        n => quinn::VarInt::from_u32(n),
+    }
+}
+
+/// The QUIC transport bounds that come from the app's own configuration.
+///
+/// Grouped so there is one list of them: a *transport parameter* that belongs
+/// here and is not in this struct is one HTTP/3 silently ignores, which is the
+/// failure this type exists to make visible.
+///
+/// Only quinn transport parameters, because that is all this reaches — it is
+/// handed to [`server_config_from_pem_with_limits`] and nothing else. App-level
+/// deadlines are applied where the work they bound happens, in
+/// [`serve_connection`]: `h2_max_header_list_size` becomes h3's
+/// `max_field_section_size` there, and consequently applies on the
+/// [`serve_with_config`] path too, where these bounds do not.
+struct TransportLimits {
+    /// From `keep_alive_ms`, via [`idle_ms_for`].
+    idle_ms: u64,
+    /// From `h2_max_concurrent_streams`, via [`max_streams_for`].
+    max_streams: quinn::VarInt,
+}
+
+impl TransportLimits {
+    /// The bounds this app configures.
+    fn from(cfg: &crate::app::ServerConfig) -> Self {
+        Self {
+            idle_ms: idle_ms_for(cfg.keep_alive_ms),
+            max_streams: max_streams_for(cfg.h2_max_concurrent_streams),
+        }
+    }
+
+    /// The defaults, for a caller with no app to ask.
+    fn defaults() -> Self {
+        Self::from(&crate::app::ServerConfig::default())
+    }
+}
+
+/// [`server_config_from_pem`], with the transport bounds named rather than
+/// assumed.
+///
+/// The one place QUIC transport bounds are applied, so a value cannot drift away
+/// from the setting it came from the way a second copy would.
+fn server_config_from_pem_with_limits(
+    cert_path: &str,
+    key_path: &str,
+    limits: TransportLimits,
+) -> io::Result<quinn::ServerConfig> {
     let certs = load_certs(cert_path)?;
     let key = load_key(key_path)?;
 
@@ -96,44 +225,46 @@ pub fn server_config_from_pem(cert_path: &str, key_path: &str) -> io::Result<qui
     // says nothing at all, or answers one request and lingers, pinned a
     // `max_connections` slot indefinitely. Neither case involves a request, so
     // no request-level deadline can reach them.
-    //
-    // Set from the same knob that bounds an idle TCP connection, so one setting
-    // means one thing on both transports.
     let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(
-        std::time::Duration::from_millis(DEFAULT_IDLE_MS)
-            .try_into()
-            .expect("idle timeout fits in a QUIC varint"),
-    ));
+    transport.max_idle_timeout(Some(idle_timeout(limits.idle_ms)?));
+    // Bidirectional only: an HTTP/3 request arrives on a bidi stream, and the
+    // unidirectional ones carry control and QPACK data rather than requests, so
+    // a request-concurrency setting is not the right bound for them.
+    transport.max_concurrent_bidi_streams(limits.max_streams);
     config.transport_config(Arc::new(transport));
     Ok(config)
 }
 
-fn load_certs(path: &str) -> io::Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
-    let file = std::fs::File::open(path)?;
-    let mut reader = std::io::BufReader::new(file);
-    rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()
-}
-
-fn load_key(path: &str) -> io::Result<rustls::pki_types::PrivateKeyDer<'static>> {
-    let file = std::fs::File::open(path)?;
-    let mut reader = std::io::BufReader::new(file);
-    rustls_pemfile::private_key(&mut reader)?
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no private key found"))
-}
-
 /// Serve `app` over HTTP/3 on `addr` until the process ends.
+///
+/// The transport bounds come from the app: `keep_alive_ms` becomes the QUIC idle
+/// timeout and `h2_max_concurrent_streams` the per-connection request limit, so
+/// lowering either bounds this transport too and not only TCP.
+///
+/// `h2_max_header_list_size` is honoured as well, applied per stream rather than
+/// as a QUIC transport parameter, so unlike the two above it holds on
+/// [`serve_with_config`] too.
+///
+/// `header_read_timeout_ms` is *not* applied on this transport. See the note in
+/// `serve_connection` for why — abandoning a pending request in h3 0.4 leaks its
+/// stream id — and for what bounds the exposure instead.
 ///
 /// # Errors
 ///
-/// If the certificate or key cannot be loaded, or the UDP socket cannot be
-/// bound.
+/// If the certificate or key cannot be loaded, if no private key is found, if
+/// rustls rejects the pair, if `keep_alive_ms` is too large for a QUIC idle
+/// timeout, or if the UDP socket cannot be bound.
 pub async fn serve(app: App, addr: SocketAddr, cert_path: &str, key_path: &str) -> io::Result<()> {
-    let config = server_config_from_pem(cert_path, key_path)?;
+    let limits = TransportLimits::from(app.config());
+    let config = server_config_from_pem_with_limits(cert_path, key_path, limits)?;
     serve_with_config(app, addr, config).await
 }
 
 /// Serve `app` over HTTP/3 with an already-built QUIC configuration.
+///
+/// The configuration is used as given: `keep_alive_ms` is not applied here,
+/// because a caller who built the transport themselves has already said what
+/// they want. [`serve`] is the path that reads the app's knob.
 ///
 /// # Errors
 ///
@@ -201,6 +332,22 @@ async fn accept_loop(app: App, endpoint: quinn::Endpoint) {
     let slots = (app.config().max_connections > 0)
         .then(|| std::sync::Arc::new(tokio::sync::Semaphore::new(app.config().max_connections)));
 
+    // `max_tls_handshakes` and `tls_handshake_timeout_ms`, applied to QUIC for
+    // the reason they exist on TCP: a QUIC handshake *is* a TLS 1.3 handshake,
+    // asymmetric in exactly the same way — cheap to ask for, expensive to
+    // answer — so `max_connections` alone is too loose a bound on it. Enabling
+    // http3 previously opted a deployment out of both knobs, which is the same
+    // hole `slots` above was added to close.
+    //
+    // The existing knobs rather than QUIC-specific ones, on the precedent
+    // `serve_connection` sets just below for `h2_max_header_list_size`: the
+    // setting asks the same question of the same kind of work, so one value
+    // should not need saying twice.
+    let handshakes = (app.config().max_tls_handshakes > 0)
+        .then(|| std::sync::Arc::new(tokio::sync::Semaphore::new(app.config().max_tls_handshakes)));
+    let handshake_timeout = (app.config().tls_handshake_timeout_ms > 0)
+        .then(|| std::time::Duration::from_millis(app.config().tls_handshake_timeout_ms));
+
     while let Some(incoming) = endpoint.accept().await {
         let app = app.clone();
         // Taken before accepting, so excess load waits in QUIC's own queue
@@ -210,11 +357,50 @@ async fn accept_loop(app: App, endpoint: quinn::Endpoint) {
             Some(sem) => sem.clone().acquire_owned().await.ok(),
             None => None,
         };
+        let handshakes = handshakes.clone();
         // One task per connection, like the TCP engine: a slow peer must not
         // hold up the accept loop.
         tokio::spawn(async move {
             let _permit = permit;
-            match incoming.await {
+
+            // Queueing for the handshake budget and performing the handshake
+            // are one timed step, as on TCP. Timing only the handshake would
+            // turn the budget into a rate limiter: permits would expire at
+            // `max_tls_handshakes` per deadline while everything else waited on
+            // `acquire_owned` with no deadline at all, and each of those waiters
+            // is already holding a connection permit taken above. What the knob
+            // promises is that no peer holds a connection permit for longer
+            // than this without having proved it can speak TLS, so the wait for
+            // the budget has to be inside the deadline that guards it.
+            //
+            // The handshake permit is scoped to this block and released when it
+            // ends — before `serve_connection` runs. The handshake budget is
+            // for handshakes; the connection budget takes over from there.
+            let queue_and_shake = async {
+                let _handshake_permit = match &handshakes {
+                    Some(sem) => sem.clone().acquire_owned().await.ok(),
+                    None => None,
+                };
+                incoming.await
+            };
+
+            let accepted = match handshake_timeout {
+                Some(limit) => match tokio::time::timeout(limit, queue_and_shake).await {
+                    Ok(res) => res,
+                    // Dropping the future cancels the acquire as well as the
+                    // handshake, so a peer that timed out while queued returns
+                    // nothing and holds nothing. Until the handshake completes
+                    // there is no HTTP layer, so no request-level deadline can
+                    // reach this.
+                    Err(_) => {
+                        tracing::debug!("http3 handshake timed out");
+                        return;
+                    }
+                },
+                None => queue_and_shake.await,
+            };
+
+            match accepted {
                 Ok(connection) => {
                     if let Err(e) = serve_connection(app, connection).await {
                         tracing::debug!(error = %e, "http3 connection ended");
@@ -247,6 +433,37 @@ async fn serve_connection(
         .max_field_section_size(app.config().h2_max_header_list_size as u64)
         .build(h3_quinn::Connection::new(connection))
         .await?;
+
+    // `header_read_timeout_ms` is deliberately NOT applied to the wait for a
+    // HEADERS frame here, and this is the note saying why, because the omission
+    // looks exactly like the transport-parity bugs fixed elsewhere in this file.
+    //
+    // It was applied, by wrapping `resolve_request` in a timeout and returning
+    // when it elapsed. That leaks. h3 0.0.8 inserts the stream id into
+    // `h3::server::Connection::ongoing_streams` in `poll_accept_bi`, as soon as
+    // the bidi stream is accepted and before any frame is read, and removes it
+    // only when `RequestEnd::drop` reports the id back. `RequestResolver` holds a
+    // bare `UnboundedSender<StreamId>` rather than a `RequestEnd` — the
+    // `RequestEnd` is built inside `accept_with_frame`, i.e. *after* the header
+    // block has decoded — so a resolver abandoned before that point can never
+    // report anything. The id then stays in the set for the life of the
+    // connection: `ongoing_streams.is_empty()` is never true again, the
+    // connection can never complete its graceful close, and the task keeps its
+    // `max_connections` permit. A peer repeating the stall grows that set without
+    // bound. That is the permit leak the deadline was meant to prevent, made
+    // permanent instead of temporary.
+    //
+    // There is no way to abandon a pending resolver cleanly in this version, so
+    // the wait is left unbounded and the exposure is bounded structurally
+    // instead: `h2_max_concurrent_streams` caps the streams one connection may
+    // have open at once, and `max_connections` caps the connections. Closing the
+    // whole QUIC connection on the deadline would also avoid the leak, but takes
+    // every sibling request down with it, which the accept loop's own error
+    // handling deliberately does not do.
+    //
+    // If h3 gains a way to end a pending request — a `RequestEnd` on the
+    // resolver, or a documented reset that reports the id — this becomes a small
+    // change and should be made.
 
     loop {
         match h3.accept().await {
@@ -313,6 +530,42 @@ where
     let (parts, _) = request.into_parts();
     let max_body = app.config().max_body_bytes;
 
+    // RFC 9114 §4.2: a message carrying a connection-specific field must be
+    // treated as malformed. Checked before the body is judged for size, because a
+    // malformed message is not a request whose length is worth an opinion.
+    //
+    // The reason this is a refusal and not a strip, when the response path
+    // strips: a `Transfer-Encoding` on an inbound h3 request is a framing claim
+    // on a transport that already frames the body itself, and quietly ignoring it
+    // is how the same bytes come to mean two different things to a proxy in front
+    // and this server behind. The TCP path refuses the HTTP/1.1 version of that
+    // disagreement for the same reason.
+    if let Some(field) = connection_specific_field(&parts.headers) {
+        tracing::debug!(
+            field,
+            "rejected an http3 request with a connection-specific field"
+        );
+        return send_status(&app, &mut stream, http::StatusCode::BAD_REQUEST).await;
+    }
+
+    // Refuse a body the client has already declared too large, before a byte of
+    // it is read — the same check the TCP path makes for the same reason.
+    // `read_body` below refuses at the chunk that crosses the cap, which bounds
+    // what is held but still accepts and buffers everything up to it.
+    // `Content-Length` is the client's own statement of size, so refusing on it
+    // costs one header lookup and no buffering at all. A body that declares
+    // nothing is still bounded by the cap when it is read.
+    let declared: Option<u64> = parts
+        .headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if let Some(declared) = declared {
+        if declared > max_body as u64 {
+            return send_status(&app, &mut stream, http::StatusCode::PAYLOAD_TOO_LARGE).await;
+        }
+    }
+
     // The deadline has to start here, not after the body has arrived. Reading
     // the body is the attacker-controlled phase — a client can dribble one byte
     // and stop — and wrapping only the handler left exactly that phase
@@ -321,7 +574,7 @@ where
     let deadline = (timeout_ms > 0)
         .then(|| tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms));
 
-    let read = async { read_body(&mut stream, max_body).await };
+    let read = async { read_body(&mut stream, max_body, declared).await };
     let read = match deadline {
         Some(at) => match tokio::time::timeout_at(at, read).await {
             Ok(r) => r,
@@ -358,6 +611,21 @@ where
         // return before `process_with_extensions`, so the handler never runs
         // and never commits half a payload. Refusing the stream is the report;
         // not dispatching is the fix.
+        // A 400 rather than a stream error, and rather than the reset the arm
+        // below uses. The peer finished cleanly and is still reading its
+        // response, so the objection reaches it — which is the very thing the
+        // reset arm says is not true of a cancelled stream. It also matches what
+        // HTTP/1.1 does with the same request. Not followed by `stop_stream`:
+        // `send_status` finishes the stream, and a reset after it can destroy the
+        // response before it is acknowledged.
+        Err(BodyRefused::Truncated { declared, got }) => {
+            tracing::debug!(
+                declared,
+                got,
+                "http3 request body did not match its content-length"
+            );
+            return send_status(&app, &mut stream, http::StatusCode::BAD_REQUEST).await;
+        }
         Err(BodyRefused::Incomplete(e)) => {
             tracing::debug!(error = %e, "http3 request body ended before it was complete");
             stream.stop_stream(h3::error::Code::H3_REQUEST_INCOMPLETE);
@@ -368,10 +636,37 @@ where
     let mut extensions = http::Extensions::new();
     extensions.insert(crate::call::PeerAddr(peer));
 
+    // Carry the authority across in the `Host` field, because `normalise_uri`
+    // below is about to drop it.
+    //
+    // `Call::host` reads the URI authority first and the `Host` field only as a
+    // fallback (`call.rs`), and HTTP/3 replaced the field with the `:authority`
+    // pseudo-header, which arrives in the URI. Normalising to origin form
+    // therefore removed the only signal there was: `Call::host` answered `None`
+    // over h3, so `guard::host` matched nothing and a host-scoped route was
+    // either a silent 404 or — with an unguarded sibling on the same method and
+    // path, which is the ordinary virtual-host shape — served by the wrong
+    // handler. `guard.rs` documents this same failure as a fixed HTTP/2
+    // regression; on this transport it had come back.
+    //
+    // Seeding the field rather than keeping the authority in the URI is what
+    // leaves `normalise_uri`'s own decision intact: a handler still sees the
+    // same origin-form target on every transport.
+    //
+    // `insert`, not `append`: `Call::host` resolves a request carrying both an
+    // authority and a `Host` field to the authority, so a stray field must not
+    // survive beside the value it is supposed to lose to.
+    let mut headers = parts.headers.clone();
+    if let Some(authority) = parts.uri.authority() {
+        if let Ok(value) = http::HeaderValue::from_str(authority.as_str()) {
+            headers.insert(http::header::HOST, value);
+        }
+    }
+
     let process = app.process_with_extensions(
         parts.method.clone(),
         normalise_uri(&parts.uri, &parts.method),
-        parts.headers.clone(),
+        headers,
         body,
         extensions,
     );
@@ -419,6 +714,12 @@ enum BodyRefused {
     /// The stream failed before the body was whole, so what was read is a
     /// fragment of a request rather than a request.
     Incomplete(h3::error::StreamError),
+    /// The body ended cleanly at a length the client's own `Content-Length` says
+    /// it should not have.
+    ///
+    /// Distinct from `Incomplete`: the peer finished its side deliberately and is
+    /// still reading, so unlike a reset this one can be told what was wrong.
+    Truncated { declared: u64, got: u64 },
 }
 
 /// Read a request body, refusing one past `max_body` and one cut short.
@@ -426,9 +727,35 @@ enum BodyRefused {
 /// Counted as it arrives rather than collected and then measured, so an
 /// oversized body is refused at the chunk that crosses the line instead of
 /// after all of it has been held in memory.
+///
+/// # Why this buffers where the TCP engine streams
+///
+/// Deliberately, and not because streaming was overlooked. Collecting the body
+/// before dispatch is what lets a truncated one be refused *without the handler
+/// ever running*, which is the guarantee the `Incomplete` arm below exists for:
+/// a peer that announces 5000 bytes, sends 1200 and resets has sent a fragment,
+/// and a fragment is undetectable after the fact because a truncated body is a
+/// well-formed shorter body.
+///
+/// The TCP path hands the handler a stream instead, so there the truncation
+/// surfaces mid-handler — after any side effect it has on the bytes it already
+/// read. `Call::body_stream` says as much: exceeding the cap "surfaces as an
+/// error item in the stream rather than a `413`, because the response has
+/// usually begun by then". This transport is the stricter of the two, and the
+/// cost is memory: one `max_body_bytes` per in-flight request.
+///
+/// That cost is bounded rather than removed. `TransportLimits::max_streams`
+/// caps the requests a connection may have in flight, so the ceiling is
+/// `max_body_bytes × h2_max_concurrent_streams × max_connections` and every
+/// term is configurable; a declared oversize is refused in `serve_request`
+/// before a byte is buffered.
+///
+/// Converting this to a stream would level the two transports down to the
+/// weaker guarantee. If the asymmetry is worth closing, close it the other way.
 async fn read_body<S>(
     stream: &mut h3::server::RequestStream<S, Bytes>,
     max_body: usize,
+    declared: Option<u64>,
 ) -> Result<Bytes, BodyRefused>
 where
     S: h3::quic::BidiStream<Bytes>,
@@ -453,8 +780,24 @@ where
                 }
                 buf.extend_from_slice(&piece);
             }
-            // The peer finished its side of the stream: the body is whole.
-            Ok(None) => return Ok(buf.freeze()),
+            // The peer finished its side of the stream. That makes the body
+            // *complete*, which is not the same as whole: a clean FIN after 1200
+            // bytes of a declared 5000 is exactly the fragment the `Incomplete`
+            // arm below exists to refuse, arriving by the one route that used to
+            // be taken as proof of wholeness. Measured, this transport served it
+            // as a 200 where HTTP/1.1 answered 400.
+            //
+            // `!=` rather than `<`, so a body longer than its declaration is
+            // caught too — that disagreement is the request-smuggling shape the
+            // TCP path refuses outright, and there is no reading of it that makes
+            // one of the two numbers right.
+            Ok(None) => {
+                let got = buf.len() as u64;
+                return match declared {
+                    Some(n) if n != got => Err(BodyRefused::Truncated { declared: n, got }),
+                    _ => Ok(buf.freeze()),
+                };
+            }
             Err(e) => return Err(BodyRefused::Incomplete(e)),
         }
     }
@@ -566,22 +909,51 @@ where
     Ok(())
 }
 
+/// The fields RFC 9114 §4.2 bans from an HTTP/3 message.
+///
+/// One list because the rule is symmetric and the two directions are not: a
+/// response carrying one of these is stripped, because the handler that set it
+/// was probably written for HTTP/1.1 and the alternative is a client rejecting a
+/// reply the application meant; a *request* carrying one is refused, because the
+/// spec says an endpoint must treat such a message as malformed and the sender is
+/// the one that can fix it. Two lists would eventually disagree about which
+/// fields those are.
+const CONNECTION_SPECIFIC: [&str; 5] = [
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "transfer-encoding",
+    "upgrade",
+];
+
 /// Drop headers HTTP/3 forbids.
 ///
 /// RFC 9114 §4.2 bans connection-specific fields, and a `Connection:
 /// keep-alive` copied from a handler written for HTTP/1.1 is enough for a
 /// conforming client to treat the whole response as malformed.
 fn sanitise(mut headers: HeaderMap) -> HeaderMap {
-    for name in [
-        "connection",
-        "keep-alive",
-        "proxy-connection",
-        "transfer-encoding",
-        "upgrade",
-    ] {
+    for name in CONNECTION_SPECIFIC {
         headers.remove(name);
     }
     headers
+}
+
+/// Why a request head is malformed under RFC 9114 §4.2, if it is.
+///
+/// `TE` is the one field on the list that is conditionally allowed: §4.2 permits
+/// it when its value is exactly `trailers`, so it is checked separately rather
+/// than banned outright.
+fn connection_specific_field(headers: &HeaderMap) -> Option<&'static str> {
+    for name in CONNECTION_SPECIFIC {
+        if headers.contains_key(name) {
+            return Some(name);
+        }
+    }
+    let te_is_allowed = headers
+        .get_all(http::header::TE)
+        .iter()
+        .all(|v| v.as_bytes().eq_ignore_ascii_case(b"trailers"));
+    (!te_is_allowed).then_some("te")
 }
 
 #[cfg(test)]
@@ -631,6 +1003,104 @@ mod tests {
         match server_config_from_pem("/nonexistent/cert.pem", "/nonexistent/key.pem") {
             Ok(_) => panic!("expected an error for missing files"),
             Err(e) => assert_eq!(e.kind(), io::ErrorKind::NotFound),
+        }
+    }
+
+    #[test]
+    fn a_configured_keep_alive_becomes_the_quic_idle_bound() {
+        assert_eq!(idle_ms_for(5_000), 5_000);
+    }
+
+    #[test]
+    fn a_zero_keep_alive_keeps_the_default_bound() {
+        // `0` asks TCP to answer and close. QUIC cannot do that, and the
+        // alternative reading — never expire — would let one idle connection
+        // hold a `max_connections` slot for good, which is the opposite of what
+        // the setting asks for.
+        assert_eq!(idle_ms_for(0), DEFAULT_IDLE_MS);
+        assert_ne!(idle_ms_for(0), 0);
+    }
+
+    #[test]
+    fn the_default_bound_agrees_with_the_default_keep_alive() {
+        // The two constants live in different files; this is what would notice
+        // if one moved without the other.
+        assert_eq!(
+            DEFAULT_IDLE_MS,
+            crate::app::ServerConfig::default().keep_alive_ms
+        );
+    }
+
+    #[test]
+    fn a_configured_stream_limit_becomes_the_quic_bidi_cap() {
+        assert_eq!(max_streams_for(100), quinn::VarInt::from_u32(100));
+    }
+
+    #[test]
+    fn a_zero_stream_limit_keeps_the_default_rather_than_advertising_a_maximum() {
+        // Two ways to get this wrong, and this pins against both.
+        //
+        // Passing `0` through forbids every request stream — the opposite of what
+        // it means on HTTP/2. Translating it to the varint maximum looks right and
+        // hangs the server: quinn pre-inserts one map entry per advertised remote
+        // stream when it builds the connection state, so `2^62 - 1` is a
+        // four-quintillion-iteration loop on the first packet from any peer,
+        // before anything is authenticated. The bound has to stay small.
+        assert_eq!(
+            max_streams_for(0),
+            quinn::VarInt::from_u32(DEFAULT_MAX_STREAMS)
+        );
+        assert_ne!(max_streams_for(0), quinn::VarInt::from_u32(0));
+        assert_ne!(max_streams_for(0), quinn::VarInt::MAX);
+        assert!(
+            u64::from(max_streams_for(0)) <= 100_000,
+            "an advertised stream cap is allocated against eagerly; it must stay small"
+        );
+    }
+
+    #[test]
+    fn no_configured_stream_limit_is_large_enough_to_allocate_against() {
+        // The property that matters is not about `0` specifically: whatever a
+        // caller sets, quinn will allocate that many entries per connection.
+        for configured in [1u32, 200, 10_000] {
+            assert!(
+                u64::from(max_streams_for(configured)) <= 100_000,
+                "{configured} produced a cap quinn would allocate eagerly against"
+            );
+        }
+    }
+
+    #[test]
+    fn the_transport_defaults_come_from_the_app_defaults() {
+        // What would notice a knob added to `ServerConfig` and wired into the
+        // TCP engine but never into `TransportLimits`.
+        let cfg = crate::app::ServerConfig::default();
+        let limits = TransportLimits::defaults();
+        assert_eq!(limits.idle_ms, idle_ms_for(cfg.keep_alive_ms));
+        assert_eq!(
+            limits.max_streams,
+            max_streams_for(cfg.h2_max_concurrent_streams)
+        );
+    }
+
+    #[test]
+    fn an_ordinary_keep_alive_converts_to_an_idle_timeout() {
+        assert!(idle_timeout(75_000).is_ok());
+    }
+
+    #[test]
+    fn a_keep_alive_past_the_varint_range_is_refused_rather_than_panicking() {
+        // Reachable now that the value is an operator's `u64` rather than a
+        // constant, so it has to be an error and not an `expect`.
+        match idle_timeout(u64::MAX) {
+            Ok(_) => panic!("expected an error for an out-of-range idle timeout"),
+            Err(e) => {
+                assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+                assert!(
+                    e.to_string().contains("keep_alive_ms"),
+                    "the error should name the setting at fault, got: {e}"
+                );
+            }
         }
     }
 }

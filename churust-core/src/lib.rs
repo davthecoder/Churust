@@ -191,6 +191,9 @@ pub fn secure_compare(a: impl AsRef<[u8]>, b: impl AsRef<[u8]>) -> bool {
 }
 
 #[cfg(feature = "tls")]
+mod pem;
+
+#[cfg(feature = "tls")]
 pub mod tls;
 
 /// HTTP/3 over QUIC (feature `http3`).
