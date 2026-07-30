@@ -355,6 +355,9 @@ impl AppBuilder {
     /// Deliberately far below `max_connections`: a handshake is asymmetric
     /// work, cheap for the client to request and expensive for the server to
     /// perform, so it gets its own tighter bound.
+    ///
+    /// Applies to HTTP/3 as well, whose QUIC handshake is a TLS 1.3 handshake
+    /// and asymmetric in the same way.
     pub fn max_tls_handshakes(mut self, n: usize) -> Self {
         self.config.max_tls_handshakes = n;
         self
@@ -367,6 +370,12 @@ impl AppBuilder {
     /// finishes there is no HTTP layer to time out. Without it, a client that
     /// completes the TCP handshake and then dribbles bytes holds a connection
     /// open indefinitely.
+    ///
+    /// Applies to HTTP/3 too, and bounds the wait for the
+    /// [`max_tls_handshakes`](Self::max_tls_handshakes) budget as well as the
+    /// handshake itself — a peer queued for that budget is already holding a
+    /// connection permit, so timing only the handshake would leave the wait
+    /// unbounded.
     pub fn tls_handshake_timeout_ms(mut self, ms: u64) -> Self {
         self.config.tls_handshake_timeout_ms = ms;
         self

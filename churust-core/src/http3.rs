@@ -253,6 +253,23 @@ async fn accept_loop(app: App, endpoint: quinn::Endpoint) {
     let slots = (app.config().max_connections > 0)
         .then(|| std::sync::Arc::new(tokio::sync::Semaphore::new(app.config().max_connections)));
 
+    // `max_tls_handshakes` and `tls_handshake_timeout_ms`, applied to QUIC for
+    // the reason they exist on TCP: a QUIC handshake *is* a TLS 1.3 handshake,
+    // asymmetric in exactly the same way — cheap to ask for, expensive to
+    // answer — so `max_connections` alone is too loose a bound on it. Enabling
+    // http3 previously opted a deployment out of both knobs, which is the same
+    // hole `slots` above was added to close.
+    //
+    // The existing knobs rather than QUIC-specific ones, on the precedent
+    // `serve_connection` sets just below for `h2_max_header_list_size`: the
+    // setting asks the same question of the same kind of work, so one value
+    // should not need saying twice.
+    let handshakes = (app.config().max_tls_handshakes > 0).then(|| {
+        std::sync::Arc::new(tokio::sync::Semaphore::new(app.config().max_tls_handshakes))
+    });
+    let handshake_timeout = (app.config().tls_handshake_timeout_ms > 0)
+        .then(|| std::time::Duration::from_millis(app.config().tls_handshake_timeout_ms));
+
     while let Some(incoming) = endpoint.accept().await {
         let app = app.clone();
         // Taken before accepting, so excess load waits in QUIC's own queue
@@ -262,11 +279,50 @@ async fn accept_loop(app: App, endpoint: quinn::Endpoint) {
             Some(sem) => sem.clone().acquire_owned().await.ok(),
             None => None,
         };
+        let handshakes = handshakes.clone();
         // One task per connection, like the TCP engine: a slow peer must not
         // hold up the accept loop.
         tokio::spawn(async move {
             let _permit = permit;
-            match incoming.await {
+
+            // Queueing for the handshake budget and performing the handshake
+            // are one timed step, as on TCP. Timing only the handshake would
+            // turn the budget into a rate limiter: permits would expire at
+            // `max_tls_handshakes` per deadline while everything else waited on
+            // `acquire_owned` with no deadline at all, and each of those waiters
+            // is already holding a connection permit taken above. What the knob
+            // promises is that no peer holds a connection permit for longer
+            // than this without having proved it can speak TLS, so the wait for
+            // the budget has to be inside the deadline that guards it.
+            //
+            // The handshake permit is scoped to this block and released when it
+            // ends — before `serve_connection` runs. The handshake budget is
+            // for handshakes; the connection budget takes over from there.
+            let queue_and_shake = async {
+                let _handshake_permit = match &handshakes {
+                    Some(sem) => sem.clone().acquire_owned().await.ok(),
+                    None => None,
+                };
+                incoming.await
+            };
+
+            let accepted = match handshake_timeout {
+                Some(limit) => match tokio::time::timeout(limit, queue_and_shake).await {
+                    Ok(res) => res,
+                    // Dropping the future cancels the acquire as well as the
+                    // handshake, so a peer that timed out while queued returns
+                    // nothing and holds nothing. Until the handshake completes
+                    // there is no HTTP layer, so no request-level deadline can
+                    // reach this.
+                    Err(_) => {
+                        tracing::debug!("http3 handshake timed out");
+                        return;
+                    }
+                },
+                None => queue_and_shake.await,
+            };
+
+            match accepted {
                 Ok(connection) => {
                     if let Err(e) = serve_connection(app, connection).await {
                         tracing::debug!(error = %e, "http3 connection ended");

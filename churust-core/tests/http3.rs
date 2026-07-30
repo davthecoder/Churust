@@ -50,6 +50,33 @@ async fn serve(app: churust_core::App, cert: &Cert) -> SocketAddr {
     addr
 }
 
+/// Complete a QUIC handshake and hand the connection back still open.
+///
+/// The h3 layer is deliberately not built on top: what this establishes is the
+/// state *just after* the handshake the budget guards, which is what a test of
+/// that budget needs to hold open.
+async fn connect_only(addr: SocketAddr, cert: &Cert) -> quinn::Connection {
+    let mut roots = rustls::RootCertStore::empty();
+    for der in &cert.chain {
+        roots.add(der.clone()).expect("trust the test certificate");
+    }
+    let mut tls = rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+
+    let quic = quinn::crypto::rustls::QuicClientConfig::try_from(tls).expect("quic client config");
+    let mut endpoint =
+        quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("a client socket");
+    endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic)));
+
+    endpoint
+        .connect(addr, "localhost")
+        .expect("a connect attempt")
+        .await
+        .expect("a completed handshake")
+}
+
 /// Send one h3 request and return the status and body.
 async fn request(
     addr: SocketAddr,
@@ -162,6 +189,93 @@ fn app() -> churust_core::App {
             });
         })
         .build()
+}
+
+/// The handshake budget releases its slot once the handshake is done, rather
+/// than holding it for as long as the connection lives.
+///
+/// With a cap of one, an unreleased slot would mean the first connection had to
+/// *end* before a second could shake hands. That is the failure this guards:
+/// the slot is scoped to the handshake, and `max_connections` is the bound that
+/// takes over afterwards.
+#[tokio::test]
+async fn a_completed_handshake_releases_its_slot_in_the_budget() {
+    let cert = self_signed();
+    let app = Churust::server()
+        .max_tls_handshakes(1)
+        .routing(|r| {
+            r.get("/hello", |_c: Call| async { "hello over quic" });
+        })
+        .build();
+    let addr = serve(app, &cert).await;
+
+    // Held open for the rest of the test, so its handshake slot would still be
+    // taken if the slot outlived the handshake.
+    let held = connect_only(addr, &cert).await;
+
+    let answered = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        request(addr, &cert, http::Method::GET, "/hello", None),
+    )
+    .await
+    .expect("a second handshake should not have to wait for the first connection to close");
+
+    assert_eq!(answered.0, StatusCode::OK);
+    assert_eq!(answered.1, "hello over quic");
+    drop(held);
+}
+
+/// A handshake budget of `0` means unlimited, as it does on TCP.
+#[tokio::test]
+async fn a_zero_handshake_budget_does_not_refuse_the_handshake() {
+    let cert = self_signed();
+    let app = Churust::server()
+        .max_tls_handshakes(0)
+        .routing(|r| {
+            r.get("/hello", |_c: Call| async { "hello over quic" });
+        })
+        .build();
+    let addr = serve(app, &cert).await;
+
+    let (status, body) = request(addr, &cert, http::Method::GET, "/hello", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "hello over quic");
+}
+
+/// A handshake deadline that is set does not cut short a handshake that
+/// completes well inside it.
+#[tokio::test]
+async fn a_handshake_inside_the_deadline_is_served() {
+    let cert = self_signed();
+    let app = Churust::server()
+        .tls_handshake_timeout_ms(10_000)
+        .routing(|r| {
+            r.get("/hello", |_c: Call| async { "hello over quic" });
+        })
+        .build();
+    let addr = serve(app, &cert).await;
+
+    let (status, body) = request(addr, &cert, http::Method::GET, "/hello", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "hello over quic");
+}
+
+/// A disabled handshake deadline leaves the handshake unbounded rather than
+/// expiring it immediately.
+#[tokio::test]
+async fn a_zero_handshake_deadline_does_not_expire_the_handshake() {
+    let cert = self_signed();
+    let app = Churust::server()
+        .tls_handshake_timeout_ms(0)
+        .routing(|r| {
+            r.get("/hello", |_c: Call| async { "hello over quic" });
+        })
+        .build();
+    let addr = serve(app, &cert).await;
+
+    let (status, body) = request(addr, &cert, http::Method::GET, "/hello", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "hello over quic");
 }
 
 #[tokio::test]
