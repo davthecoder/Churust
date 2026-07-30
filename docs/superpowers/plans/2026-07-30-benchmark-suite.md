@@ -33,7 +33,7 @@
 | file | responsibility |
 |---|---|
 | `churust-core/Cargo.toml` | criterion dev-dep, four `[[bench]]` sections with `harness = false` |
-| `churust-core/benches/dispatch.rs` | `App::process` end to end: bare 200, with middleware, with extractors, 404 |
+| `churust-core/benches/dispatch.rs` | `App::process` end to end: bare 200, with middleware, 404 (does not reach engine.rs's `Host` check) |
 | `churust-core/benches/routing.rs` | route-shape sensitivity: static, param, wildcard, deep, miss, backtracking |
 | `churust-core/benches/headers.rs` | `Vary` merge, cookie render/parse, `Error`→`Response` 1 vs 3 headers, security headers on/off |
 | `churust-core/benches/extract.rs` | `Path` / `Query` / `Form` decode |
@@ -91,8 +91,12 @@ Create `churust-core/benches/dispatch.rs`:
 //!
 //! `App::process` is the same entry point `TestClient` uses, so these numbers
 //! cover routing, the middleware pipeline, extraction and response building
-//! without kernel or TCP noise. The `Host` validation added in 0.3.3 is on this
-//! path.
+//! without kernel or TCP noise.
+//!
+//! What they do *not* cover is anything above that entry point. The `Host`
+//! validation added in 0.3.3 lives in `engine.rs`, on the raw hyper request,
+//! and runs before `process_call` is reached — so it is structurally out of
+//! reach here, and no number in this file includes it.
 
 use bytes::Bytes;
 use churust_core::{Call, Churust, Middleware, Next, Response};

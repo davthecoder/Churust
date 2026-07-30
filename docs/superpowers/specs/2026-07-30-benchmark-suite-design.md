@@ -62,7 +62,13 @@ read in full when a number moves.
 - **`dispatch.rs`** — `App::process` end to end: a bare `200`, the same with
   three middleware installed, one driving extractors, and a `404`. This is the
   same entry point `TestClient` uses, so it exercises the real pipeline without a
-  socket. The `Host` validation added in 0.3.3 is on this path.
+  socket.
+
+  Note what this does *not* cover: the `Host` validation added in 0.3.3 lives in
+  `engine.rs`, on the raw hyper request, and runs before `process_call` is
+  reached. `App::process` is downstream of it, so no in-process benchmark can
+  measure that check. It would need a bench that drives a real socket, which the
+  comparison half does and this half deliberately does not.
 - **`headers.rs`** — `Vary` merge, cookie render and parse, and
   `Error → Response` carrying one header versus three; the last is the 0.3.3
   change from `insert` to first-replaces-then-appends. Security headers are
