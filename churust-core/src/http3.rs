@@ -52,6 +52,7 @@
 
 use crate::app::App;
 use crate::body::Body;
+use crate::pem::{load_certs, load_key};
 use bytes::{Buf, Bytes};
 use http::{HeaderMap, Method, Request, Uri};
 use std::io;
@@ -200,19 +201,6 @@ fn server_config_from_pem_with_limits(
     transport.max_concurrent_bidi_streams(limits.max_streams);
     config.transport_config(Arc::new(transport));
     Ok(config)
-}
-
-fn load_certs(path: &str) -> io::Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
-    let file = std::fs::File::open(path)?;
-    let mut reader = std::io::BufReader::new(file);
-    rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()
-}
-
-fn load_key(path: &str) -> io::Result<rustls::pki_types::PrivateKeyDer<'static>> {
-    let file = std::fs::File::open(path)?;
-    let mut reader = std::io::BufReader::new(file);
-    rustls_pemfile::private_key(&mut reader)?
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no private key found"))
 }
 
 /// Serve `app` over HTTP/3 on `addr` until the process ends.

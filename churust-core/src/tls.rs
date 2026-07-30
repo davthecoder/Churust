@@ -3,9 +3,9 @@
 
 #![cfg(feature = "tls")]
 
-use std::io::{self, BufReader};
+use crate::pem::{load_certs, load_key};
+use std::io;
 use std::sync::Arc;
-use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::rustls::ServerConfig;
 use tokio_rustls::TlsAcceptor;
 
@@ -39,19 +39,6 @@ pub fn acceptor_from_pem(cert_path: &str, key_path: &str) -> io::Result<TlsAccep
     config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
     Ok(TlsAcceptor::from(Arc::new(config)))
-}
-
-fn load_certs(path: &str) -> io::Result<Vec<CertificateDer<'static>>> {
-    let file = std::fs::File::open(path)?;
-    let mut reader = BufReader::new(file);
-    rustls_pemfile::certs(&mut reader).collect::<Result<Vec<_>, _>>()
-}
-
-fn load_key(path: &str) -> io::Result<PrivateKeyDer<'static>> {
-    let file = std::fs::File::open(path)?;
-    let mut reader = BufReader::new(file);
-    rustls_pemfile::private_key(&mut reader)?
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no private key found"))
 }
 
 #[cfg(all(test, feature = "tls"))]
