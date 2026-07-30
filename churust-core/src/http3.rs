@@ -521,12 +521,12 @@ where
     // `Content-Length` is the client's own statement of size, so refusing on it
     // costs one header lookup and no buffering at all. A body that declares
     // nothing is still bounded by the cap when it is read.
-    if let Some(declared) = parts
+    let declared: Option<u64> = parts
         .headers
         .get(http::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-    {
+        .and_then(|v| v.parse::<u64>().ok());
+    if let Some(declared) = declared {
         if declared > max_body as u64 {
             return send_status(&app, &mut stream, http::StatusCode::PAYLOAD_TOO_LARGE).await;
         }
@@ -540,7 +540,7 @@ where
     let deadline = (timeout_ms > 0)
         .then(|| tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms));
 
-    let read = async { read_body(&mut stream, max_body).await };
+    let read = async { read_body(&mut stream, max_body, declared).await };
     let read = match deadline {
         Some(at) => match tokio::time::timeout_at(at, read).await {
             Ok(r) => r,
@@ -577,6 +577,21 @@ where
         // return before `process_with_extensions`, so the handler never runs
         // and never commits half a payload. Refusing the stream is the report;
         // not dispatching is the fix.
+        // A 400 rather than a stream error, and rather than the reset the arm
+        // below uses. The peer finished cleanly and is still reading its
+        // response, so the objection reaches it — which is the very thing the
+        // reset arm says is not true of a cancelled stream. It also matches what
+        // HTTP/1.1 does with the same request. Not followed by `stop_stream`:
+        // `send_status` finishes the stream, and a reset after it can destroy the
+        // response before it is acknowledged.
+        Err(BodyRefused::Truncated { declared, got }) => {
+            tracing::debug!(
+                declared,
+                got,
+                "http3 request body did not match its content-length"
+            );
+            return send_status(&app, &mut stream, http::StatusCode::BAD_REQUEST).await;
+        }
         Err(BodyRefused::Incomplete(e)) => {
             tracing::debug!(error = %e, "http3 request body ended before it was complete");
             stream.stop_stream(h3::error::Code::H3_REQUEST_INCOMPLETE);
@@ -665,6 +680,12 @@ enum BodyRefused {
     /// The stream failed before the body was whole, so what was read is a
     /// fragment of a request rather than a request.
     Incomplete(h3::error::StreamError),
+    /// The body ended cleanly at a length the client's own `Content-Length` says
+    /// it should not have.
+    ///
+    /// Distinct from `Incomplete`: the peer finished its side deliberately and is
+    /// still reading, so unlike a reset this one can be told what was wrong.
+    Truncated { declared: u64, got: u64 },
 }
 
 /// Read a request body, refusing one past `max_body` and one cut short.
@@ -700,6 +721,7 @@ enum BodyRefused {
 async fn read_body<S>(
     stream: &mut h3::server::RequestStream<S, Bytes>,
     max_body: usize,
+    declared: Option<u64>,
 ) -> Result<Bytes, BodyRefused>
 where
     S: h3::quic::BidiStream<Bytes>,
@@ -724,8 +746,24 @@ where
                 }
                 buf.extend_from_slice(&piece);
             }
-            // The peer finished its side of the stream: the body is whole.
-            Ok(None) => return Ok(buf.freeze()),
+            // The peer finished its side of the stream. That makes the body
+            // *complete*, which is not the same as whole: a clean FIN after 1200
+            // bytes of a declared 5000 is exactly the fragment the `Incomplete`
+            // arm below exists to refuse, arriving by the one route that used to
+            // be taken as proof of wholeness. Measured, this transport served it
+            // as a 200 where HTTP/1.1 answered 400.
+            //
+            // `!=` rather than `<`, so a body longer than its declaration is
+            // caught too — that disagreement is the request-smuggling shape the
+            // TCP path refuses outright, and there is no reading of it that makes
+            // one of the two numbers right.
+            Ok(None) => {
+                let got = buf.len() as u64;
+                return match declared {
+                    Some(n) if n != got => Err(BodyRefused::Truncated { declared: n, got }),
+                    _ => Ok(buf.freeze()),
+                };
+            }
             Err(e) => return Err(BodyRefused::Incomplete(e)),
         }
     }

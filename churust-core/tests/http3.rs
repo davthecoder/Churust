@@ -350,6 +350,107 @@ async fn a_declared_oversized_body_is_refused_without_being_read() {
     assert_eq!(head.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
+/// A body that ends cleanly short of its `Content-Length` is not served.
+///
+/// The FIN half of `a_request_body_cut_short_by_a_reset_is_not_served_as_complete`.
+/// That test covers a peer that resets; this one covers a peer that finishes its
+/// side deliberately having sent less than it announced. `read_body` treated a
+/// clean end as proof the body was whole, so the fragment was dispatched and the
+/// handler answered `200` — the exact failure the module's own comments say
+/// buffering exists to prevent, arriving by the one route they did not check.
+/// HTTP/1.1 answers `400` for the same request.
+#[tokio::test]
+async fn a_request_body_short_of_its_content_length_is_not_served() {
+    let cert = self_signed();
+    let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = hits.clone();
+    let app = Churust::server()
+        .routing(move |r| {
+            r.post("/echo", move |body: String| {
+                let seen = seen.clone();
+                async move {
+                    seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    format!("saw {}", body.len())
+                }
+            });
+        })
+        .build();
+    let addr = serve(app, &cert).await;
+
+    let (head, _) = request_head_with_headers(
+        addr,
+        &cert,
+        http::Method::POST,
+        "/echo",
+        &[("content-length", "5000")],
+        // Far less than declared, then a clean finish.
+        Some(Bytes::from(vec![b'x'; 1200])),
+    )
+    .await;
+
+    assert_eq!(head.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "the handler ran on a fragment: refusing after dispatch is not refusing"
+    );
+}
+
+/// A body longer than its `Content-Length` is refused too.
+///
+/// The other side of the disagreement. Whichever number is wrong, the two cannot
+/// both be believed, and taking the body's word for it is how a proxy in front
+/// and this server behind end up framing one byte stream differently.
+#[tokio::test]
+async fn a_request_body_longer_than_its_content_length_is_not_served() {
+    let cert = self_signed();
+    let app = Churust::server()
+        .routing(|r| {
+            r.post("/echo", |body: String| async move { format!("saw {}", body.len()) });
+        })
+        .build();
+    let addr = serve(app, &cert).await;
+
+    let (head, _) = request_head_with_headers(
+        addr,
+        &cert,
+        http::Method::POST,
+        "/echo",
+        &[("content-length", "5")],
+        Some(Bytes::from_static(b"much longer than five")),
+    )
+    .await;
+
+    assert_eq!(head.status(), StatusCode::BAD_REQUEST);
+}
+
+/// A body that matches its declaration exactly is served.
+///
+/// The guard against refusing everything: the check has to compare, not reject.
+#[tokio::test]
+async fn a_request_body_matching_its_content_length_is_served() {
+    let cert = self_signed();
+    let app = Churust::server()
+        .routing(|r| {
+            r.post("/echo", |body: String| async move { body });
+        })
+        .build();
+    let addr = serve(app, &cert).await;
+
+    let (head, body) = request_head_with_headers(
+        addr,
+        &cert,
+        http::Method::POST,
+        "/echo",
+        &[("content-length", "5")],
+        Some(Bytes::from_static(b"hello")),
+    )
+    .await;
+
+    assert_eq!(head.status(), StatusCode::OK);
+    assert_eq!(body, "hello");
+}
+
 /// A declared body within the cap is served normally.
 #[tokio::test]
 async fn a_declared_body_within_the_cap_is_served() {
