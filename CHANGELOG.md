@@ -71,15 +71,6 @@ whole set.
   body up to `max_body_bytes`, so this cap is what decides how much one peer can
   make the process hold.
 
-- **`header_read_timeout_ms` — the documented slow-loris defence — reaches
-  HTTP/3.** It bounded HTTP/1, HTTP/2 and protocol negotiation, and no phase of
-  the h3 path. A peer could open streams up to `h2_max_concurrent_streams`,
-  dribble a partial HEADERS frame on each, and hold a task and a resolver per
-  stream indefinitely: the request timeout is armed only after the headers
-  arrive, the handshake deadline has already ended, and the QUIC idle timer is
-  reset by any keepalive packet. The bound is applied per stream, so a stalled
-  stream no longer costs its siblings anything and never closes the connection.
-
 - **An HTTP/3 request body the client declares too large is refused before any of
   it is read.** The h3 reader refused at the chunk that crossed
   `max_body_bytes`, which bounded what was held but still accepted everything up
@@ -117,7 +108,7 @@ whole set.
 
 - Several unbounded-resource paths are closed above: an HTTP/3 connection with no
   idle bound, QUIC handshakes with no concurrency cap or deadline, h3 request
-  streams with no per-connection cap and no header deadline, and HTTP/2
+  streams with no per-connection cap, and HTTP/2
   connections held forever at `keep_alive_ms = 0`. Each let one peer retain a
   `max_connections` permit — and in the h3 stream case a task and a parser state
   per stream — until the process ended. Deployments that enable `http3` or set
