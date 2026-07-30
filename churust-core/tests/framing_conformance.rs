@@ -242,7 +242,6 @@ async fn an_http11_request_without_a_host_is_refused() {
 async fn an_http11_request_with_two_hosts_is_refused() {
     // The dangerous half: an intermediary routes or authorizes on one of them
     // and this server would have served the other.
-    let addr = bound().await;
     let got = exchange(b"GET / HTTP/1.1\r\nHost: a.example\r\nHost: b.example\r\n\r\n").await;
     assert!(got.contains("400"), "{got}");
 }
