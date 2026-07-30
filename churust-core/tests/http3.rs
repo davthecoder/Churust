@@ -350,6 +350,90 @@ async fn a_declared_oversized_body_is_refused_without_being_read() {
     assert_eq!(head.status(), StatusCode::PAYLOAD_TOO_LARGE);
 }
 
+/// A request carrying a connection-specific field is refused.
+///
+/// RFC 9114 §4.2 requires an endpoint to treat such a message as malformed. The
+/// response path already stripped these on the way out; nothing checked them on
+/// the way in, so a `Transfer-Encoding` — a framing claim on a transport that
+/// frames the body itself — was accepted and ignored. That is how the same bytes
+/// come to mean two things to a proxy in front and this server behind, which is
+/// the disagreement the TCP path refuses outright in its HTTP/1.1 form.
+#[tokio::test]
+async fn a_request_with_a_connection_specific_field_is_refused_over_h3() {
+    let cert = self_signed();
+    for field in ["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade"] {
+        let app = Churust::server()
+            .routing(|r| {
+                r.get("/hello", |_c: Call| async { "hello over quic" });
+            })
+            .build();
+        let addr = serve(app, &cert).await;
+
+        let (head, _) = request_head_with_headers(
+            addr,
+            &cert,
+            http::Method::GET,
+            "/hello",
+            &[(field, "whatever")],
+            None,
+        )
+        .await;
+        assert_eq!(
+            head.status(),
+            StatusCode::BAD_REQUEST,
+            "`{field}` should make the message malformed"
+        );
+    }
+}
+
+/// `TE: trailers` is the one allowance §4.2 makes, and it must survive.
+///
+/// The guard against banning the whole list blindly: `TE` is permitted when its
+/// value is exactly `trailers`, and refused otherwise.
+#[tokio::test]
+async fn te_trailers_is_allowed_over_h3_but_other_te_values_are_not() {
+    let cert = self_signed();
+
+    let app = Churust::server()
+        .routing(|r| {
+            r.get("/hello", |_c: Call| async { "hello over quic" });
+        })
+        .build();
+    let addr = serve(app, &cert).await;
+    let (head, body) = request_head_with_headers(
+        addr,
+        &cert,
+        http::Method::GET,
+        "/hello",
+        &[("te", "trailers")],
+        None,
+    )
+    .await;
+    assert_eq!(head.status(), StatusCode::OK, "`TE: trailers` is permitted");
+    assert_eq!(body, "hello over quic");
+
+    let app = Churust::server()
+        .routing(|r| {
+            r.get("/hello", |_c: Call| async { "hello over quic" });
+        })
+        .build();
+    let addr = serve(app, &cert).await;
+    let (head, _) = request_head_with_headers(
+        addr,
+        &cert,
+        http::Method::GET,
+        "/hello",
+        &[("te", "gzip")],
+        None,
+    )
+    .await;
+    assert_eq!(
+        head.status(),
+        StatusCode::BAD_REQUEST,
+        "any other `TE` value is malformed"
+    );
+}
+
 /// A body that ends cleanly short of its `Content-Length` is not served.
 ///
 /// The FIN half of `a_request_body_cut_short_by_a_reset_is_not_served_as_complete`.

@@ -514,6 +514,21 @@ where
     let (parts, _) = request.into_parts();
     let max_body = app.config().max_body_bytes;
 
+    // RFC 9114 §4.2: a message carrying a connection-specific field must be
+    // treated as malformed. Checked before the body is judged for size, because a
+    // malformed message is not a request whose length is worth an opinion.
+    //
+    // The reason this is a refusal and not a strip, when the response path
+    // strips: a `Transfer-Encoding` on an inbound h3 request is a framing claim
+    // on a transport that already frames the body itself, and quietly ignoring it
+    // is how the same bytes come to mean two different things to a proxy in front
+    // and this server behind. The TCP path refuses the HTTP/1.1 version of that
+    // disagreement for the same reason.
+    if let Some(field) = connection_specific_field(&parts.headers) {
+        tracing::debug!(field, "rejected an http3 request with a connection-specific field");
+        return send_status(&app, &mut stream, http::StatusCode::BAD_REQUEST).await;
+    }
+
     // Refuse a body the client has already declared too large, before a byte of
     // it is read — the same check the TCP path makes for the same reason.
     // `read_body` below refuses at the chunk that crosses the cap, which bounds
@@ -875,22 +890,51 @@ where
     Ok(())
 }
 
+/// The fields RFC 9114 §4.2 bans from an HTTP/3 message.
+///
+/// One list because the rule is symmetric and the two directions are not: a
+/// response carrying one of these is stripped, because the handler that set it
+/// was probably written for HTTP/1.1 and the alternative is a client rejecting a
+/// reply the application meant; a *request* carrying one is refused, because the
+/// spec says an endpoint must treat such a message as malformed and the sender is
+/// the one that can fix it. Two lists would eventually disagree about which
+/// fields those are.
+const CONNECTION_SPECIFIC: [&str; 5] = [
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "transfer-encoding",
+    "upgrade",
+];
+
 /// Drop headers HTTP/3 forbids.
 ///
 /// RFC 9114 §4.2 bans connection-specific fields, and a `Connection:
 /// keep-alive` copied from a handler written for HTTP/1.1 is enough for a
 /// conforming client to treat the whole response as malformed.
 fn sanitise(mut headers: HeaderMap) -> HeaderMap {
-    for name in [
-        "connection",
-        "keep-alive",
-        "proxy-connection",
-        "transfer-encoding",
-        "upgrade",
-    ] {
+    for name in CONNECTION_SPECIFIC {
         headers.remove(name);
     }
     headers
+}
+
+/// Why a request head is malformed under RFC 9114 §4.2, if it is.
+///
+/// `TE` is the one field on the list that is conditionally allowed: §4.2 permits
+/// it when its value is exactly `trailers`, so it is checked separately rather
+/// than banned outright.
+fn connection_specific_field(headers: &HeaderMap) -> Option<&'static str> {
+    for name in CONNECTION_SPECIFIC {
+        if headers.contains_key(name) {
+            return Some(name);
+        }
+    }
+    let te_is_allowed = headers
+        .get_all(http::header::TE)
+        .iter()
+        .all(|v| v.as_bytes().eq_ignore_ascii_case(b"trailers"));
+    (!te_is_allowed).then_some("te")
 }
 
 #[cfg(test)]
