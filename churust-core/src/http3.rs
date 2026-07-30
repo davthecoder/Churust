@@ -73,18 +73,18 @@ const DEFAULT_IDLE_MS: u64 = 75_000;
 /// negotiated anything else would not be HTTP/3, and there is nothing here to
 /// hand it to.
 ///
-/// The idle timeout is [`DEFAULT_IDLE_MS`], because there is no app here to ask.
-/// [`serve`] builds its config through the same code with the app's configured
-/// `keep_alive_ms`, so the knob is honoured on the ordinary path; a caller
-/// reaching for this function directly and wanting another value adjusts the
-/// returned config's transport before handing it to [`serve_with_config`].
+/// The transport bounds are the defaults, because there is no app here to ask.
+/// [`serve`] builds its config through the same code with the app's own
+/// settings, so the knobs are honoured on the ordinary path; a caller reaching
+/// for this function directly and wanting other values adjusts the returned
+/// config's transport before handing it to [`serve_with_config`].
 ///
 /// # Errors
 ///
 /// If either file is missing or unreadable, if no private key is found, or if
 /// rustls rejects the pair.
 pub fn server_config_from_pem(cert_path: &str, key_path: &str) -> io::Result<quinn::ServerConfig> {
-    server_config_from_pem_with_idle(cert_path, key_path, DEFAULT_IDLE_MS)
+    server_config_from_pem_with_limits(cert_path, key_path, TransportLimits::defaults())
 }
 
 /// The QUIC idle bound for a configured `keep_alive_ms`.
@@ -118,14 +118,60 @@ fn idle_timeout(idle_ms: u64) -> io::Result<quinn::IdleTimeout> {
         })
 }
 
-/// [`server_config_from_pem`], with the idle timeout named rather than assumed.
+/// The per-connection stream cap for a configured `h2_max_concurrent_streams`.
 ///
-/// The one place a QUIC idle bound is applied, so the value cannot drift away
-/// from `keep_alive_ms` the way a second copy would.
-fn server_config_from_pem_with_idle(
+/// `0` removes the limit on HTTP/2. QUIC has no unlimited: the value is carried
+/// in a transport parameter as a varint, so the nearest thing is its maximum.
+///
+/// A cap matters more here than the name suggests. Every in-flight request
+/// buffers its body up to `max_body_bytes`, so what a single connection can make
+/// this process hold is that cap multiplied by the streams it may open at once —
+/// and quinn's own default of 100 applied however `h2_max_concurrent_streams`
+/// was set, which is the same knob-ignored-on-one-transport shape as the idle
+/// timeout above.
+fn max_streams_for(h2_max_concurrent_streams: u32) -> quinn::VarInt {
+    match h2_max_concurrent_streams {
+        0 => quinn::VarInt::MAX,
+        n => quinn::VarInt::from_u32(n),
+    }
+}
+
+/// The QUIC transport bounds that come from the app's own configuration.
+///
+/// Grouped so there is one list of them: a knob that belongs here and is not in
+/// this struct is a knob HTTP/3 silently ignores, which is the failure this type
+/// exists to make visible.
+struct TransportLimits {
+    /// From `keep_alive_ms`, via [`idle_ms_for`].
+    idle_ms: u64,
+    /// From `h2_max_concurrent_streams`, via [`max_streams_for`].
+    max_streams: quinn::VarInt,
+}
+
+impl TransportLimits {
+    /// The bounds this app configures.
+    fn from(cfg: &crate::app::ServerConfig) -> Self {
+        Self {
+            idle_ms: idle_ms_for(cfg.keep_alive_ms),
+            max_streams: max_streams_for(cfg.h2_max_concurrent_streams),
+        }
+    }
+
+    /// The defaults, for a caller with no app to ask.
+    fn defaults() -> Self {
+        Self::from(&crate::app::ServerConfig::default())
+    }
+}
+
+/// [`server_config_from_pem`], with the transport bounds named rather than
+/// assumed.
+///
+/// The one place QUIC transport bounds are applied, so a value cannot drift away
+/// from the setting it came from the way a second copy would.
+fn server_config_from_pem_with_limits(
     cert_path: &str,
     key_path: &str,
-    idle_ms: u64,
+    limits: TransportLimits,
 ) -> io::Result<quinn::ServerConfig> {
     let certs = load_certs(cert_path)?;
     let key = load_key(key_path)?;
@@ -147,7 +193,11 @@ fn server_config_from_pem_with_idle(
     // `max_connections` slot indefinitely. Neither case involves a request, so
     // no request-level deadline can reach them.
     let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(idle_timeout(idle_ms)?));
+    transport.max_idle_timeout(Some(idle_timeout(limits.idle_ms)?));
+    // Bidirectional only: an HTTP/3 request arrives on a bidi stream, and the
+    // unidirectional ones carry control and QPACK data rather than requests, so
+    // a request-concurrency setting is not the right bound for them.
+    transport.max_concurrent_bidi_streams(limits.max_streams);
     config.transport_config(Arc::new(transport));
     Ok(config)
 }
@@ -167,8 +217,9 @@ fn load_key(path: &str) -> io::Result<rustls::pki_types::PrivateKeyDer<'static>>
 
 /// Serve `app` over HTTP/3 on `addr` until the process ends.
 ///
-/// The QUIC idle timeout comes from the app's `keep_alive_ms`, so lowering that
-/// knob bounds an idle connection on this transport too and not only on TCP.
+/// The transport bounds come from the app: `keep_alive_ms` becomes the QUIC idle
+/// timeout and `h2_max_concurrent_streams` the per-connection request limit, so
+/// lowering either bounds this transport too and not only TCP.
 ///
 /// # Errors
 ///
@@ -176,8 +227,8 @@ fn load_key(path: &str) -> io::Result<rustls::pki_types::PrivateKeyDer<'static>>
 /// rustls rejects the pair, if `keep_alive_ms` is too large for a QUIC idle
 /// timeout, or if the UDP socket cannot be bound.
 pub async fn serve(app: App, addr: SocketAddr, cert_path: &str, key_path: &str) -> io::Result<()> {
-    let idle_ms = idle_ms_for(app.config().keep_alive_ms);
-    let config = server_config_from_pem_with_idle(cert_path, key_path, idle_ms)?;
+    let limits = TransportLimits::from(app.config());
+    let config = server_config_from_pem_with_limits(cert_path, key_path, limits)?;
     serve_with_config(app, addr, config).await
 }
 
@@ -420,6 +471,24 @@ where
 {
     let (parts, _) = request.into_parts();
     let max_body = app.config().max_body_bytes;
+
+    // Refuse a body the client has already declared too large, before a byte of
+    // it is read — the same check the TCP path makes for the same reason.
+    // `read_body` below refuses at the chunk that crosses the cap, which bounds
+    // what is held but still accepts and buffers everything up to it.
+    // `Content-Length` is the client's own statement of size, so refusing on it
+    // costs one header lookup and no buffering at all. A body that declares
+    // nothing is still bounded by the cap when it is read.
+    if let Some(declared) = parts
+        .headers
+        .get(http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        if declared > max_body as u64 {
+            return send_status(&app, &mut stream, http::StatusCode::PAYLOAD_TOO_LARGE).await;
+        }
+    }
 
     // The deadline has to start here, not after the body has arrived. Reading
     // the body is the attacker-controlled phase — a client can dribble one byte
@@ -764,6 +833,32 @@ mod tests {
         assert_eq!(
             DEFAULT_IDLE_MS,
             crate::app::ServerConfig::default().keep_alive_ms
+        );
+    }
+
+    #[test]
+    fn a_configured_stream_limit_becomes_the_quic_bidi_cap() {
+        assert_eq!(max_streams_for(100), quinn::VarInt::from_u32(100));
+    }
+
+    #[test]
+    fn a_zero_stream_limit_means_unlimited_not_zero() {
+        // `0` removes the limit on HTTP/2. Passing it straight through would
+        // forbid every request stream instead, which is the opposite.
+        assert_eq!(max_streams_for(0), quinn::VarInt::MAX);
+        assert_ne!(max_streams_for(0), quinn::VarInt::from_u32(0));
+    }
+
+    #[test]
+    fn the_transport_defaults_come_from_the_app_defaults() {
+        // What would notice a knob added to `ServerConfig` and wired into the
+        // TCP engine but never into `TransportLimits`.
+        let cfg = crate::app::ServerConfig::default();
+        let limits = TransportLimits::defaults();
+        assert_eq!(limits.idle_ms, idle_ms_for(cfg.keep_alive_ms));
+        assert_eq!(
+            limits.max_streams,
+            max_streams_for(cfg.h2_max_concurrent_streams)
         );
     }
 

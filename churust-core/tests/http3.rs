@@ -101,6 +101,21 @@ async fn request_head(
     path: &str,
     body: Option<Bytes>,
 ) -> (http::Response<()>, String) {
+    request_head_with_headers(addr, cert, method, path, &[], body).await
+}
+
+/// As [`request_head`], but with request headers of your own.
+///
+/// Separate because one thing a test needs to be able to say is what the client
+/// *claimed* about its body, which is not always what it then sent.
+async fn request_head_with_headers(
+    addr: SocketAddr,
+    cert: &Cert,
+    method: http::Method,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Option<Bytes>,
+) -> (http::Response<()>, String) {
     let mut roots = rustls::RootCertStore::empty();
     for der in &cert.chain {
         roots.add(der.clone()).expect("trust the test certificate");
@@ -130,11 +145,11 @@ async fn request_head(
     let drive = tokio::spawn(async move { std::future::poll_fn(|cx| driver.poll_close(cx)).await });
 
     let uri: http::Uri = format!("https://localhost{path}").parse().unwrap();
-    let req = http::Request::builder()
-        .method(method)
-        .uri(uri)
-        .body(())
-        .unwrap();
+    let mut builder = http::Request::builder().method(method).uri(uri);
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let req = builder.body(()).unwrap();
 
     let mut stream = send.send_request(req).await.expect("a request stream");
     if let Some(body) = body {
@@ -223,6 +238,64 @@ async fn a_completed_handshake_releases_its_slot_in_the_budget() {
     assert_eq!(answered.0, StatusCode::OK);
     assert_eq!(answered.1, "hello over quic");
     drop(held);
+}
+
+/// A body the client declares too large is refused before any of it is read.
+///
+/// The discriminating case is a declaration with nothing behind it: counting
+/// chunks as they arrive never sees a byte, so `read_body` alone would hand the
+/// handler an empty body and answer `200` for a request the server had already
+/// said it would refuse. The TCP path makes the same check for the same reason.
+#[tokio::test]
+async fn a_declared_oversized_body_is_refused_without_being_read() {
+    let cert = self_signed();
+    let app = Churust::server()
+        .max_body_bytes(16)
+        .routing(|r| {
+            r.post("/echo", |body: String| async move { body });
+        })
+        .build();
+    let addr = serve(app, &cert).await;
+
+    let (head, _) = request_head_with_headers(
+        addr,
+        &cert,
+        http::Method::POST,
+        "/echo",
+        &[("content-length", "4096")],
+        // Nothing sent: the declaration is the whole of what the server has to
+        // go on, which is the point.
+        None,
+    )
+    .await;
+
+    assert_eq!(head.status(), StatusCode::PAYLOAD_TOO_LARGE);
+}
+
+/// A declared body within the cap is served normally.
+#[tokio::test]
+async fn a_declared_body_within_the_cap_is_served() {
+    let cert = self_signed();
+    let app = Churust::server()
+        .max_body_bytes(4096)
+        .routing(|r| {
+            r.post("/echo", |body: String| async move { body });
+        })
+        .build();
+    let addr = serve(app, &cert).await;
+
+    let (head, body) = request_head_with_headers(
+        addr,
+        &cert,
+        http::Method::POST,
+        "/echo",
+        &[("content-length", "5")],
+        Some(Bytes::from_static(b"hello")),
+    )
+    .await;
+
+    assert_eq!(head.status(), StatusCode::OK);
+    assert_eq!(body, "hello");
 }
 
 /// A handshake budget of `0` means unlimited, as it does on TCP.
