@@ -58,12 +58,13 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-/// How long a QUIC connection may sit idle before quinn closes it.
+/// How long a QUIC connection may sit idle before quinn closes it, when no
+/// value is supplied.
 ///
 /// Matches the default `keep_alive_ms`, so an idle connection costs the same
-/// whichever transport it arrived on. `server_config_from_pem` is a free
-/// function with no access to the app config; a caller that needs a different
-/// value builds its own `quinn::ServerConfig` and uses `serve_with_config`.
+/// whichever transport it arrived on. [`serve`] passes the app's own
+/// `keep_alive_ms` instead; this is what [`server_config_from_pem`] uses, since
+/// it is a free function with no access to the app config.
 const DEFAULT_IDLE_MS: u64 = 75_000;
 
 /// Build a QUIC server configuration from a PEM certificate chain and key.
@@ -72,11 +73,60 @@ const DEFAULT_IDLE_MS: u64 = 75_000;
 /// negotiated anything else would not be HTTP/3, and there is nothing here to
 /// hand it to.
 ///
+/// The idle timeout is [`DEFAULT_IDLE_MS`], because there is no app here to ask.
+/// [`serve`] builds its config through the same code with the app's configured
+/// `keep_alive_ms`, so the knob is honoured on the ordinary path; a caller
+/// reaching for this function directly and wanting another value adjusts the
+/// returned config's transport before handing it to [`serve_with_config`].
+///
 /// # Errors
 ///
 /// If either file is missing or unreadable, if no private key is found, or if
 /// rustls rejects the pair.
 pub fn server_config_from_pem(cert_path: &str, key_path: &str) -> io::Result<quinn::ServerConfig> {
+    server_config_from_pem_with_idle(cert_path, key_path, DEFAULT_IDLE_MS)
+}
+
+/// The QUIC idle bound for a configured `keep_alive_ms`.
+///
+/// `0` means "answer and close" on TCP. QUIC has no equivalent: a connection
+/// multiplexes streams, and `max_idle_timeout(None)` is the opposite — it never
+/// expires, which would unbound the `max_connections` slot the timeout exists to
+/// release. Fall back to the default bound rather than invent a QUIC meaning for
+/// a TCP-shaped setting.
+fn idle_ms_for(keep_alive_ms: u64) -> u64 {
+    match keep_alive_ms {
+        0 => DEFAULT_IDLE_MS,
+        ms => ms,
+    }
+}
+
+/// Convert milliseconds into a QUIC idle timeout.
+///
+/// An error rather than an `expect`, because the value is no longer a constant:
+/// a QUIC idle timeout is carried as a varint and rejects anything past its
+/// range, and `keep_alive_ms` is a `u64` an operator fills in. Refusing at
+/// startup names the bad setting; panicking would take the process down for it.
+fn idle_timeout(idle_ms: u64) -> io::Result<quinn::IdleTimeout> {
+    std::time::Duration::from_millis(idle_ms)
+        .try_into()
+        .map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("keep_alive_ms = {idle_ms} is too large for a QUIC idle timeout: {e}"),
+            )
+        })
+}
+
+/// [`server_config_from_pem`], with the idle timeout named rather than assumed.
+///
+/// The one place a QUIC idle bound is applied, so the value cannot drift away
+/// from `keep_alive_ms` the way a second copy would.
+fn server_config_from_pem_with_idle(
+    cert_path: &str,
+    key_path: &str,
+    idle_ms: u64,
+) -> io::Result<quinn::ServerConfig> {
     let certs = load_certs(cert_path)?;
     let key = load_key(key_path)?;
 
@@ -96,15 +146,8 @@ pub fn server_config_from_pem(cert_path: &str, key_path: &str) -> io::Result<qui
     // says nothing at all, or answers one request and lingers, pinned a
     // `max_connections` slot indefinitely. Neither case involves a request, so
     // no request-level deadline can reach them.
-    //
-    // Set from the same knob that bounds an idle TCP connection, so one setting
-    // means one thing on both transports.
     let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(
-        std::time::Duration::from_millis(DEFAULT_IDLE_MS)
-            .try_into()
-            .expect("idle timeout fits in a QUIC varint"),
-    ));
+    transport.max_idle_timeout(Some(idle_timeout(idle_ms)?));
     config.transport_config(Arc::new(transport));
     Ok(config)
 }
@@ -124,16 +167,25 @@ fn load_key(path: &str) -> io::Result<rustls::pki_types::PrivateKeyDer<'static>>
 
 /// Serve `app` over HTTP/3 on `addr` until the process ends.
 ///
+/// The QUIC idle timeout comes from the app's `keep_alive_ms`, so lowering that
+/// knob bounds an idle connection on this transport too and not only on TCP.
+///
 /// # Errors
 ///
-/// If the certificate or key cannot be loaded, or the UDP socket cannot be
-/// bound.
+/// If the certificate or key cannot be loaded, if no private key is found, if
+/// rustls rejects the pair, if `keep_alive_ms` is too large for a QUIC idle
+/// timeout, or if the UDP socket cannot be bound.
 pub async fn serve(app: App, addr: SocketAddr, cert_path: &str, key_path: &str) -> io::Result<()> {
-    let config = server_config_from_pem(cert_path, key_path)?;
+    let idle_ms = idle_ms_for(app.config().keep_alive_ms);
+    let config = server_config_from_pem_with_idle(cert_path, key_path, idle_ms)?;
     serve_with_config(app, addr, config).await
 }
 
 /// Serve `app` over HTTP/3 with an already-built QUIC configuration.
+///
+/// The configuration is used as given: `keep_alive_ms` is not applied here,
+/// because a caller who built the transport themselves has already said what
+/// they want. [`serve`] is the path that reads the app's knob.
 ///
 /// # Errors
 ///
@@ -631,6 +683,52 @@ mod tests {
         match server_config_from_pem("/nonexistent/cert.pem", "/nonexistent/key.pem") {
             Ok(_) => panic!("expected an error for missing files"),
             Err(e) => assert_eq!(e.kind(), io::ErrorKind::NotFound),
+        }
+    }
+
+    #[test]
+    fn a_configured_keep_alive_becomes_the_quic_idle_bound() {
+        assert_eq!(idle_ms_for(5_000), 5_000);
+    }
+
+    #[test]
+    fn a_zero_keep_alive_keeps_the_default_bound() {
+        // `0` asks TCP to answer and close. QUIC cannot do that, and the
+        // alternative reading — never expire — would let one idle connection
+        // hold a `max_connections` slot for good, which is the opposite of what
+        // the setting asks for.
+        assert_eq!(idle_ms_for(0), DEFAULT_IDLE_MS);
+        assert_ne!(idle_ms_for(0), 0);
+    }
+
+    #[test]
+    fn the_default_bound_agrees_with_the_default_keep_alive() {
+        // The two constants live in different files; this is what would notice
+        // if one moved without the other.
+        assert_eq!(
+            DEFAULT_IDLE_MS,
+            crate::app::ServerConfig::default().keep_alive_ms
+        );
+    }
+
+    #[test]
+    fn an_ordinary_keep_alive_converts_to_an_idle_timeout() {
+        assert!(idle_timeout(75_000).is_ok());
+    }
+
+    #[test]
+    fn a_keep_alive_past_the_varint_range_is_refused_rather_than_panicking() {
+        // Reachable now that the value is an operator's `u64` rather than a
+        // constant, so it has to be an error and not an `expect`.
+        match idle_timeout(u64::MAX) {
+            Ok(_) => panic!("expected an error for an out-of-range idle timeout"),
+            Err(e) => {
+                assert_eq!(e.kind(), io::ErrorKind::InvalidInput);
+                assert!(
+                    e.to_string().contains("keep_alive_ms"),
+                    "the error should name the setting at fault, got: {e}"
+                );
+            }
         }
     }
 }

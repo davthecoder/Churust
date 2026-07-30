@@ -267,6 +267,12 @@ impl AppBuilder {
     /// A connection with a request in flight is not idle, however long the
     /// handler takes. Lower this when connection count matters more than
     /// round-trip latency; raise it for chatty clients on slow links.
+    ///
+    /// Over HTTP/3 this becomes the QUIC idle timeout, so a lowered bound
+    /// applies there too. The one exception is `0`: a QUIC connection
+    /// multiplexes streams and cannot be closed after a single response, so
+    /// there is nothing for "answer and close" to mean and the HTTP/3 listener
+    /// keeps the default `75000` ms bound rather than never expiring.
     pub fn keep_alive_ms(mut self, ms: u64) -> Self {
         self.config.keep_alive_ms = ms;
         self
