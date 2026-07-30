@@ -25,6 +25,33 @@
 //! `P` you choose is what later handlers extract; only one principal type can be
 //! resolved per call (the most recently inserted value of a given type wins).
 //!
+//! # Comparing credentials
+//!
+//! [`Bearer`] and [`Basic`] do not check the credential themselves — they decode
+//! the header and hand you the value, and *your* closure decides. That makes the
+//! comparison yours to get right, and `==` on a `String` is the wrong tool: it
+//! returns as soon as it meets a differing byte, so how long it took reveals how
+//! much of a guess was correct. Enough requests recovers the secret a byte at a
+//! time.
+//!
+//! Use [`churust_core::secure_compare`], which compares in constant time:
+//!
+//! ```
+//! use churust_core::secure_compare;
+//! # struct User;
+//! # let verify = |token: String| async move {
+//! secure_compare(&token, "the-expected-token").then_some(User)
+//! # };
+//! ```
+//!
+//! Every example below does this, so copying one does not copy a timing leak.
+//! A username is not a secret — it identifies rather than authenticates, and is
+//! often visible anyway — so comparing it with `==` is fine; the password or
+//! token beside it is what needs the constant-time path.
+//!
+//! [`Jwt`] needs none of this: it verifies an HMAC signature through
+//! `jsonwebtoken`, which already compares in constant time.
+//!
 //! # Example
 //!
 //! Protect a route with bearer-token auth. The `/me` handler only runs when a
@@ -32,7 +59,7 @@
 //! extractor short-circuits with `401`.
 //!
 //! ```
-//! use churust_core::{Churust, TestClient};
+//! use churust_core::{secure_compare, Churust, TestClient};
 //! use churust_auth::{Auth, Principal};
 //!
 //! #[derive(Clone)]
@@ -43,7 +70,8 @@
 //! # tokio::runtime::Runtime::new().unwrap().block_on(async {
 //! let app = Churust::server()
 //!     .install(Auth::bearer(|token: String| async move {
-//!         (token == "s3cret").then(|| User { name: "ana".into() })
+//!         // `secure_compare`, not `==`: see "Comparing credentials" below.
+//!         secure_compare(&token, "s3cret").then(|| User { name: "ana".into() })
 //!     }))
 //!     .routing(|r| {
 //!         r.get("/me", |Principal(u): Principal<User>| async move {
@@ -111,7 +139,7 @@ type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 /// # Examples
 ///
 /// ```
-/// use churust_core::{Churust, TestClient};
+/// use churust_core::{secure_compare, Churust, TestClient};
 /// use churust_auth::{Auth, Principal};
 ///
 /// #[derive(Clone)]
@@ -122,7 +150,7 @@ type BoxFut<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
 /// let app = Churust::server()
 ///     .install(Auth::bearer(|tok: String| async move {
-///         (tok == "ok").then(|| User { id: 7 })
+///         secure_compare(&tok, "ok").then(|| User { id: 7 })
 ///     }))
 ///     .routing(|r| {
 ///         r.get("/id", |Principal(u): Principal<User>| async move {
@@ -185,7 +213,7 @@ where
 /// # Examples
 ///
 /// ```
-/// use churust_core::{Churust, TestClient};
+/// use churust_core::{secure_compare, Churust, TestClient};
 /// use churust_auth::{Auth, Principal};
 ///
 /// #[derive(Clone)]
@@ -193,7 +221,9 @@ where
 ///
 /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
 /// let app = Churust::server()
-///     .install(Auth::bearer(|t: String| async move { (t == "ok").then_some(User) }))
+///     .install(Auth::bearer(|t: String| async move {
+///         secure_compare(&t, "ok").then_some(User)
+///     }))
 ///     .routing(|r| {
 ///         r.get("/", |_p: Principal<User>| async { "in" });
 ///     })
@@ -256,7 +286,7 @@ impl Auth {
     /// # Examples
     ///
     /// ```
-    /// use churust_core::{Churust, TestClient};
+    /// use churust_core::{secure_compare, Churust, TestClient};
     /// use churust_auth::{Auth, Principal};
     ///
     /// #[derive(Clone)]
@@ -265,7 +295,7 @@ impl Auth {
     /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
     /// let app = Churust::server()
     ///     .install(Auth::bearer(|token: String| async move {
-    ///         (token == "letmein").then(|| User { name: "ada".into() })
+    ///         secure_compare(&token, "letmein").then(|| User { name: "ada".into() })
     ///     }))
     ///     .routing(|r| {
     ///         r.get("/me", |Principal(u): Principal<User>| async move { u.name });
@@ -313,7 +343,7 @@ impl Auth {
     /// # Examples
     ///
     /// ```
-    /// use churust_core::{Churust, TestClient};
+    /// use churust_core::{secure_compare, Churust, TestClient};
     /// use churust_auth::{Auth, Principal};
     ///
     /// #[derive(Clone)]
@@ -322,7 +352,8 @@ impl Auth {
     /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
     /// let app = Churust::server()
     ///     .install(Auth::basic(|u: String, p: String| async move {
-    ///         (u == "admin" && p == "pw").then(|| User { name: u })
+    ///         // `==` on the username, constant-time on the password.
+    ///         (u == "admin" && secure_compare(&p, "pw")).then(|| User { name: u })
     ///     }))
     ///     .routing(|r| {
     ///         r.get("/me", |Principal(u): Principal<User>| async move { u.name });
@@ -420,7 +451,7 @@ where
 /// # Examples
 ///
 /// ```
-/// use churust_core::{Churust, TestClient};
+/// use churust_core::{secure_compare, Churust, TestClient};
 /// use churust_auth::{Auth, Principal};
 ///
 /// #[derive(Clone)]
@@ -429,7 +460,7 @@ where
 /// # tokio::runtime::Runtime::new().unwrap().block_on(async {
 /// let app = Churust::server()
 ///     .install(Auth::basic(|u: String, p: String| async move {
-///         (p == "hunter2").then(|| User { name: u })
+///         secure_compare(&p, "hunter2").then(|| User { name: u })
 ///     }))
 ///     .routing(|r| {
 ///         r.get("/me", |Principal(u): Principal<User>| async move { u.name });
