@@ -25,8 +25,9 @@ Environment variables use the `CHURUST_` prefix with nested keys separated by
 | `path_policy` | `"strict"` | `strict` \| `redirect` \| `collapse` |
 
 Header-read timeouts cover a connection from accept time, so a peer that
-connects and stays silent is still bounded (slow-loris protection). Over HTTP/3
-the same deadline bounds each request stream's wait for its HEADERS frame.
+connects and stays silent is still bounded (slow-loris protection). It does not
+apply to HTTP/3 — see [HTTP/3](../plugins/http3.md) for why, and for what bounds
+that transport instead.
 
 ### Which transports a knob reaches
 
@@ -41,7 +42,8 @@ Two deliberate differences are worth knowing:
   `75000` ms idle bound rather than never expiring, which would leave a
   connection holding a `max_connections` permit for good.
 - **`h2_max_concurrent_streams`** is named for HTTP/2 and also caps concurrent
-  request streams per HTTP/3 connection; `0` is unlimited on both.
+  request streams per HTTP/3 connection. `0` means unlimited on HTTP/2 only: QUIC
+  allocates against whatever cap is advertised, so HTTP/3 keeps the default.
 
 An HTTP/3 request body is collected before the request is dispatched, where the
 TCP path streams it to the handler. That is what lets a body truncated mid-flight

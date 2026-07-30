@@ -68,6 +68,14 @@ use std::sync::Arc;
 /// it is a free function with no access to the app config.
 const DEFAULT_IDLE_MS: u64 = 75_000;
 
+/// The per-connection request-stream cap used when `h2_max_concurrent_streams`
+/// is `0`.
+///
+/// Matches the default `h2_max_concurrent_streams`, for the reason spelled out on
+/// [`max_streams_for`]: HTTP/2's "no limit" has no safe QUIC translation, because
+/// quinn allocates eagerly against whatever is advertised.
+const DEFAULT_MAX_STREAMS: u32 = 200;
+
 /// Build a QUIC server configuration from a PEM certificate chain and key.
 ///
 /// The ALPN protocol is `h3` and nothing else: a QUIC connection that
@@ -121,18 +129,35 @@ fn idle_timeout(idle_ms: u64) -> io::Result<quinn::IdleTimeout> {
 
 /// The per-connection stream cap for a configured `h2_max_concurrent_streams`.
 ///
-/// `0` removes the limit on HTTP/2. QUIC has no unlimited: the value is carried
-/// in a transport parameter as a varint, so the nearest thing is its maximum.
-///
 /// A cap matters more here than the name suggests. Every in-flight request
 /// buffers its body up to `max_body_bytes`, so what a single connection can make
 /// this process hold is that cap multiplied by the streams it may open at once —
 /// and quinn's own default of 100 applied however `h2_max_concurrent_streams`
 /// was set, which is the same knob-ignored-on-one-transport shape as the idle
 /// timeout above.
+///
+/// # Why `0` is not passed through
+///
+/// `0` removes the limit on HTTP/2, and the QUIC transport parameter has a
+/// maximum that looks like the natural translation. It is not: quinn *allocates
+/// against this number eagerly*. `quinn_proto::connection::streams::state::State`
+/// pre-inserts one map entry per advertised remote stream when the connection
+/// state is built — `for i in 0..max_remote[dir] { insert(...) }` — so a varint
+/// maximum of `2^62 - 1` is a four-quintillion-iteration loop that runs on the
+/// first Initial packet from any peer, before the handshake completes and before
+/// anything is authenticated. Advertising it does not fail cleanly at the far
+/// end; it pins a core and grows memory locally, on one unauthenticated UDP
+/// packet. Measured: a listener built this way never completed a handshake.
+///
+/// That rules out "large but not maximal" too — the loop is linear in whatever is
+/// advertised, so `1 << 60` is the same hang with a different constant.
+///
+/// So `0` falls back to the default, the same shape [`idle_ms_for`] uses for a
+/// `keep_alive_ms` of `0`: a setting whose HTTP/2 meaning has no safe QUIC
+/// translation keeps the documented default rather than being invented.
 fn max_streams_for(h2_max_concurrent_streams: u32) -> quinn::VarInt {
     match h2_max_concurrent_streams {
-        0 => quinn::VarInt::MAX,
+        0 => quinn::VarInt::from_u32(DEFAULT_MAX_STREAMS),
         n => quinn::VarInt::from_u32(n),
     }
 }
@@ -146,10 +171,9 @@ fn max_streams_for(h2_max_concurrent_streams: u32) -> quinn::VarInt {
 /// Only quinn transport parameters, because that is all this reaches — it is
 /// handed to [`server_config_from_pem_with_limits`] and nothing else. App-level
 /// deadlines are applied where the work they bound happens, in
-/// [`serve_connection`]: `h2_max_header_list_size` as h3's
-/// `max_field_section_size`, and `header_read_timeout_ms` around the wait for a
-/// HEADERS frame. Both consequently apply on the [`serve_with_config`] path too,
-/// where these bounds do not.
+/// [`serve_connection`]: `h2_max_header_list_size` becomes h3's
+/// `max_field_section_size` there, and consequently applies on the
+/// [`serve_with_config`] path too, where these bounds do not.
 struct TransportLimits {
     /// From `keep_alive_ms`, via [`idle_ms_for`].
     idle_ms: u64,
@@ -217,9 +241,13 @@ fn server_config_from_pem_with_limits(
 /// timeout and `h2_max_concurrent_streams` the per-connection request limit, so
 /// lowering either bounds this transport too and not only TCP.
 ///
-/// `header_read_timeout_ms` and `h2_max_header_list_size` are honoured as well.
-/// They are applied per stream rather than as QUIC transport parameters, so
-/// unlike the two above they hold on [`serve_with_config`] too.
+/// `h2_max_header_list_size` is honoured as well, applied per stream rather than
+/// as a QUIC transport parameter, so unlike the two above it holds on
+/// [`serve_with_config`] too.
+///
+/// `header_read_timeout_ms` is *not* applied on this transport. See the note in
+/// `serve_connection` for why — abandoning a pending request in h3 0.4 leaks its
+/// stream id — and for what bounds the exposure instead.
 ///
 /// # Errors
 ///
@@ -406,25 +434,36 @@ async fn serve_connection(
         .build(h3_quinn::Connection::new(connection))
         .await?;
 
-    // `header_read_timeout_ms`, the slow-loris defence, which this transport did
-    // not apply to any phase of a request.
+    // `header_read_timeout_ms` is deliberately NOT applied to the wait for a
+    // HEADERS frame here, and this is the note saying why, because the omission
+    // looks exactly like the transport-parity bugs fixed elsewhere in this file.
     //
-    // `accept` returns as soon as a bidi stream exists, before a frame has been
-    // read, so a peer could open `h2_max_concurrent_streams` streams, send no
-    // HEADERS frame on any of them, and hold a task and an h3 resolver per stream
-    // for the life of the process. Nothing reclaimed them: `request_timeout_ms`
-    // is armed further down, after the headers have arrived; the QUIC idle
-    // timeout is a packet-activity timer that any keepalive resets, where the TCP
-    // watchdog measures *completed requests* and so does close a connection whose
-    // streams never produce one; and the handshake deadline has ended long
-    // before a stream exists.
+    // It was applied, by wrapping `resolve_request` in a timeout and returning
+    // when it elapsed. That leaks. h3 0.0.8 inserts the stream id into
+    // `h3::server::Connection::ongoing_streams` in `poll_accept_bi`, as soon as
+    // the bidi stream is accepted and before any frame is read, and removes it
+    // only when `RequestEnd::drop` reports the id back. `RequestResolver` holds a
+    // bare `UnboundedSender<StreamId>` rather than a `RequestEnd` — the
+    // `RequestEnd` is built inside `accept_with_frame`, i.e. *after* the header
+    // block has decoded — so a resolver abandoned before that point can never
+    // report anything. The id then stays in the set for the life of the
+    // connection: `ongoing_streams.is_empty()` is never true again, the
+    // connection can never complete its graceful close, and the task keeps its
+    // `max_connections` permit. A peer repeating the stall grows that set without
+    // bound. That is the permit leak the deadline was meant to prevent, made
+    // permanent instead of temporary.
     //
-    // Read here rather than through `TransportLimits`, which is only for quinn
-    // transport parameters — this is an app-level deadline, and the precedent is
-    // `max_field_section_size` just above. One consequence worth naming: like
-    // that knob, it therefore also applies on the `serve_with_config` path.
-    let header_deadline = (app.config().header_read_timeout_ms > 0)
-        .then(|| std::time::Duration::from_millis(app.config().header_read_timeout_ms));
+    // There is no way to abandon a pending resolver cleanly in this version, so
+    // the wait is left unbounded and the exposure is bounded structurally
+    // instead: `h2_max_concurrent_streams` caps the streams one connection may
+    // have open at once, and `max_connections` caps the connections. Closing the
+    // whole QUIC connection on the deadline would also avoid the leak, but takes
+    // every sibling request down with it, which the accept loop's own error
+    // handling deliberately does not do.
+    //
+    // If h3 gains a way to end a pending request — a `RequestEnd` on the
+    // resolver, or a documented reset that reports the id — this becomes a small
+    // change and should be made.
 
     loop {
         match h3.accept().await {
@@ -445,29 +484,7 @@ async fn serve_connection(
                 // the `h3::server::Connection`, and closed the whole QUIC
                 // connection, killing every other request multiplexed on it.
                 tokio::spawn(async move {
-                    // Bounded per stream, never per connection. A sibling that
-                    // never sends its headers must not take the connection down
-                    // with it — dropping the resolver drops that stream alone,
-                    // and `h3::server::Connection` is untouched.
-                    let resolved = match header_deadline {
-                        Some(limit) => {
-                            match tokio::time::timeout(limit, resolver.resolve_request()).await {
-                                Ok(res) => res,
-                                // Dropping the timed-out future drops the resolver,
-                                // which drops the quinn stream. `resolve_request`
-                                // consumes the resolver, so there is no way to send a
-                                // deliberate H3_REQUEST_INCOMPLETE from here without
-                                // reaching a `doc(hidden)` field; the implicit reset
-                                // is the report, and no request was dispatched.
-                                Err(_) => {
-                                    tracing::debug!("http3 request headers timed out");
-                                    return;
-                                }
-                            }
-                        }
-                        None => resolver.resolve_request().await,
-                    };
-                    let (request, stream) = match resolved {
+                    let (request, stream) = match resolver.resolve_request().await {
                         Ok(pair) => pair,
                         // Scoped to this stream by construction. h3 has already
                         // done whatever the stream needed — a `431` for an
@@ -1020,11 +1037,37 @@ mod tests {
     }
 
     #[test]
-    fn a_zero_stream_limit_means_unlimited_not_zero() {
-        // `0` removes the limit on HTTP/2. Passing it straight through would
-        // forbid every request stream instead, which is the opposite.
-        assert_eq!(max_streams_for(0), quinn::VarInt::MAX);
+    fn a_zero_stream_limit_keeps_the_default_rather_than_advertising_a_maximum() {
+        // Two ways to get this wrong, and this pins against both.
+        //
+        // Passing `0` through forbids every request stream — the opposite of what
+        // it means on HTTP/2. Translating it to the varint maximum looks right and
+        // hangs the server: quinn pre-inserts one map entry per advertised remote
+        // stream when it builds the connection state, so `2^62 - 1` is a
+        // four-quintillion-iteration loop on the first packet from any peer,
+        // before anything is authenticated. The bound has to stay small.
+        assert_eq!(
+            max_streams_for(0),
+            quinn::VarInt::from_u32(DEFAULT_MAX_STREAMS)
+        );
         assert_ne!(max_streams_for(0), quinn::VarInt::from_u32(0));
+        assert_ne!(max_streams_for(0), quinn::VarInt::MAX);
+        assert!(
+            u64::from(max_streams_for(0)) <= 100_000,
+            "an advertised stream cap is allocated against eagerly; it must stay small"
+        );
+    }
+
+    #[test]
+    fn no_configured_stream_limit_is_large_enough_to_allocate_against() {
+        // The property that matters is not about `0` specifically: whatever a
+        // caller sets, quinn will allocate that many entries per connection.
+        for configured in [1u32, 200, 10_000] {
+            assert!(
+                u64::from(max_streams_for(configured)) <= 100_000,
+                "{configured} produced a cap quinn would allocate eagerly against"
+            );
+        }
     }
 
     #[test]
