@@ -295,8 +295,30 @@ impl<T: IntoResponse> IntoResponse for (StatusCode, T) {
 impl IntoResponse for Error {
     fn into_response(self) -> Response {
         let mut res = Response::text(self.message().to_string()).with_status(self.status());
+        // First occurrence of a name replaces, the rest append.
+        //
+        // `Error::with_response_header` is documented as callable repeatedly, and
+        // its store is a `Vec`, so an error can legitimately carry two values of
+        // one name — two `Set-Cookie`s, or two `WWW-Authenticate` challenges when
+        // a route accepts more than one scheme. `insert` for every pair kept only
+        // the last of those, which is the same defect `Response::with_cookie`
+        // already avoids: folding several cookies into one comma-separated value
+        // "does not work in practice", and silently dropping all but one is worse.
+        //
+        // Not a blanket `append`, though, which would be the obvious fix and is
+        // wrong. `Response::text` above has already set `Content-Type`, so an
+        // error carrying `with_response_header(CONTENT_TYPE, "application/json")`
+        // would go out with two of them and the recipient would have to guess.
+        // Replacing on the first sighting keeps that an override; appending
+        // afterwards keeps a deliberate repeat.
+        let mut replaced: Vec<&HeaderName> = Vec::new();
         for (name, value) in self.response_headers() {
-            res.headers.insert(name.clone(), value.clone());
+            if replaced.contains(&name) {
+                res.headers.append(name.clone(), value.clone());
+            } else {
+                res.headers.insert(name.clone(), value.clone());
+                replaced.push(name);
+            }
         }
         res
     }
@@ -338,5 +360,51 @@ mod tests {
     fn error_renders_with_its_status() {
         let r = Error::bad_request("x").into_response();
         assert_eq!(r.status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn an_error_carrying_two_of_one_header_renders_both() {
+        let r = Error::new(StatusCode::UNAUTHORIZED, "no")
+            .with_response_header(
+                http::header::WWW_AUTHENTICATE,
+                HeaderValue::from_static("Basic realm=\"api\""),
+            )
+            .with_response_header(
+                http::header::WWW_AUTHENTICATE,
+                HeaderValue::from_static("Bearer"),
+            )
+            .into_response();
+
+        let challenges: Vec<_> = r
+            .headers
+            .get_all(http::header::WWW_AUTHENTICATE)
+            .iter()
+            .map(|v| v.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            challenges,
+            vec!["Basic realm=\"api\"", "Bearer"],
+            "both challenges should reach the client, in order"
+        );
+    }
+
+    #[test]
+    fn an_error_header_still_overrides_the_body_content_type() {
+        // The discriminating one. A blanket `append` passes the test above and
+        // fails this: `Response::text` has already set `text/plain`, so the
+        // override has to replace it rather than sit beside it.
+        let r = Error::bad_request("nope")
+            .with_response_header(
+                http::header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            )
+            .into_response();
+
+        assert_eq!(
+            r.headers.get_all(http::header::CONTENT_TYPE).iter().count(),
+            1,
+            "an overriding header must not be appended beside the one it overrides"
+        );
+        assert_eq!(r.headers.get(http::header::CONTENT_TYPE).unwrap(), "application/json");
     }
 }
