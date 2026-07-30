@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["churust-core", "churust-macros", "churust", "examples/hello", "churust-json", "churust-logging", "churust-cors", "churust-auth", "churust-ratelimit", "churust-compression", "churust-templates", "churust-redis", "churust-client", "churust-openapi", "churust-lab", "examples/api", "examples/chat", "examples/static"]
+# The comparison harness. Outside the workspace on purpose: it depends on axum,
+# and a benchmark's dependencies must not reach `Cargo.lock`, `cargo test
+# --workspace`, or any CI job that builds the library.
+exclude = ["benchmarks"]
 
 [workspace.package]
 # Every Churust crate releases in lockstep on this single version.

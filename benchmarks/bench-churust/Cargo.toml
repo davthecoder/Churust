@@ -1,0 +1,16 @@
+[package]
+name = "bench-churust"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+churust-core = { path = "../../churust-core" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+http = "1"
+
+[profile.release]
+lto = true
+codegen-units = 1
