@@ -240,6 +240,84 @@ async fn a_completed_handshake_releases_its_slot_in_the_budget() {
     drop(held);
 }
 
+/// The target authority reaches the handler over h3, so `Call::host` works.
+///
+/// HTTP/3 carries the authority in `:authority`, which lands in the URI, and
+/// there is no `Host` field beside it. Normalising the target to origin form
+/// dropped the authority, and with it the only signal `Call::host` had.
+#[tokio::test]
+async fn the_target_host_reaches_the_handler_over_h3() {
+    let cert = self_signed();
+    let app = Churust::server()
+        .routing(|r| {
+            r.get("/whoishost", |c: Call| async move {
+                match c.host() {
+                    Some(h) => format!("host {h}"),
+                    None => "host unknown".to_string(),
+                }
+            });
+        })
+        .build();
+    let addr = serve(app, &cert).await;
+
+    let (status, body) = request(addr, &cert, http::Method::GET, "/whoishost", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body, "host localhost",
+        "the `:authority` should survive into `Call::host`"
+    );
+}
+
+/// A host guard selects the right handler over h3.
+///
+/// The dangerous shape, and the reason this is not merely a missing `404`: a
+/// host-scoped route with an unguarded sibling on the same method and path is
+/// the ordinary virtual-host arrangement. With no authority to match on, the
+/// guard failed and the fallback answered — the wrong tenant's handler, with a
+/// `200`.
+#[tokio::test]
+async fn a_host_guarded_route_wins_over_its_fallback_on_h3() {
+    let cert = self_signed();
+    let app = Churust::server()
+        .routing(|r| {
+            r.get("/tenant", |_c: Call| async { "the localhost tenant" });
+            r.guard(churust_core::guard::host("localhost"));
+            r.get("/tenant", |_c: Call| async { "public fallback" });
+        })
+        .build();
+    let addr = serve(app, &cert).await;
+
+    let (status, body) = request(addr, &cert, http::Method::GET, "/tenant", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body, "the localhost tenant",
+        "the host-guarded route should have matched, not the fallback"
+    );
+}
+
+/// A guard for a host this request is not for still does not match.
+///
+/// The companion to the test above: seeding the `Host` field must not make every
+/// host guard pass.
+#[tokio::test]
+async fn a_guard_for_another_host_does_not_match_on_h3() {
+    let cert = self_signed();
+    let app = Churust::server()
+        .routing(|r| {
+            r.get("/tenant", |_c: Call| async { "someone else's tenant" });
+            r.guard(churust_core::guard::host("elsewhere.example"));
+        })
+        .build();
+    let addr = serve(app, &cert).await;
+
+    let (status, _) = request(addr, &cert, http::Method::GET, "/tenant", None).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a guard naming another host must not match this request"
+    );
+}
+
 /// A body the client declares too large is refused before any of it is read.
 ///
 /// The discriminating case is a declaration with nothing behind it: counting

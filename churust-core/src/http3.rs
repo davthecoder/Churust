@@ -533,10 +533,37 @@ where
     let mut extensions = http::Extensions::new();
     extensions.insert(crate::call::PeerAddr(peer));
 
+    // Carry the authority across in the `Host` field, because `normalise_uri`
+    // below is about to drop it.
+    //
+    // `Call::host` reads the URI authority first and the `Host` field only as a
+    // fallback (`call.rs`), and HTTP/3 replaced the field with the `:authority`
+    // pseudo-header, which arrives in the URI. Normalising to origin form
+    // therefore removed the only signal there was: `Call::host` answered `None`
+    // over h3, so `guard::host` matched nothing and a host-scoped route was
+    // either a silent 404 or — with an unguarded sibling on the same method and
+    // path, which is the ordinary virtual-host shape — served by the wrong
+    // handler. `guard.rs` documents this same failure as a fixed HTTP/2
+    // regression; on this transport it had come back.
+    //
+    // Seeding the field rather than keeping the authority in the URI is what
+    // leaves `normalise_uri`'s own decision intact: a handler still sees the
+    // same origin-form target on every transport.
+    //
+    // `insert`, not `append`: `Call::host` resolves a request carrying both an
+    // authority and a `Host` field to the authority, so a stray field must not
+    // survive beside the value it is supposed to lose to.
+    let mut headers = parts.headers.clone();
+    if let Some(authority) = parts.uri.authority() {
+        if let Ok(value) = http::HeaderValue::from_str(authority.as_str()) {
+            headers.insert(http::header::HOST, value);
+        }
+    }
+
     let process = app.process_with_extensions(
         parts.method.clone(),
         normalise_uri(&parts.uri, &parts.method),
-        parts.headers.clone(),
+        headers,
         body,
         extensions,
     );
