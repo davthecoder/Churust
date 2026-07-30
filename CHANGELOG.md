@@ -15,6 +15,16 @@ whole set.
 
 ### Fixed
 
+- **An HTTP/1.1 request without exactly one `Host` is refused.** RFC 9112 §3.2
+  requires a `400` for a request that carries none or several, and both were
+  served. Two `Host` fields is a request this server and an intermediary in front
+  can disagree about — the intermediary routes or authorizes on one, the origin
+  serves the other — and none at all leaves `Call::host` and every `guard::host`
+  route deciding on nothing. The check is gated on the version: HTTP/2 and
+  HTTP/3 carry the authority in `:authority` instead, HTTP/1.0 predates the
+  requirement, and an absolute-form target already carries the authority it
+  needs.
+
 - **`backlog` applies to the Unix-socket listener.** It was honoured on every TCP
   listener and silently dropped for `serve_unix`, which used the platform default
   — 128 on Linux — however the knob was set. Neither std's nor tokio's

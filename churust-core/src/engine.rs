@@ -1589,6 +1589,46 @@ async fn respond(
         return Ok(res);
     }
 
+    // RFC 9112 §3.2: an HTTP/1.1 request must carry exactly one `Host`, and a
+    // server must answer `400` to one that carries none or several.
+    //
+    // The reason is the same as the framing check above, and so is the risk. A
+    // request with two `Host` fields is one where this server and an
+    // intermediary can disagree about which site it was for — the intermediary
+    // routes or authorizes on one, the origin serves the other — and a request
+    // with none leaves `Call::host` and every `guard::host` route deciding on
+    // nothing at all.
+    //
+    // Gated on the version, because the other transports do not carry it there:
+    // HTTP/2 and HTTP/3 replaced the field with `:authority`, which hyper and h3
+    // put in the URI, and an ungated check would refuse every request on them.
+    // HTTP/1.0 predates the requirement. An absolute-form target is accepted
+    // without the field for the same reason `Call::host` prefers the URI: the
+    // authority is already there and it is the one that wins.
+    if req.version() == http::Version::HTTP_11 {
+        let hosts = req.headers().get_all(http::header::HOST).iter().count();
+        let bad = hosts > 1 || (hosts == 0 && req.uri().authority().is_none());
+        if bad {
+            tracing::warn!(
+                path = %req.uri().path(),
+                hosts,
+                "rejected an HTTP/1.1 request without exactly one Host"
+            );
+            let res = HyperResponse::builder()
+                .status(StatusCode::BAD_REQUEST)
+                // Closing for the same reason as the framing refusal: the
+                // disagreement is about what the message meant, so nothing after
+                // it on this connection can be trusted to mean what it says.
+                .header(http::header::CONNECTION, "close")
+                .header(http::header::CONTENT_TYPE, TEXT_PLAIN)
+                .body(into_boxed_body(Body::Bytes(bytes::Bytes::from_static(
+                    b"Bad Request",
+                ))))
+                .expect("response build is infallible");
+            return Ok(res);
+        }
+    }
+
     #[cfg(feature = "ws")]
     let ws_max_frame_bytes = app.config().ws_max_frame_bytes;
     #[cfg(feature = "ws")]
