@@ -603,6 +603,31 @@ enum BodyRefused {
 /// Counted as it arrives rather than collected and then measured, so an
 /// oversized body is refused at the chunk that crosses the line instead of
 /// after all of it has been held in memory.
+///
+/// # Why this buffers where the TCP engine streams
+///
+/// Deliberately, and not because streaming was overlooked. Collecting the body
+/// before dispatch is what lets a truncated one be refused *without the handler
+/// ever running*, which is the guarantee the `Incomplete` arm below exists for:
+/// a peer that announces 5000 bytes, sends 1200 and resets has sent a fragment,
+/// and a fragment is undetectable after the fact because a truncated body is a
+/// well-formed shorter body.
+///
+/// The TCP path hands the handler a stream instead, so there the truncation
+/// surfaces mid-handler — after any side effect it has on the bytes it already
+/// read. `Call::body_stream` says as much: exceeding the cap "surfaces as an
+/// error item in the stream rather than a `413`, because the response has
+/// usually begun by then". This transport is the stricter of the two, and the
+/// cost is memory: one `max_body_bytes` per in-flight request.
+///
+/// That cost is bounded rather than removed. `TransportLimits::max_streams`
+/// caps the requests a connection may have in flight, so the ceiling is
+/// `max_body_bytes × h2_max_concurrent_streams × max_connections` and every
+/// term is configurable; a declared oversize is refused in `serve_request`
+/// before a byte is buffered.
+///
+/// Converting this to a stream would level the two transports down to the
+/// weaker guarantee. If the asymmetry is worth closing, close it the other way.
 async fn read_body<S>(
     stream: &mut h3::server::RequestStream<S, Bytes>,
     max_body: usize,
