@@ -88,6 +88,10 @@ h3 = { workspace = true }
 h3-quinn = { workspace = true }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 futures-util = { workspace = true }
+# Benchmarks for the per-request hot path. `async_tokio` because the thing
+# under test — `App::process` — is async, and Criterion needs a runtime to
+# drive it.
+criterion = { version = "0.8", features = ["async_tokio"] }
 
 [features]
 default = []
@@ -109,3 +113,9 @@ http3 = ["tls", "dep:quinn", "dep:h3", "dep:h3-quinn"]
 
 [target.'cfg(unix)'.dependencies]
 socket2 = { workspace = true }
+
+# `harness = false` because Criterion supplies its own `main`; the default
+# libtest harness would swallow the benchmark arguments.
+[[bench]]
+name = "dispatch"
+harness = false
