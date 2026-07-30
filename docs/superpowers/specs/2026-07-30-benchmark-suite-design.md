@@ -52,23 +52,37 @@ there measures someone else's code and moves for reasons we cannot act on.
 One file per concern rather than one per module, so each stays small enough to
 read in full when a number moves.
 
-- **`routing.rs`** — `Router::find`: static hit, single param, wildcard, deep
-  path, miss, and a backtracking case. Routing runs before anything else and its
-  cost scales with the route table, so the table is built once outside the
-  measured closure.
+- **`routing.rs`** — route-shape sensitivity: static hit, single param,
+  wildcard, deep path, miss, and a backtracking case. Measured through
+  `App::process` rather than against `Router` directly, because `RouteBuilder`'s
+  constructor is `pub(crate)` and a benchmark is an external crate — it cannot
+  populate a bare `Router`. Every number therefore carries the same constant
+  dispatch overhead, so these show relative movement between route shapes, not
+  routing's absolute cost. The app is built once outside the measured closure.
 - **`dispatch.rs`** — `App::process` end to end: a bare `200`, the same with
   three middleware installed, one driving extractors, and a `404`. This is the
   same entry point `TestClient` uses, so it exercises the real pipeline without a
   socket. The `Host` validation added in 0.3.3 is on this path.
-- **`headers.rs`** — security-header application, `Vary` merge, cookie render and
-  parse, and `Error → Response` carrying one header versus three. The last is
-  the 0.3.3 change from `insert` to first-replaces-then-appends.
+- **`headers.rs`** — `Vary` merge, cookie render and parse, and
+  `Error → Response` carrying one header versus three; the last is the 0.3.3
+  change from `insert` to first-replaces-then-appends. Security headers are
+  measured as `App::process` with them on versus `without_security_headers()`,
+  since `SecurityHeaders::apply_to` is `pub(crate)`.
 - **`extract.rs`** — `Path`, `Query` and `Json` decode, since an extractor runs
   per request per handler argument.
 
+### What a benchmark can reach
+
+A `benches/` target compiles as its own crate, so it sees only `churust-core`'s
+public API. That rules out two things the suite would otherwise measure directly
+— `RouteBuilder::new` and `SecurityHeaders::apply_to` are both `pub(crate)` — and
+both are measured through `App::process` instead. Widening the public API to suit
+a benchmark was considered and rejected: a pre-1.0 crate should not make a
+permanent API commitment for a testing convenience.
+
 ### Harness
 
-Criterion 0.5 with `async_tokio`, as a dev-dependency of `churust-core`, with
+Criterion 0.8 with `async_tokio`, as a dev-dependency of `churust-core`, with
 `harness = false` on each `[[bench]]`.
 
 Chosen over iai-callgrind despite the latter's determinism: the dispatch benches
