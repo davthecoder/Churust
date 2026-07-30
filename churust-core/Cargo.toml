@@ -123,3 +123,7 @@ harness = false
 [[bench]]
 name = "routing"
 harness = false
+
+[[bench]]
+name = "headers"
+harness = false
