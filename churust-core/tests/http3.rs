@@ -361,7 +361,13 @@ async fn a_declared_oversized_body_is_refused_without_being_read() {
 #[tokio::test]
 async fn a_request_with_a_connection_specific_field_is_refused_over_h3() {
     let cert = self_signed();
-    for field in ["connection", "keep-alive", "proxy-connection", "transfer-encoding", "upgrade"] {
+    for field in [
+        "connection",
+        "keep-alive",
+        "proxy-connection",
+        "transfer-encoding",
+        "upgrade",
+    ] {
         let app = Churust::server()
             .routing(|r| {
                 r.get("/hello", |_c: Call| async { "hello over quic" });
@@ -490,7 +496,9 @@ async fn a_request_body_longer_than_its_content_length_is_not_served() {
     let cert = self_signed();
     let app = Churust::server()
         .routing(|r| {
-            r.post("/echo", |body: String| async move { format!("saw {}", body.len()) });
+            r.post("/echo", |body: String| async move {
+                format!("saw {}", body.len())
+            });
         })
         .build();
     let addr = serve(app, &cert).await;

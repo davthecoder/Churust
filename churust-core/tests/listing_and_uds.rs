@@ -430,7 +430,9 @@ async fn a_unix_listener_still_serves_with_a_custom_backlog() {
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut sock = tokio::net::UnixStream::connect(&path).await.expect("connect");
+    let mut sock = tokio::net::UnixStream::connect(&path)
+        .await
+        .expect("connect");
     sock.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
         .await
         .unwrap();
@@ -443,4 +445,3 @@ async fn a_unix_listener_still_serves_with_a_custom_backlog() {
     let _ = server.await;
     let _ = std::fs::remove_file(&path);
 }
-

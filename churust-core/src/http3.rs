@@ -315,9 +315,8 @@ async fn accept_loop(app: App, endpoint: quinn::Endpoint) {
     // `serve_connection` sets just below for `h2_max_header_list_size`: the
     // setting asks the same question of the same kind of work, so one value
     // should not need saying twice.
-    let handshakes = (app.config().max_tls_handshakes > 0).then(|| {
-        std::sync::Arc::new(tokio::sync::Semaphore::new(app.config().max_tls_handshakes))
-    });
+    let handshakes = (app.config().max_tls_handshakes > 0)
+        .then(|| std::sync::Arc::new(tokio::sync::Semaphore::new(app.config().max_tls_handshakes)));
     let handshake_timeout = (app.config().tls_handshake_timeout_ms > 0)
         .then(|| std::time::Duration::from_millis(app.config().tls_handshake_timeout_ms));
 
@@ -451,21 +450,21 @@ async fn serve_connection(
                     // with it — dropping the resolver drops that stream alone,
                     // and `h3::server::Connection` is untouched.
                     let resolved = match header_deadline {
-                        Some(limit) => match tokio::time::timeout(limit, resolver.resolve_request())
-                            .await
-                        {
-                            Ok(res) => res,
-                            // Dropping the timed-out future drops the resolver,
-                            // which drops the quinn stream. `resolve_request`
-                            // consumes the resolver, so there is no way to send a
-                            // deliberate H3_REQUEST_INCOMPLETE from here without
-                            // reaching a `doc(hidden)` field; the implicit reset
-                            // is the report, and no request was dispatched.
-                            Err(_) => {
-                                tracing::debug!("http3 request headers timed out");
-                                return;
+                        Some(limit) => {
+                            match tokio::time::timeout(limit, resolver.resolve_request()).await {
+                                Ok(res) => res,
+                                // Dropping the timed-out future drops the resolver,
+                                // which drops the quinn stream. `resolve_request`
+                                // consumes the resolver, so there is no way to send a
+                                // deliberate H3_REQUEST_INCOMPLETE from here without
+                                // reaching a `doc(hidden)` field; the implicit reset
+                                // is the report, and no request was dispatched.
+                                Err(_) => {
+                                    tracing::debug!("http3 request headers timed out");
+                                    return;
+                                }
                             }
-                        },
+                        }
                         None => resolver.resolve_request().await,
                     };
                     let (request, stream) = match resolved {
@@ -525,7 +524,10 @@ where
     // and this server behind. The TCP path refuses the HTTP/1.1 version of that
     // disagreement for the same reason.
     if let Some(field) = connection_specific_field(&parts.headers) {
-        tracing::debug!(field, "rejected an http3 request with a connection-specific field");
+        tracing::debug!(
+            field,
+            "rejected an http3 request with a connection-specific field"
+        );
         return send_status(&app, &mut stream, http::StatusCode::BAD_REQUEST).await;
     }
 

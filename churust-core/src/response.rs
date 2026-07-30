@@ -405,6 +405,9 @@ mod tests {
             1,
             "an overriding header must not be appended beside the one it overrides"
         );
-        assert_eq!(r.headers.get(http::header::CONTENT_TYPE).unwrap(), "application/json");
+        assert_eq!(
+            r.headers.get(http::header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
     }
 }

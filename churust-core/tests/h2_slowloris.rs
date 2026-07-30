@@ -276,11 +276,15 @@ async fn keep_alive_zero_waits_for_a_concurrent_http2_request() {
 
     // The slow one first, so it is already in flight when the fast one finishes.
     let slow_req = http::Request::builder().uri("/slow").body(()).unwrap();
-    let (slow, _) = send.send_request(slow_req, true).expect("send the slow one");
+    let (slow, _) = send
+        .send_request(slow_req, true)
+        .expect("send the slow one");
 
     tokio::time::sleep(Duration::from_millis(100)).await;
     let fast_req = http::Request::builder().uri("/fast").body(()).unwrap();
-    let (fast, _) = send.send_request(fast_req, true).expect("send the fast one");
+    let (fast, _) = send
+        .send_request(fast_req, true)
+        .expect("send the fast one");
 
     let fast = tokio::time::timeout(Duration::from_secs(3), fast)
         .await

@@ -267,4 +267,3 @@ async fn an_absolute_form_target_is_served_without_a_host_field() {
     let got = exchange(b"GET http://a.example/ HTTP/1.1\r\n\r\n").await;
     assert!(got.contains("200"), "{got}");
 }
-

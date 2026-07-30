@@ -599,8 +599,8 @@ impl Middleware for CorsMiddleware {
 mod tests {
     use super::*;
     // Only the tests name it now that merging lives in churust-core.
-    use http::header::VARY;
     use churust_core::{App, Churust, TestClient};
+    use http::header::VARY;
 
     fn app() -> App {
         Churust::server()
