@@ -870,6 +870,22 @@ impl<'r> RouteBuilder<'r> {
     /// the `intercept` call is not covered by it, so the reading order of the
     /// block matches the behaviour.
     ///
+    /// # Ordering, and why there is no `Phase` here
+    ///
+    /// A scope chain runs in registration order, outermost first. It is not
+    /// sorted by [`Phase`](crate::pipeline::Phase), and takes a bare
+    /// [`Middleware`](crate::pipeline::Middleware) rather than a
+    /// [`Plugin`](crate::Plugin) for that reason: `Phase` orders the one chain
+    /// every request goes through, and answers a question — does this run
+    /// outside logging, inside the router — that a scope has already answered by
+    /// being a scope. Registration order is the whole of the ordering here, so
+    /// the block reads top to bottom as it runs.
+    ///
+    /// Install through [`AppBuilder::install`](crate::AppBuilder::install) or
+    /// [`add_middleware_in`](crate::AppBuilder::add_middleware_in) when a
+    /// specific phase is what you want; that chain is phase-sorted, stably, so
+    /// install order still decides within a phase.
+    ///
     /// ```
     /// use churust_core::{Call, Churust, Middleware, Next, Response, TestClient};
     /// use async_trait::async_trait;
