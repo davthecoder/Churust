@@ -13,6 +13,10 @@ publish = false
 #
 # bytes and futures-util are only for the hand-built stream in /numbers;
 # serving files needs churust alone.
+# Inherits `unsafe_code = "forbid"` from the workspace.
+[lints]
+workspace = true
+
 [dependencies]
 churust = { workspace = true, features = ["fs"] }
 bytes = { workspace = true }

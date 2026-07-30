@@ -12,6 +12,10 @@ homepage.workspace = true
 readme.workspace = true
 description = "Core engine, routing, pipeline, and extractors for the Churust web framework."
 
+# Inherits `unsafe_code = "forbid"` from the workspace.
+[lints]
+workspace = true
+
 [package.metadata.docs.rs]
 all-features = true
 

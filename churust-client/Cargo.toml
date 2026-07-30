@@ -12,6 +12,10 @@ homepage.workspace = true
 readme.workspace = true
 description = "HTTP client for the Churust web framework: pooled connections, JSON helpers, optional rustls."
 
+# Inherits `unsafe_code = "forbid"` from the workspace.
+[lints]
+workspace = true
+
 [package.metadata.docs.rs]
 all-features = true
 

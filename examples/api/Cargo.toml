@@ -11,6 +11,10 @@ publish = false
 #     serde   = { version = "1", features = ["derive"] }
 #
 # `full` turns on the json, logging, cors, and auth plugins.
+# Inherits `unsafe_code = "forbid"` from the workspace.
+[lints]
+workspace = true
+
 [dependencies]
 churust = { workspace = true, features = ["full"] }
 serde = { workspace = true }
