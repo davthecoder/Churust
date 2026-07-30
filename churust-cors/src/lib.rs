@@ -43,7 +43,7 @@ use async_trait::async_trait;
 use churust_core::{AppBuilder, Call, Middleware, Next, Phase, Plugin, Response};
 use http::header::{
     ACCESS_CONTROL_ALLOW_CREDENTIALS, ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS,
-    ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_MAX_AGE, ACCESS_CONTROL_REQUEST_METHOD, VARY,
+    ACCESS_CONTROL_ALLOW_ORIGIN, ACCESS_CONTROL_MAX_AGE, ACCESS_CONTROL_REQUEST_METHOD,
 };
 use http::{HeaderValue, Method, StatusCode};
 use std::sync::Arc;
@@ -516,35 +516,15 @@ impl Default for Cors {
 /// CORS sits outside it, so the overwrite left a gzip-encoded response keyed on
 /// `Origin` alone: a shared cache would store those compressed bytes and hand
 /// them to the next same-origin client that sent no `Accept-Encoding` at all,
-/// which cannot decode them. The merge below is deliberately the same shape as
-/// `churust_compression`'s `vary_on_accept_encoding` so the two plugins agree
-/// on what a merged `Vary` looks like whichever order they are installed in:
-/// split the existing values on commas, compare case-insensitively because
-/// field names are case-insensitive, and leave the header alone when it is
-/// already `*` (which varies on everything) or already names the origin. The
-/// token is appended in lower case for the same reason — it matches the
-/// spelling the compression plugin emits, so a response passing through both
-/// reads as one consistent list rather than a mixture.
+/// which cannot decode them.
+///
+/// The merge itself is `Response::vary_on`, in churust-core, rather than a shape
+/// copied here and kept in step with the compression plugin's by hand: the two
+/// only interoperate if they agree on what a merged `Vary` looks like whichever
+/// order they are installed in, and one implementation is how that is
+/// guaranteed rather than intended.
 fn vary_on_origin(res: &mut Response) {
-    let existing: Vec<String> = res
-        .headers
-        .get_all(VARY)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .map(|v| v.trim().to_ascii_lowercase())
-        .filter(|v| !v.is_empty())
-        .collect();
-
-    if existing.iter().any(|v| v == "*" || v == "origin") {
-        return;
-    }
-
-    let mut merged = existing;
-    merged.push("origin".to_string());
-    if let Ok(value) = HeaderValue::from_str(&merged.join(", ")) {
-        res.headers.insert(VARY, value);
-    }
+    res.vary_on("origin");
 }
 
 impl Plugin for Cors {
@@ -618,6 +598,8 @@ impl Middleware for CorsMiddleware {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the tests name it now that merging lives in churust-core.
+    use http::header::VARY;
     use churust_core::{App, Churust, TestClient};
 
     fn app() -> App {

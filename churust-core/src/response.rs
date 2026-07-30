@@ -164,6 +164,63 @@ impl Response {
         self.headers.insert(name, value);
         self
     }
+
+    /// Add a field name to `Vary` without disturbing what is already there.
+    ///
+    /// Middleware that varies its output on a request header has to say so, and
+    /// more than one layer can want to. Each has to merge rather than overwrite:
+    /// a plugin that inserted its own field alone erased the other's, and a
+    /// shared cache then served a response keyed on the wrong thing — compressed
+    /// bytes handed to a client that never said it could decode them, or one
+    /// origin's response handed to another.
+    ///
+    /// Merging is here, in one place, because the merge is only correct if every
+    /// layer does it the same way: field names are case-insensitive, so the
+    /// comparison is too, and the value is appended in lower case so a response
+    /// passing through several layers reads as one consistent list rather than a
+    /// mixture. Two implementations agreeing by convention is what this replaces.
+    ///
+    /// Already-present fields and a `Vary: *` — which varies on everything — are
+    /// left alone.
+    ///
+    /// ```
+    /// use churust_core::Response;
+    ///
+    /// let mut res = Response::text("ok");
+    /// res.vary_on("accept-encoding");
+    /// res.vary_on("Origin");
+    /// assert_eq!(res.headers.get("vary").unwrap(), "accept-encoding, origin");
+    ///
+    /// // Asking twice changes nothing, whatever the spelling.
+    /// res.vary_on("ORIGIN");
+    /// assert_eq!(res.headers.get("vary").unwrap(), "accept-encoding, origin");
+    /// ```
+    pub fn vary_on(&mut self, field: &str) {
+        let field = field.trim().to_ascii_lowercase();
+        if field.is_empty() {
+            return;
+        }
+
+        let existing: Vec<String> = self
+            .headers
+            .get_all(http::header::VARY)
+            .iter()
+            .filter_map(|v| v.to_str().ok())
+            .flat_map(|v| v.split(','))
+            .map(|v| v.trim().to_ascii_lowercase())
+            .filter(|v| !v.is_empty())
+            .collect();
+
+        if existing.iter().any(|v| v == "*" || *v == field) {
+            return;
+        }
+
+        let mut merged = existing;
+        merged.push(field);
+        if let Ok(value) = HeaderValue::from_str(&merged.join(", ")) {
+            self.headers.insert(http::header::VARY, value);
+        }
+    }
 }
 
 /// Convert a handler return value into a [`Response`].
