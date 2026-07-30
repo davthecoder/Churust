@@ -182,12 +182,57 @@ where
     async fn from_call_parts(call: &mut Call) -> Result<Self> {
         match call.get::<P>() {
             Some(p) => Ok(Principal(p)),
-            None => Err(
-                Error::new(StatusCode::UNAUTHORIZED, "authentication required")
-                    .with_response_header(WWW_AUTHENTICATE, HeaderValue::from_static("Bearer")),
-            ),
+            None => {
+                let offered = call.get::<Challenges>().unwrap_or_default().0;
+                let mut err = Error::new(StatusCode::UNAUTHORIZED, "authentication required");
+                if offered.is_empty() {
+                    err = err.with_response_header(WWW_AUTHENTICATE, default_challenge());
+                } else {
+                    for challenge in offered {
+                        err = err.with_response_header(WWW_AUTHENTICATE, challenge);
+                    }
+                }
+                Err(err)
+            }
         }
     }
+}
+
+/// The `WWW-Authenticate` challenges the schemes on this call would accept.
+///
+/// The [`Principal<P>`] extractor refuses with `401`, and a `401` has to say
+/// *how* to authenticate — RFC 9110 §11.6.1 requires the header, and a browser
+/// only opens its own credential dialog for a scheme it recognises. The extractor
+/// is generic over the principal type and cannot know which scheme guards the
+/// route, so each plugin records its own challenge here as the request passes
+/// through and the extractor emits what it finds.
+///
+/// A `Vec` because more than one scheme can be installed, and a `401` may
+/// legitimately offer several. Values are in installation order.
+#[derive(Clone, Debug, Default)]
+struct Challenges(Vec<HeaderValue>);
+
+impl Challenges {
+    /// Record `challenge` for this call, keeping installation order and not
+    /// repeating one that is already there.
+    fn offer(call: &mut Call, challenge: HeaderValue) {
+        let mut existing = call.get::<Challenges>().unwrap_or_default();
+        if !existing.0.contains(&challenge) {
+            existing.0.push(challenge);
+            call.insert(existing);
+        }
+    }
+}
+
+/// The challenge used when nothing recorded one.
+///
+/// A route can ask for a `Principal` with no auth plugin installed at all, and a
+/// bare `401` with no header would be the one answer that tells the client
+/// nothing. `Bearer` is the safe default: it is what this crate emitted for every
+/// scheme before challenges were tracked, and unlike `Basic` it does not make a
+/// browser pop up a login dialog for a route that may not want one.
+fn default_challenge() -> HeaderValue {
+    HeaderValue::from_static("Bearer")
 }
 
 // ---------- Bearer ----------
@@ -377,6 +422,7 @@ impl Auth {
     {
         Basic {
             verify: Arc::new(verify),
+            realm: "restricted".to_string(),
             _p: PhantomData,
         }
     }
@@ -413,6 +459,7 @@ where
     P: Clone + Send + Sync + 'static,
 {
     async fn handle(&self, mut call: Call, next: Next) -> Response {
+        Challenges::offer(&mut call, HeaderValue::from_static("Bearer"));
         if let Some(raw) = call.header("authorization") {
             if let Some(token) = raw
                 .strip_prefix("Bearer ")
@@ -478,7 +525,31 @@ where
 /// ```
 pub struct Basic<P, F> {
     verify: Arc<F>,
+    realm: String,
     _p: PhantomData<fn() -> P>,
+}
+
+impl<P, F> Basic<P, F> {
+    /// Set the protection space named in the `WWW-Authenticate` challenge.
+    ///
+    /// RFC 9110 §11.6.1 requires a `realm` on a Basic challenge. It is what a
+    /// browser shows in its credential dialog and what a client keys stored
+    /// credentials on, so a name the user will recognise is worth setting. The
+    /// default is `"restricted"`.
+    ///
+    /// A `"` in the name is replaced with `'`: the value is a quoted string, and
+    /// a stray quote would end it early and let the rest of the name be read as
+    /// further authentication parameters.
+    pub fn realm(mut self, realm: impl Into<String>) -> Self {
+        self.realm = realm.into().replace('"', "'");
+        self
+    }
+
+    /// The challenge this scheme offers, as a header value.
+    fn challenge(&self) -> HeaderValue {
+        HeaderValue::from_str(&format!("Basic realm=\"{}\"", self.realm))
+            .unwrap_or_else(|_| HeaderValue::from_static("Basic realm=\"restricted\""))
+    }
 }
 
 impl<P, F, Fut> Plugin for Basic<P, F>
@@ -489,6 +560,7 @@ where
 {
     fn install(self: Box<Self>, app: &mut AppBuilder) {
         let verify = self.verify.clone();
+        let challenge = self.challenge();
         app.add_middleware_in(
             Phase::Plugins,
             Arc::new(BasicMiddleware::<P> {
@@ -496,6 +568,7 @@ where
                     let verify = verify.clone();
                     Box::pin(async move { verify(u, p).await }) as BoxFut<Option<P>>
                 }),
+                challenge,
             }),
         );
     }
@@ -504,6 +577,8 @@ where
 struct BasicMiddleware<P> {
     #[allow(clippy::type_complexity)]
     verify: Arc<dyn Fn(String, String) -> BoxFut<Option<P>> + Send + Sync>,
+    /// Rendered once at install time rather than per request.
+    challenge: HeaderValue,
 }
 
 #[async_trait]
@@ -512,6 +587,7 @@ where
     P: Clone + Send + Sync + 'static,
 {
     async fn handle(&self, mut call: Call, next: Next) -> Response {
+        Challenges::offer(&mut call, self.challenge.clone());
         if let Some((user, pass)) = call.header("authorization").and_then(decode_basic) {
             if let Some(principal) = (self.verify)(user, pass).await {
                 call.insert(principal);
@@ -807,5 +883,125 @@ mod tests {
             .await;
         assert_eq!(res.status(), StatusCode::OK);
         assert_eq!(res.text(), "u42");
+    }
+
+    #[derive(Clone)]
+    struct Guest;
+
+    fn basic_app() -> App {
+        Churust::server()
+            .install(Auth::basic(|_u: String, p: String| async move {
+                churust_core::secure_compare(&p, "pw").then_some(Guest)
+            }))
+            .routing(|r| {
+                r.get("/private", |_p: Principal<Guest>| async { "in" });
+            })
+            .build()
+    }
+
+    #[tokio::test]
+    async fn a_basic_route_challenges_with_basic_and_a_realm() {
+        // A `401` has to say how to authenticate, and a browser only opens its
+        // credential dialog for a scheme it recognises. Every scheme in this crate
+        // used to answer `Bearer`, so a Basic-protected route asked for
+        // credentials a browser had no way to supply.
+        let res = TestClient::new(basic_app()).get("/private").send().await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            res.header("www-authenticate"),
+            Some("Basic realm=\"restricted\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_custom_realm_reaches_the_challenge() {
+        let app = Churust::server()
+            .install(
+                Auth::basic(|_u: String, p: String| async move {
+                    churust_core::secure_compare(&p, "pw").then_some(Guest)
+                })
+                .realm("staging area"),
+            )
+            .routing(|r| {
+                r.get("/private", |_p: Principal<Guest>| async { "in" });
+            })
+            .build();
+        let res = TestClient::new(app).get("/private").send().await;
+        assert_eq!(
+            res.header("www-authenticate"),
+            Some("Basic realm=\"staging area\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_quote_in_a_realm_cannot_end_the_quoted_string() {
+        // The value is a quoted string; a stray `"` would close it early and let
+        // the rest be read as further auth parameters.
+        let app = Churust::server()
+            .install(
+                Auth::basic(|_u: String, p: String| async move {
+                    churust_core::secure_compare(&p, "pw").then_some(Guest)
+                })
+                .realm("a\" , error=\"nope"),
+            )
+            .routing(|r| {
+                r.get("/private", |_p: Principal<Guest>| async { "in" });
+            })
+            .build();
+        let res = TestClient::new(app).get("/private").send().await;
+        let got = res.header("www-authenticate").unwrap().to_string();
+        assert!(
+            !got.trim_start_matches("Basic realm=\"").contains('"')
+                || got.ends_with('"') && got.matches('"').count() == 2,
+            "the realm must stay one quoted string, got: {got}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bearer_route_still_challenges_with_bearer() {
+        // The guard against making every challenge Basic.
+        let app = Churust::server()
+            .install(Auth::bearer(|t: String| async move {
+                churust_core::secure_compare(&t, "ok").then_some(Guest)
+            }))
+            .routing(|r| {
+                r.get("/private", |_p: Principal<Guest>| async { "in" });
+            })
+            .build();
+        let res = TestClient::new(app).get("/private").send().await;
+        assert_eq!(res.header("www-authenticate"), Some("Bearer"));
+    }
+
+    #[tokio::test]
+    async fn a_route_with_both_schemes_offers_both_challenges() {
+        // Both installed, so a `401` names both. This is what needed
+        // `IntoResponse for Error` to stop collapsing repeated header names.
+        let app = Churust::server()
+            .install(Auth::basic(|_u: String, p: String| async move {
+                churust_core::secure_compare(&p, "pw").then_some(Guest)
+            }))
+            .install(Auth::bearer(|t: String| async move {
+                churust_core::secure_compare(&t, "ok").then_some(Guest)
+            }))
+            .routing(|r| {
+                r.get("/private", |_p: Principal<Guest>| async { "in" });
+            })
+            .build();
+        let res = TestClient::new(app).get("/private").send().await;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        let all = res.headers().get_all("www-authenticate").iter().count();
+        assert_eq!(all, 2, "both schemes should be offered, got {all}");
+    }
+
+    #[tokio::test]
+    async fn a_valid_basic_credential_still_reaches_the_handler() {
+        // base64("ada:pw") == "YWRhOnB3"
+        let res = TestClient::new(basic_app())
+            .get("/private")
+            .header("authorization", "Basic YWRhOnB3")
+            .send()
+            .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(res.text(), "in");
     }
 }

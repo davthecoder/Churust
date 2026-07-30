@@ -44,11 +44,20 @@ compare against a store) so timing does not leak how much of a guess was right.
 ## Basic
 
 ```rust
-.install(Auth::basic(|user, pass| async move {
-    // Only over TLS — Basic is reversibly encoded, not encrypted.
-    verify_user(user, pass).await
-}))
+.install(
+    Auth::basic(|user, pass| async move {
+        // Only over TLS — Basic is reversibly encoded, not encrypted.
+        verify_user(user, pass).await
+    })
+    // Named in the 401 challenge; browsers show it in the login dialog.
+    .realm("admin area"),
+)
 ```
+
+An unauthenticated request to a `Principal`-protected route answers `401` with
+`WWW-Authenticate: Basic realm="…"`. The realm defaults to `restricted`. Install
+Basic and Bearer together and a `401` offers both challenges, in installation
+order.
 
 ## JWT
 
