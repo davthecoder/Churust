@@ -36,6 +36,11 @@ CASES = {
         "a compare step that produced no real table must fail loudly, not "
         "silently pass",
     ),
+    "zero_base.txt": (
+        1,
+        "a zero base time is unanalysable, not a free pass no matter how "
+        "large head becomes",
+    ),
 }
 
 

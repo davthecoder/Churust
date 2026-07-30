@@ -15,7 +15,8 @@ jobs:
     name: Compare against the merge base
     runs-on: ubuntu-latest
     steps:
-      # Full history, because the base commit has to be checked out and benched.
+      # Full history, because the merge base and the head commit both have to
+      # be checked out and benched.
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
@@ -40,10 +41,14 @@ jobs:
       - name: Install critcmp
         run: cargo install critcmp --locked --version 0.1.8
 
-      # Sample size is cut to keep a doubled run inside a few minutes. It widens
-      # the confidence interval, which is acceptable when the gate only fires at
-      # 20%.
-      - name: Bench the merge base
+      # `pull_request.base.sha` is the base branch's tip at event time, not
+      # the commit the PR actually forked from. Once main advances past that
+      # fork point, benching `base.sha` would attribute main's own later
+      # changes to the PR -- the opposite of what a job named "Compare
+      # against the merge base" should do. `git merge-base` finds the real
+      # common ancestor instead.
+      - name: Resolve the merge base
+        id: merge_base
         env:
           # Passed through env rather than interpolated into the script body:
           # these two values are commit hashes, not attacker-controllable text,
@@ -51,8 +56,18 @@ jobs:
           # `${{ }}` inside `run:` is the pattern to keep once someone adds a
           # field that isn't as safe, e.g. a PR title.
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          git checkout --detach "$BASE_SHA"
+          echo "sha=$(git merge-base "$BASE_SHA" "$HEAD_SHA")" >> "$GITHUB_OUTPUT"
+
+      # Sample size is cut to keep a doubled run inside a few minutes. It widens
+      # the confidence interval, which is acceptable when the gate only fires at
+      # 20%.
+      - name: Bench the merge base
+        env:
+          MERGE_BASE_SHA: ${{ steps.merge_base.outputs.sha }}
+        run: |
+          git checkout --detach "$MERGE_BASE_SHA"
           cargo bench -p churust-core -- --save-baseline base --sample-size 20
 
       - name: Bench the head
@@ -102,9 +117,26 @@ jobs:
                   'Benchmarks did not complete, so there is no table to show. ' +
                     'Check the failed step in this run for the real error.',
                 ].join('\n');
-            await github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body,
-            });
+            try {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body,
+              });
+            } catch (error) {
+              // A pull request from a fork gets a read-only GITHUB_TOKEN no
+              // matter what `permissions:` above says, so createComment 403s
+              // here for every external contribution -- Churust is public,
+              // so that is not an edge case. That is a permissions artifact,
+              // not a benchmark result, and must not turn an otherwise-green
+              // run red: the regression verdict already happened in the
+              // "Fail on a regression past 20%" step and stands on its own
+              // either way. Fall back to the job summary, which needs no
+              // write permission at all.
+              core.warning(
+                `could not comment on the pull request (${error.message}); ` +
+                  'writing the table to the job summary instead.'
+              );
+              await core.summary.addRaw(body).write();
+            }

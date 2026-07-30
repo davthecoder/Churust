@@ -20,6 +20,15 @@ def to_seconds(value: str, unit: str) -> float:
 def main() -> int:
     path, factor = sys.argv[1], float(sys.argv[2])
     rows = []
+    # Rows whose parsed base time is exactly 0 go here instead of into `rows`.
+    # `head / base` either explodes or, guarded with a naive `base > 0 and
+    # ...`, makes the row match neither branch: it counts toward `total` (so
+    # the "empty table" guard below does not catch it either) yet can never
+    # be flagged no matter how large `head` grows. An arbitrarily large real
+    # regression would then exit 0. Zero is not a time a real benchmark
+    # reports, so a zero base is treated as a row this script cannot judge,
+    # not as one that is fine, and fails loudly instead of passing quietly.
+    unanalysable = []
     # Every line that carries exactly two `value±error unit` measurements is a
     # real comparison row (critcmp's header and separator lines carry none).
     # Counting these separately from `rows` lets an empty or garbled table --
@@ -46,7 +55,10 @@ def main() -> int:
         # the ratio is taken.
         base = to_seconds(*times[0])
         head = to_seconds(*times[1])
-        if base > 0 and head / base > factor:
+        if base <= 0:
+            unanalysable.append(name)
+            continue
+        if head / base > factor:
             rows.append((name, base, head, head / base))
 
     if total == 0:
@@ -61,8 +73,20 @@ def main() -> int:
     for name, base, head, ratio in rows:
         print(f"REGRESSION {name}: {base:.3e}s -> {head:.3e}s ({ratio:.2f}x)")
 
-    if rows:
-        print(f"\n{len(rows)} benchmark(s) regressed past {factor:.2f}x.")
+    for name in unanalysable:
+        print(
+            f"UNANALYSABLE {name}: base time parsed as 0s, cannot compute a ratio",
+            file=sys.stderr,
+        )
+
+    if rows or unanalysable:
+        if rows:
+            print(f"\n{len(rows)} benchmark(s) regressed past {factor:.2f}x.")
+        if unanalysable:
+            print(
+                f"\n{len(unanalysable)} benchmark(s) had a zero base time and "
+                "could not be judged."
+            )
         return 1
 
     print(f"No benchmark regressed past {factor:.2f}x ({total} compared).")
