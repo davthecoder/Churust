@@ -387,6 +387,17 @@ impl Drain {
 /// deliberately far below any sane value of it.
 const GOAWAY_LINGER: std::time::Duration = std::time::Duration::from_millis(250);
 
+/// How often the connection loop re-checks whether it may close, when
+/// `keep_alive_ms` is `0`.
+///
+/// `0` asks for "answer and close", which is a state to notice rather than a
+/// deadline to compute: the connection may close as soon as nothing is in flight,
+/// and only `in_flight` reaching zero says when that is. A connection at this
+/// setting lives about as long as one request, so this is a wake or two rather
+/// than a standing poll. Not configurable — it is the resolution of a close that
+/// is already meant to be immediate, not a policy.
+const ZERO_KEEP_ALIVE_POLL_MS: u64 = 25;
+
 /// The `Content-Type` of the refusals this module composes itself.
 ///
 /// Spelled the same way [`Response::text`](crate::Response::text) spells it, so
@@ -507,6 +518,14 @@ struct ConnActivity {
     in_flight: std::sync::atomic::AtomicUsize,
     /// Milliseconds since `origin` at the end of the last request.
     last_ms: std::sync::atomic::AtomicU64,
+    /// Whether any request has finished on this connection.
+    ///
+    /// Separate from `last_ms` rather than derived from it, because `last_ms` is
+    /// a millisecond count from `origin` and a request served in under a
+    /// millisecond stores `0` — indistinguishable from "nothing has run yet".
+    /// The `keep_alive_ms == 0` close needs exactly that distinction, and it is
+    /// the fast request that would get it wrong.
+    served: std::sync::atomic::AtomicBool,
     /// Fixed reference point, so activity is a cheap integer rather than a
     /// mutex around an `Instant`.
     origin: tokio::time::Instant,
@@ -535,6 +554,9 @@ impl Drop for InFlight {
             self.0.origin.elapsed().as_millis() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
+        self.0
+            .served
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.0
             .in_flight
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
@@ -591,6 +613,7 @@ impl ConnActivity {
         Self {
             in_flight: std::sync::atomic::AtomicUsize::new(0),
             last_ms: std::sync::atomic::AtomicU64::new(0),
+            served: std::sync::atomic::AtomicBool::new(false),
             origin: tokio::time::Instant::now(),
         }
     }
@@ -598,6 +621,21 @@ impl ConnActivity {
     /// Whether a request is being served right now.
     fn busy(&self) -> bool {
         self.in_flight.load(std::sync::atomic::Ordering::Relaxed) > 0
+    }
+
+    /// Whether any request on this connection has finished.
+    ///
+    /// Set when an [`InFlight`] guard drops, which is after the response body
+    /// has been written.
+    ///
+    /// Used by the `keep_alive_ms == 0` branch of the connection loop, which must
+    /// close *after* a response and not before the first one. Deliberately not
+    /// `last_ms > 0`: that is a millisecond count from the connection's own
+    /// start, so a request served in under a millisecond records `0` and would
+    /// read as "nothing has run yet" — leaving the fast connections, which is to
+    /// say most of them, never closed.
+    fn has_served(&self) -> bool {
+        self.served.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// `None` if the connection has been idle for at least `keep_alive_ms`,
@@ -1133,13 +1171,30 @@ async fn serve_stream<S>(
         // The idle deadline. Re-armed on every wake that finds the connection
         // busy or recently active, so the common case costs one timer per
         // connection rather than one per request.
-        let idle_enabled = cfg.keep_alive_ms > 0;
-        let idle = tokio::time::sleep(std::time::Duration::from_millis(if idle_enabled {
-            cfg.keep_alive_ms
+        //
+        // `keep_alive_ms == 0` means "answer and close". hyper implements that
+        // for HTTP/1 via `keep_alive(false)` above, and has no h2 counterpart —
+        // so the branch that used to be disabled at 0 left an HTTP/2 connection
+        // with neither reuse turned off nor an idle bound, i.e. held for the life
+        // of the process. That is the "never expires" reading `http3::idle_ms_for`
+        // refused for QUIC, and it made the strictest setting available *weaker*
+        // than the 75s default: a peer that opened `max_connections` h2
+        // connections, sent one request on each and then idled while answering
+        // keep-alive pings exhausted the budget permanently.
+        //
+        // At 0 the branch therefore stays armed and polls instead, closing as
+        // soon as the connection is not busy and something has been served. It
+        // has to be a poll rather than a deadline because there is nothing to
+        // compute a deadline against: the close is wanted immediately after a
+        // response, and only `in_flight` dropping to zero says when that is. The
+        // cost is bounded by what the setting asks for — a connection at 0 lives
+        // for about one request, so this is a wake or two, not a background poll.
+        let idle_enabled = true;
+        let zero_keep_alive = cfg.keep_alive_ms == 0;
+        let idle = tokio::time::sleep(std::time::Duration::from_millis(if zero_keep_alive {
+            ZERO_KEEP_ALIVE_POLL_MS
         } else {
-            // Parked: the branch is disabled, but `select!` still needs a
-            // future to name.
-            u64::MAX / 2
+            cfg.keep_alive_ms
         }));
         let mut idle = std::pin::pin!(idle);
 
@@ -1153,8 +1208,9 @@ async fn serve_stream<S>(
         // and the sniffing it does first carries no timer, so this is the only
         // thing standing between a silent socket and a permit held for the life
         // of the process — the idle watchdog is a backstop at `keep_alive_ms`
-        // rather than at the advertised deadline, and `keep_alive_ms` of 0
-        // disables it outright.
+        // rather than at the advertised deadline, and at `keep_alive_ms` of 0 it
+        // deliberately waits for a first response before closing anything, so it
+        // does not cover this phase either.
         //
         // It stops applying at negotiation, not at the first request: an HTTP/2
         // client that has handshaken is entitled to idle for far longer than
@@ -1254,6 +1310,33 @@ async fn serve_stream<S>(
                     }
                 }
                 _ = idle.as_mut(), if idle_enabled && !winding_down => {
+                    // `keep_alive_ms == 0`: close once a response is out and
+                    // nothing else is in flight. Gated on `has_served` so the
+                    // pre-protocol phase stays the negotiation deadline's job —
+                    // without it, `idle_for(0)` on a brand-new connection returns
+                    // `None` immediately and shuts down a peer that has not been
+                    // given the chance to say anything.
+                    //
+                    // A connection that negotiates and then never sends a request
+                    // is deliberately left alone here: the h2 keep-alive ping is
+                    // what asks whether such a peer is still there, exactly as it
+                    // does at any other value of this knob.
+                    if zero_keep_alive {
+                        if activity.has_served() && !activity.busy() {
+                            winding_down = true;
+                            conn.as_mut().graceful_shutdown();
+                            linger
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + GOAWAY_LINGER);
+                            lingering = true;
+                        } else {
+                            idle.as_mut().reset(
+                                tokio::time::Instant::now()
+                                    + std::time::Duration::from_millis(ZERO_KEEP_ALIVE_POLL_MS),
+                            );
+                        }
+                        continue;
+                    }
                     match activity.idle_for(cfg.keep_alive_ms) {
                         // Nothing in flight and nothing recent: close it.
                         None => {

@@ -217,9 +217,9 @@ fn server_config_from_pem_with_limits(
 /// timeout and `h2_max_concurrent_streams` the per-connection request limit, so
 /// lowering either bounds this transport too and not only TCP.
 ///
-/// `header_read_timeout_ms` and `h2_max_header_list_size` are honoured as well,
-/// applied per stream in [`serve_connection`] rather than as QUIC transport
-/// parameters, so they hold on [`serve_with_config`] too.
+/// `header_read_timeout_ms` and `h2_max_header_list_size` are honoured as well.
+/// They are applied per stream rather than as QUIC transport parameters, so
+/// unlike the two above they hold on [`serve_with_config`] too.
 ///
 /// # Errors
 ///

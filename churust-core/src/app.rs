@@ -273,6 +273,12 @@ impl AppBuilder {
     /// multiplexes streams and cannot be closed after a single response, so
     /// there is nothing for "answer and close" to mean and the HTTP/3 listener
     /// keeps the default `75000` ms bound rather than never expiring.
+    ///
+    /// `0` reaches HTTP/2 as well, where hyper has no reuse switch to turn off:
+    /// the connection is closed once a response has been written and nothing
+    /// else is in flight. A connection that has not answered anything yet is
+    /// left to `header_read_timeout_ms`, which is what bounds a peer that has
+    /// not made a request.
     pub fn keep_alive_ms(mut self, ms: u64) -> Self {
         self.config.keep_alive_ms = ms;
         self
