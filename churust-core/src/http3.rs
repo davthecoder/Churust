@@ -139,9 +139,17 @@ fn max_streams_for(h2_max_concurrent_streams: u32) -> quinn::VarInt {
 
 /// The QUIC transport bounds that come from the app's own configuration.
 ///
-/// Grouped so there is one list of them: a knob that belongs here and is not in
-/// this struct is a knob HTTP/3 silently ignores, which is the failure this type
-/// exists to make visible.
+/// Grouped so there is one list of them: a *transport parameter* that belongs
+/// here and is not in this struct is one HTTP/3 silently ignores, which is the
+/// failure this type exists to make visible.
+///
+/// Only quinn transport parameters, because that is all this reaches — it is
+/// handed to [`server_config_from_pem_with_limits`] and nothing else. App-level
+/// deadlines are applied where the work they bound happens, in
+/// [`serve_connection`]: `h2_max_header_list_size` as h3's
+/// `max_field_section_size`, and `header_read_timeout_ms` around the wait for a
+/// HEADERS frame. Both consequently apply on the [`serve_with_config`] path too,
+/// where these bounds do not.
 struct TransportLimits {
     /// From `keep_alive_ms`, via [`idle_ms_for`].
     idle_ms: u64,
@@ -208,6 +216,10 @@ fn server_config_from_pem_with_limits(
 /// The transport bounds come from the app: `keep_alive_ms` becomes the QUIC idle
 /// timeout and `h2_max_concurrent_streams` the per-connection request limit, so
 /// lowering either bounds this transport too and not only TCP.
+///
+/// `header_read_timeout_ms` and `h2_max_header_list_size` are honoured as well,
+/// applied per stream in [`serve_connection`] rather than as QUIC transport
+/// parameters, so they hold on [`serve_with_config`] too.
 ///
 /// # Errors
 ///
@@ -395,6 +407,26 @@ async fn serve_connection(
         .build(h3_quinn::Connection::new(connection))
         .await?;
 
+    // `header_read_timeout_ms`, the slow-loris defence, which this transport did
+    // not apply to any phase of a request.
+    //
+    // `accept` returns as soon as a bidi stream exists, before a frame has been
+    // read, so a peer could open `h2_max_concurrent_streams` streams, send no
+    // HEADERS frame on any of them, and hold a task and an h3 resolver per stream
+    // for the life of the process. Nothing reclaimed them: `request_timeout_ms`
+    // is armed further down, after the headers have arrived; the QUIC idle
+    // timeout is a packet-activity timer that any keepalive resets, where the TCP
+    // watchdog measures *completed requests* and so does close a connection whose
+    // streams never produce one; and the handshake deadline has ended long
+    // before a stream exists.
+    //
+    // Read here rather than through `TransportLimits`, which is only for quinn
+    // transport parameters — this is an app-level deadline, and the precedent is
+    // `max_field_section_size` just above. One consequence worth naming: like
+    // that knob, it therefore also applies on the `serve_with_config` path.
+    let header_deadline = (app.config().header_read_timeout_ms > 0)
+        .then(|| std::time::Duration::from_millis(app.config().header_read_timeout_ms));
+
     loop {
         match h3.accept().await {
             Ok(Some(resolver)) => {
@@ -414,7 +446,29 @@ async fn serve_connection(
                 // the `h3::server::Connection`, and closed the whole QUIC
                 // connection, killing every other request multiplexed on it.
                 tokio::spawn(async move {
-                    let (request, stream) = match resolver.resolve_request().await {
+                    // Bounded per stream, never per connection. A sibling that
+                    // never sends its headers must not take the connection down
+                    // with it — dropping the resolver drops that stream alone,
+                    // and `h3::server::Connection` is untouched.
+                    let resolved = match header_deadline {
+                        Some(limit) => match tokio::time::timeout(limit, resolver.resolve_request())
+                            .await
+                        {
+                            Ok(res) => res,
+                            // Dropping the timed-out future drops the resolver,
+                            // which drops the quinn stream. `resolve_request`
+                            // consumes the resolver, so there is no way to send a
+                            // deliberate H3_REQUEST_INCOMPLETE from here without
+                            // reaching a `doc(hidden)` field; the implicit reset
+                            // is the report, and no request was dispatched.
+                            Err(_) => {
+                                tracing::debug!("http3 request headers timed out");
+                                return;
+                            }
+                        },
+                        None => resolver.resolve_request().await,
+                    };
+                    let (request, stream) = match resolved {
                         Ok(pair) => pair,
                         // Scoped to this stream by construction. h3 has already
                         // done whatever the stream needed — a `431` for an
