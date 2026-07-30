@@ -412,14 +412,17 @@ pub(crate) struct ConnGuard(#[allow(dead_code)] std::sync::Arc<ConnGuardInner>);
 
 pub(crate) struct ConnGuardInner {
     _slot: ConnSlot,
-    token: DrainToken,
+    /// Underscored because only the `ws` build reads it: for an HTTP connection
+    /// the token is held, not watched — `serve_stream` watches the signal
+    /// directly — and merely holding it is what makes the drain wait.
+    _token: DrainToken,
 }
 
 impl ConnGuard {
     fn new(slot: ConnSlot, token: DrainToken) -> Self {
         Self(std::sync::Arc::new(ConnGuardInner {
             _slot: slot,
-            token,
+            _token: token,
         }))
     }
 
@@ -433,8 +436,9 @@ impl ConnGuard {
     /// has to watch the signal itself, and until it could, every shutdown waited
     /// out the full grace period for any live WebSocket and never returned at all
     /// at `shutdown_timeout_ms = 0`.
+    #[cfg(feature = "ws")]
     pub(crate) async fn draining(&self) {
-        let mut signal = self.0.token.signal.clone();
+        let mut signal = self.0._token.signal.clone();
         // `wait_for` rather than `changed`, so a signal that fired before this
         // was called is still seen — the same reason `serve_stream` uses it.
         let _ = signal.wait_for(|fired| *fired).await;
