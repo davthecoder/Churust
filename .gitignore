@@ -75,3 +75,6 @@ $RECYCLE.BIN/
 /graphify-out
 /.agents
 skills-lock.json
+
+# Subagent-driven-development scratch: ledgers, briefs, review packages.
+/.superpowers
