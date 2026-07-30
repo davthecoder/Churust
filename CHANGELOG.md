@@ -13,6 +13,10 @@ whole set.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.3.3] - 2026-07-30
+
 ### Fixed
 
 - **An HTTP/1.1 request without exactly one `Host` is refused.** RFC 9112 §3.2
@@ -1359,7 +1363,8 @@ First public release.
   panicking handler returns 500 rather than killing the server), and no version
   banner.
 
-[Unreleased]: https://github.com/davthecoder/Churust/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/davthecoder/Churust/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/davthecoder/Churust/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/davthecoder/Churust/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/davthecoder/Churust/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/davthecoder/Churust/compare/v0.2.0...v0.3.0
