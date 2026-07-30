@@ -27,8 +27,44 @@ require() { # name [install-hint]
 # works.
 require curl
 
-start() { # name dir port
-  (cd "$2" && PORT="$3" ./target/release/"$1" &)
+# PIDs of the two servers, and the scratch dir for equivalence-check output.
+# Declared empty up front (rather than left unset) so `cleanup` can test them
+# with plain `[ -n ... ]` under `set -u` no matter how early it fires.
+CHURUST_PID=""
+AXUM_PID=""
+WORKDIR=""
+
+# Kills exactly the two processes this run started, by PID, and removes the
+# scratch dir. Not `pkill -f target/release/bench-churust`: that pattern
+# matches *any* process on the machine with that string in its command line,
+# so two checkouts of this repo running at once — ordinary here, the project
+# uses worktrees — would have one run's exit trap kill the other run's
+# servers mid-measurement. `if`-guarded rather than `&&`-chained: this runs
+# from an EXIT trap, still under `set -e`, and a false `&&` chain here would
+# abort the rest of cleanup instead of just skipping one step.
+cleanup() {
+  if [ -n "$CHURUST_PID" ]; then
+    kill "$CHURUST_PID" >/dev/null 2>&1 || true
+  fi
+  if [ -n "$AXUM_PID" ]; then
+    kill "$AXUM_PID" >/dev/null 2>&1 || true
+  fi
+  if [ -n "$WORKDIR" ]; then
+    rm -rf "$WORKDIR"
+  fi
+}
+
+start() { # name dir port pidvar — records the real server PID into $pidvar
+  # `exec` inside the subshell replaces the subshell with the server binary,
+  # so the PID bash captures via `$!` right after backgrounding is the
+  # server's own PID, not a `cd`-wrapper shell that would leave the real
+  # process unreachable by PID. Written into `$pidvar` via `printf -v`
+  # (portable to bash 3.2, which this machine's `/bin/bash` is — no
+  # namerefs) immediately, before the health-check loop below, so a process
+  # that starts but never answers still gets recorded and reaped by
+  # `cleanup` even though `start` itself exits non-zero in that case.
+  (cd "$2" && PORT="$3" exec ./target/release/"$1") &
+  printf -v "$4" '%s' "$!"
   for _ in $(seq 50); do
     curl -fsS "http://127.0.0.1:$3/plaintext" >/dev/null 2>&1 && return 0
     sleep 0.1
@@ -43,17 +79,30 @@ start() { # name dir port
 # out anything more than `date` would let a real difference (a stray header,
 # a wrong content-length, a missing content-type) slip past unseen, so this
 # strips exactly one line and compares everything else byte-for-byte.
+#
+# Compared via files and `cmp -s`, not `a=$(...); b=$(...); [ "$a" != "$b" ]`:
+# command substitution strips *all* trailing newlines, so a body ending in
+# `\n` and the same body without one would compare equal. Neither app's body
+# ends in a newline today, but the gate's whole premise is that passing means
+# byte-identical, and a round-trip through `$(...)` can't back that up.
+#
+# `curl` runs without `-f` here on purpose: with `-f`, a non-2xx response
+# makes curl itself exit non-zero, which under `set -e` would kill the script
+# on curl's raw stderr before `check_equivalence` ever got to report
+# anything. Without `-f`, curl still exits 0 on an HTTP error response, still
+# captures its status line and body, and the mismatch it represents is
+# reported the same way any other divergence is — not treated as a crash.
 check_equivalence() {
   local failed=0
+  local afile="$WORKDIR/a" bfile="$WORKDIR/b"
   for route in "${ROUTES[@]}"; do
-    local a b
-    a=$(curl -fsS -D- "http://127.0.0.1:$CHURUST_PORT$route" \
-        | tr -d '\r' | grep -viE '^date:')
-    b=$(curl -fsS -D- "http://127.0.0.1:$AXUM_PORT$route" \
-        | tr -d '\r' | grep -viE '^date:')
-    if [ "$a" != "$b" ]; then
+    curl -sS -D- "http://127.0.0.1:$CHURUST_PORT$route" \
+        | tr -d '\r' | grep -viE '^date:' >"$afile"
+    curl -sS -D- "http://127.0.0.1:$AXUM_PORT$route" \
+        | tr -d '\r' | grep -viE '^date:' >"$bfile"
+    if ! cmp -s "$afile" "$bfile"; then
       echo "MISMATCH on $route" >&2
-      diff <(echo "$a") <(echo "$b") >&2 || true
+      diff "$afile" "$bfile" >&2 || true
       failed=1
     fi
   done
@@ -70,14 +119,16 @@ main() {
   (cd bench-churust && cargo build --release -q)
   (cd bench-axum && cargo build --release -q)
 
+  WORKDIR=$(mktemp -d)
+
   # Registered before the first server starts, not after both have: if
   # bench-axum fails its health check and start() exits, bench-churust (already
   # started) must still be reaped. A trap installed only after both starts
   # succeed would leak exactly that process on exactly that failure.
-  trap 'pkill -f "target/release/bench-churust" >/dev/null 2>&1 || true; pkill -f "target/release/bench-axum" >/dev/null 2>&1 || true' EXIT
+  trap cleanup EXIT
 
-  start bench-churust bench-churust "$CHURUST_PORT"
-  start bench-axum bench-axum "$AXUM_PORT"
+  start bench-churust bench-churust "$CHURUST_PORT" CHURUST_PID
+  start bench-axum bench-axum "$AXUM_PORT" AXUM_PID
 
   echo "checking the two apps agree..."
   if ! check_equivalence; then
