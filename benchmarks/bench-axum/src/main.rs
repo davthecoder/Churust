@@ -1,15 +1,30 @@
 //! The other half of the comparison. Same three routes, same bodies, same
 //! content types. `run.sh` refuses to measure if they diverge.
 
-use axum::{extract::Path, http::header, response::IntoResponse, routing::get, Router};
+use axum::{
+    extract::Path,
+    http::{header, HeaderValue},
+    response::IntoResponse,
+    routing::get,
+    Router,
+};
 
 async fn plaintext() -> &'static str {
     "Hello, World!"
 }
 
 async fn json() -> impl IntoResponse {
+    // `HeaderValue::from_static`, not the `&str` tuple form: `[(header::CONTENT_TYPE,
+    // "application/json")]` resolves through `V: TryInto<HeaderValue>`, which for
+    // `&str` goes via `HeaderValue::try_from` -> `Bytes::copy_from_slice` — a
+    // per-request heap copy for a compile-time constant. `from_static` is zero-copy,
+    // matching Churust's side (`Response::bytes`, which also uses
+    // `HeaderValue::from_static`).
     (
-        [(header::CONTENT_TYPE, "application/json")],
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        )],
         r#"{"message":"Hello, World!"}"#,
     )
 }

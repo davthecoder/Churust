@@ -30,16 +30,27 @@ async fn main() -> std::io::Result<()> {
         // doing so reintroduces the exact confound this comment describes.
         .without_security_headers()
         .routing(|r| {
-            r.get("/plaintext", |_c: Call| async { "Hello, World!" });
+            r.get("/plaintext", |_c: Call| async {
+                // `Response::bytes` rather than the `&'static str` `IntoResponse`
+                // impl (which goes through `Response::text`'s `impl Into<String>`
+                // and therefore `str::to_owned()` — a heap allocation and copy on
+                // every request for a compile-time literal). `bytes` takes the
+                // literal straight into a zero-copy `Bytes::from_static`, matching
+                // axum's own zero-copy `&'static str` path
+                // (`Cow::Borrowed` -> `Bytes::from_static`). Without this, the
+                // comparison would charge Churust a malloc + memcpy + free that
+                // axum never pays, for reasons that have nothing to do with either
+                // framework's dispatch path.
+                churust_core::Response::bytes("text/plain; charset=utf-8", "Hello, World!")
+            });
             r.get("/json", |_c: Call| async {
                 // Explicit rather than a `json` helper: churust-core has no
                 // JSON response constructor (that lives in churust-json, which
                 // this app deliberately does not pull in — the comparison is of
-                // core dispatch, not of a plugin).
-                churust_core::Response::text(r#"{"message":"Hello, World!"}"#).with_header(
-                    http::header::CONTENT_TYPE,
-                    http::HeaderValue::from_static("application/json"),
-                )
+                // core dispatch, not of a plugin). `bytes`, not `text` +
+                // `with_header`, for the same zero-copy reason as `/plaintext`
+                // above.
+                churust_core::Response::bytes("application/json", r#"{"message":"Hello, World!"}"#)
             });
             r.get("/user/{id}", |churust_core::Path(id): churust_core::Path<u64>| async move {
                 format!("user {id}")
