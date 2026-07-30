@@ -127,3 +127,7 @@ harness = false
 [[bench]]
 name = "headers"
 harness = false
+
+[[bench]]
+name = "extract"
+harness = false
