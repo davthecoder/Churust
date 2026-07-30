@@ -137,6 +137,30 @@ fn bind_tcp(addr: SocketAddr, backlog: u32) -> std::io::Result<tokio::net::TcpLi
     socket.listen(backlog)
 }
 
+/// Bind a Unix socket, with the backlog Churust was told to use.
+///
+/// Bound through a socket for the same reason `bind_tcp` is: neither std's nor
+/// tokio's `UnixListener::bind` lets the backlog be chosen, so this listener
+/// silently used the platform default — 128 on Linux — however `backlog` was
+/// set. tokio has a `TcpSocket` but no `UnixSocket`, hence `socket2` here and
+/// not there.
+///
+/// The caller is responsible for having established that any node already at
+/// `path` is stale; this only binds.
+#[cfg(unix)]
+fn bind_unix(path: &std::path::Path, backlog: u32) -> std::io::Result<tokio::net::UnixListener> {
+    let socket = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
+    socket.bind(&socket2::SockAddr::unix(path)?)?;
+    // Saturating rather than `as`: `backlog` is a `u32` an operator fills in, and
+    // wrapping a large one into a negative `c_int` would ask the kernel for a
+    // backlog of nonsense.
+    socket.listen(backlog.min(i32::MAX as u32) as i32)?;
+    // tokio requires a non-blocking listener; `from_std` documents this as the
+    // caller's job.
+    socket.set_nonblocking(true)?;
+    tokio::net::UnixListener::from_std(std::os::unix::net::UnixListener::from(socket))
+}
+
 /// Serve on an already-bound listener until `shutdown` resolves.
 async fn serve_listener<F>(
     app: App,
@@ -968,9 +992,31 @@ where
     // second. Probing with a connect distinguishes the two cases the way any
     // other server does it — a refused connection means nobody is listening,
     // and an accepted one means the path is genuinely in use.
+    // A Unix socket carries no TLS, and this listener never consulted the
+    // setting — so an application configured with `tls` served *plaintext* here
+    // while `apply_security_headers` kept asserting HSTS on every response,
+    // because that gate reads `config.tls.is_some()` rather than the transport.
+    // The result was a cleartext service telling its clients it was
+    // HTTPS-only.
+    //
+    // Refused rather than downgraded. The two settings contradict each other —
+    // "terminate TLS with this certificate" and "listen on a Unix socket" cannot
+    // both be honoured — and silently picking one is how the mismatch went
+    // unnoticed. An application fronted by a TLS-terminating proxy should not be
+    // configuring `tls` at all; one that is has said something it does not mean.
+    if app.config().tls.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "this app is configured for TLS, which a Unix socket cannot carry: \
+             serving it here would be cleartext while still advertising HSTS. \
+             Drop the `tls` configuration to serve over a Unix socket, or use \
+             `serve`/`start` to terminate TLS on a TCP listener.",
+        ));
+    }
+
     unlink_if_stale(path).await?;
 
-    let listener = tokio::net::UnixListener::bind(path)?;
+    let listener = bind_unix(path, app.config().backlog)?;
     // Remember which inode this bind produced. At shutdown the node at `path`
     // may no longer be ours, and removing whatever happens to be there then
     // would leave a live successor serving a path with no socket on it. See

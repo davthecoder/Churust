@@ -15,6 +15,12 @@ whole set.
 
 ### Fixed
 
+- **`backlog` applies to the Unix-socket listener.** It was honoured on every TCP
+  listener and silently dropped for `serve_unix`, which used the platform default
+  — 128 on Linux — however the knob was set. Neither std's nor tokio's
+  `UnixListener::bind` lets the backlog be chosen, so this binds through a socket
+  the way the TCP path already did.
+
 - **`Call::host` and `guard::host` work over HTTP/3.** HTTP/3 carries the target
   authority in `:authority`, which arrives in the URI, and sends no `Host` field
   beside it. Normalising the target to origin form dropped the authority, so
@@ -72,6 +78,18 @@ whole set.
   already said it would refuse. The TCP path made this check; h3 now does too.
 
 ### Changed
+
+- **`serve_unix` refuses an app configured for TLS.** A Unix socket carries no
+  TLS and that listener never consulted the setting, so such an app served
+  *cleartext* while `apply_security_headers` kept asserting HSTS on every
+  response — the gate reads `config.tls.is_some()`, not the transport. A
+  cleartext service was telling its clients it was HTTPS-only. The two settings
+  contradict each other, so this is now an `InvalidInput` error at startup rather
+  than a silent downgrade. **Breaking** for anyone who set both: drop the `tls`
+  configuration to serve over a Unix socket, or use `serve`/`start` to terminate
+  TLS on a TCP listener. An app behind a TLS-terminating proxy should not be
+  configuring `tls` at all.
+
 
 - **A host guard that never matched over HTTP/3 now matches.** This follows from
   the `Call::host` fix above and is worth stating separately: an application

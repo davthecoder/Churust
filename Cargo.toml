@@ -29,6 +29,12 @@ readme = "README.md"
 unsafe_code = "forbid"
 
 [workspace.dependencies]
+# Unix-socket bind, so `backlog` means the same thing on that listener as on a
+# TCP one. tokio exposes `TcpSocket` but has no `UnixSocket`, and neither std's
+# nor tokio's `UnixListener::bind` lets the backlog be chosen. Already in the
+# tree as a tokio dependency, so this is a direct use of a crate that was being
+# compiled either way.
+socket2 = "0.6"
 # Internal crates. `version` is what gets published; `path` is what builds
 # locally. cargo-release rewrites these in step with workspace.package.version.
 churust = { path = "churust", version = "0.3.2" }

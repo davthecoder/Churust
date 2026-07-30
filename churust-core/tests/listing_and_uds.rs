@@ -356,3 +356,91 @@ async fn binding_nothing_is_an_error_rather_than_a_silent_no_op() {
         .unwrap_err();
     assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_tls_configured_app_refuses_to_serve_over_a_unix_socket() {
+    // A Unix socket carries no TLS, and this listener never consulted the
+    // setting — so the app served plaintext while `apply_security_headers` kept
+    // asserting HSTS, because that gate reads `config.tls.is_some()` rather than
+    // the transport. A cleartext service telling clients it is HTTPS-only.
+    //
+    // Refused rather than downgraded: the two settings contradict each other and
+    // silently honouring one is how it went unnoticed.
+    let dir = std::env::temp_dir().join("churust-uds-tls-test");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("refused.sock");
+    let _ = std::fs::remove_file(&path);
+
+    let app = Churust::server()
+        .tls("/nonexistent/cert.pem", "/nonexistent/key.pem")
+        .routing(|r| {
+            r.get("/", |_c: Call| async { "ok" });
+        })
+        .build();
+
+    // Bounded, because the failure mode without the refusal is that `serve_unix`
+    // happily serves forever against a shutdown that never fires. An assertion
+    // that reports is worth more than a test run that hangs.
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        churust_core::engine::serve_unix(app, &path, std::future::pending::<()>()),
+    )
+    .await
+    .expect("serve_unix kept serving: a TLS-configured app was allowed onto a cleartext socket");
+    let err = outcome.expect_err("a TLS-configured app must not serve cleartext on a Unix socket");
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(
+        err.to_string().contains("HSTS"),
+        "the error should say why it matters, got: {err}"
+    );
+    assert!(
+        !path.exists(),
+        "the refusal must happen before anything is bound"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn a_unix_listener_still_serves_with_a_custom_backlog() {
+    // The backlog is now ours to choose on this listener too — tokio's
+    // `UnixListener::bind` used the platform default however `backlog` was set.
+    // The value itself is a kernel hint and not observable from here, so what
+    // this pins is that binding through a socket did not break serving.
+    let dir = std::env::temp_dir().join("churust-uds-backlog-test");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("backlog.sock");
+    let _ = std::fs::remove_file(&path);
+
+    let app = Churust::server()
+        .backlog(64)
+        .routing(|r| {
+            r.get("/", |_c: Call| async { "ok" });
+        })
+        .build();
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let p = path.clone();
+    let server = tokio::spawn(async move {
+        churust_core::engine::serve_unix(app, &p, async {
+            let _ = rx.await;
+        })
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut sock = tokio::net::UnixStream::connect(&path).await.expect("connect");
+    sock.write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        .await
+        .unwrap();
+    let mut got = String::new();
+    sock.read_to_string(&mut got).await.unwrap();
+    assert!(got.contains("200"), "{got}");
+    assert!(got.contains("ok"), "{got}");
+
+    let _ = tx.send(());
+    let _ = server.await;
+    let _ = std::fs::remove_file(&path);
+}
+
