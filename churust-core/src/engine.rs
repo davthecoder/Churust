@@ -412,15 +412,32 @@ pub(crate) struct ConnGuard(#[allow(dead_code)] std::sync::Arc<ConnGuardInner>);
 
 pub(crate) struct ConnGuardInner {
     _slot: ConnSlot,
-    _token: DrainToken,
+    token: DrainToken,
 }
 
 impl ConnGuard {
     fn new(slot: ConnSlot, token: DrainToken) -> Self {
         Self(std::sync::Arc::new(ConnGuardInner {
             _slot: slot,
-            _token: token,
+            token,
         }))
+    }
+
+    /// Resolves when the server has been asked to shut down.
+    ///
+    /// Holding a drain token makes the drain *wait* for this connection; it does
+    /// not tell the connection to wind down. For an HTTP connection the loop in
+    /// `serve_stream` watches the signal and does that. An upgraded WebSocket
+    /// leaves that loop the moment the `101` is dispatched — hyper resolves the
+    /// connection there and the socket lives on in a detached task — so the task
+    /// has to watch the signal itself, and until it could, every shutdown waited
+    /// out the full grace period for any live WebSocket and never returned at all
+    /// at `shutdown_timeout_ms = 0`.
+    pub(crate) async fn draining(&self) {
+        let mut signal = self.0.token.signal.clone();
+        // `wait_for` rather than `changed`, so a signal that fired before this
+        // was called is still seen — the same reason `serve_stream` uses it.
+        let _ = signal.wait_for(|fired| *fired).await;
     }
 }
 
