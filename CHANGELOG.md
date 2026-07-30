@@ -13,7 +13,94 @@ whole set.
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **`Call::host` and `guard::host` work over HTTP/3.** HTTP/3 carries the target
+  authority in `:authority`, which arrives in the URI, and sends no `Host` field
+  beside it. Normalising the target to origin form dropped the authority, so
+  `Call::host` answered `None` on that transport and every host guard stopped
+  matching. A host-scoped route was a silent `404`; with an unguarded sibling on
+  the same method and path — the ordinary virtual-host arrangement — the request
+  was served by the *fallback handler* with a `200`. The same request over
+  HTTP/1.1 or HTTP/2 matched correctly, and `advertise_http3` steers clients onto
+  the affected transport.
+
+- **`keep_alive_ms` bounds an idle HTTP/3 connection.** The QUIC listener used a
+  hardcoded 75s idle timeout regardless of the configured value. Both happen to
+  default to `75000`, so nothing failed until the knob was lowered — after which
+  TCP honoured it and QUIC did not. An idle QUIC connection holds a
+  `max_connections` permit for as long as it lives, which is why the timeout
+  exists.
+
+- **`keep_alive_ms = 0` closes an HTTP/2 connection.** `0` means "answer and
+  close". hyper implements that for HTTP/1 and has no HTTP/2 counterpart, and the
+  idle watchdog was switched off entirely at `0` — so an h2 connection got
+  neither, and was held for the life of the process. The strictest setting
+  available was therefore *weaker* than the default: a peer that opened
+  `max_connections` h2 connections, sent one request on each and then idled while
+  answering keep-alive pings exhausted the budget permanently.
+
+- **`max_tls_handshakes` and `tls_handshake_timeout_ms` bound QUIC handshakes.**
+  Both were enforced by the TCP accept loop and ignored by the HTTP/3 listener,
+  so enabling `http3` opted a deployment out of them. A QUIC handshake is a TLS
+  1.3 handshake and asymmetric in the same way — cheap to ask for, expensive to
+  answer — so `max_connections` alone was too loose a bound. As on TCP, the
+  deadline covers the wait for the handshake budget as well as the handshake
+  itself; timing only the work would make the budget a rate limiter while queued
+  peers held connection permits with no deadline at all.
+
+- **`h2_max_concurrent_streams` bounds HTTP/3 request streams.** The value never
+  reached quinn's `max_concurrent_bidi_streams`, so a connection got quinn's own
+  default of 100 however the knob was set. Every in-flight h3 request buffers its
+  body up to `max_body_bytes`, so this cap is what decides how much one peer can
+  make the process hold.
+
+- **`header_read_timeout_ms` — the documented slow-loris defence — reaches
+  HTTP/3.** It bounded HTTP/1, HTTP/2 and protocol negotiation, and no phase of
+  the h3 path. A peer could open streams up to `h2_max_concurrent_streams`,
+  dribble a partial HEADERS frame on each, and hold a task and a resolver per
+  stream indefinitely: the request timeout is armed only after the headers
+  arrive, the handshake deadline has already ended, and the QUIC idle timer is
+  reset by any keepalive packet. The bound is applied per stream, so a stalled
+  stream no longer costs its siblings anything and never closes the connection.
+
+- **An HTTP/3 request body the client declares too large is refused before any of
+  it is read.** The h3 reader refused at the chunk that crossed
+  `max_body_bytes`, which bounded what was held but still accepted everything up
+  to it — and a `Content-Length` with nothing behind it crossed nothing, so the
+  handler received an empty body and answered `200` for a request the server had
+  already said it would refuse. The TCP path made this check; h3 now does too.
+
+### Changed
+
+- **A host guard that never matched over HTTP/3 now matches.** This follows from
+  the `Call::host` fix above and is worth stating separately: an application
+  serving h3 whose host-scoped routes were silently falling through to an
+  unguarded sibling will start routing to the guarded handler, which is what it
+  asked for. Anything that had come to depend on the fallback behaviour changes.
+
+- **Loading a PEM chain and key, and merging `Vary`, each happen in one place.**
+  `load_certs`/`load_key` existed byte-for-byte in both the TLS and HTTP/3
+  modules; the `Vary` merge existed in `churust-cors` and `churust-compression`
+  as two implementations kept in step by a comment, where agreeing is a
+  correctness requirement — a response passes through both. No behaviour change.
+
+### Security
+
+- Several unbounded-resource paths are closed above: an HTTP/3 connection with no
+  idle bound, QUIC handshakes with no concurrency cap or deadline, h3 request
+  streams with no per-connection cap and no header deadline, and HTTP/2
+  connections held forever at `keep_alive_ms = 0`. Each let one peer retain a
+  `max_connections` permit — and in the h3 stream case a task and a parser state
+  per stream — until the process ended. Deployments that enable `http3` or set
+  `keep_alive_ms = 0` are the ones affected.
+
+- **`churust-auth`'s examples now compare credentials with
+  `churust_core::secure_compare`.** `Bearer` and `Basic` hand the credential to a
+  closure the application writes, so the comparison is the application's to get
+  right, and every example demonstrated `==` — which returns at the first
+  differing byte and leaks how much of a guess was correct. `Jwt` was never
+  affected: it verifies through `jsonwebtoken`, which compares in constant time.
 
 ## [0.3.2] - 2026-07-29
 
