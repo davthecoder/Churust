@@ -69,6 +69,13 @@ quinn = { workspace = true, optional = true }
 h3 = { workspace = true, optional = true }
 h3-quinn = { workspace = true, optional = true }
 
+# `cargo bench` otherwise also runs the lib's unit tests as a bench target, and
+# that target uses the default libtest harness, which rejects Criterion's own
+# flags — so `cargo bench -- --save-baseline x` failed before reaching a single
+# benchmark. The unit tests are tests; they are not benchmarks.
+[lib]
+bench = false
+
 [dev-dependencies]
 tokio-tungstenite = "0.26"
 # Self-signed certificates generated in-process, so the TLS serving path can be

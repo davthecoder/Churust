@@ -92,6 +92,25 @@ CI, so the example in your docs is a test whether you meant it to be or not.
 twenty lines" is not justification; "hand-rolling this would be a correctness
 risk" is.
 
+## Benchmarks
+
+Two separate things, because only one of them produces numbers you can trust on
+a shared machine.
+
+**Regressions** — `cargo bench -p churust-core`. Criterion, in-process, no
+socket. To compare a change against `main`:
+
+```sh
+git checkout main && cargo bench -p churust-core -- --save-baseline main
+git checkout - && cargo bench -p churust-core -- --baseline main
+```
+
+CI runs this on every PR against the merge base and comments the table. It fails
+only past 20%, because the runners swing 20–30% on their own.
+
+**Comparison against axum** — `benchmarks/run.sh`. Run by hand on an idle
+machine; see `benchmarks/README.md`.
+
 ## Before you open a PR
 
 Run the same gate CI runs. All of it:
