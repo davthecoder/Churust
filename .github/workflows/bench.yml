@@ -68,14 +68,14 @@ jobs:
           MERGE_BASE_SHA: ${{ steps.merge_base.outputs.sha }}
         run: |
           git checkout --detach "$MERGE_BASE_SHA"
-          cargo bench -p churust-core -- --save-baseline base --sample-size 20
+          cargo bench -p churust-core --locked -- --save-baseline base --sample-size 20
 
       - name: Bench the head
         env:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           git checkout --detach "$HEAD_SHA"
-          cargo bench -p churust-core -- --save-baseline pr --sample-size 20
+          cargo bench -p churust-core --locked -- --save-baseline pr --sample-size 20
 
       - name: Compare
         id: compare

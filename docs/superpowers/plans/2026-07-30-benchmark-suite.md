@@ -34,9 +34,9 @@
 |---|---|
 | `churust-core/Cargo.toml` | criterion dev-dep, four `[[bench]]` sections with `harness = false` |
 | `churust-core/benches/dispatch.rs` | `App::process` end to end: bare 200, with middleware, 404 (does not reach engine.rs's `Host` check) |
-| `churust-core/benches/routing.rs` | route-shape sensitivity: static, param, wildcard, deep, miss, backtracking |
-| `churust-core/benches/headers.rs` | `Vary` merge, cookie render/parse, `Error`→`Response` 1 vs 3 headers, security headers on/off |
-| `churust-core/benches/extract.rs` | `Path` / `Query` / `Form` decode |
+| `churust-core/benches/routing.rs` | route-shape sensitivity: static, param, wildcard, deep, miss |
+| `churust-core/benches/headers.rs` | `Vary` merge (empty/existing), `Error`→`Response` 1 vs 3 headers, security headers on/off |
+| `churust-core/benches/extract.rs` | `Path` / `Query` decode |
 | `.github/workflows/bench.yml` | bench base + head, `critcmp`, PR comment, fail past 20% |
 | `Cargo.toml` (root) | `[workspace] exclude = ["benchmarks"]` |
 | `benchmarks/bench-churust/` | minimal Churust app, three routes |

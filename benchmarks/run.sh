@@ -12,6 +12,7 @@ CHURUST_PORT=${CHURUST_PORT:-8111}
 AXUM_PORT=${AXUM_PORT:-8112}
 DURATION=${DURATION:-30s}
 CONNECTIONS=${CONNECTIONS:-64}
+WARMUP=${WARMUP:-3s}
 ROUTES=(/plaintext /json /user/42)
 
 require() { # name [install-hint]
@@ -20,12 +21,16 @@ require() { # name [install-hint]
     exit 1
   }
 }
-# curl is needed for both the health-check poll and the equivalence check, so
-# it is required up front. oha is only needed once we already trust the two
-# apps agree, and is required later in main(), right before it is used — a
-# missing oha must not stop this script from proving the equivalence gate
-# works.
+# curl is needed for both the health-check poll and the equivalence check, and
+# python3 formats every number in the final report — both are required up
+# front. oha is only needed once we already trust the two apps agree, and is
+# required later in main(), right before it is used — a missing oha must not
+# stop this script from proving the equivalence gate works. Requiring python3
+# here rather than letting it surface later means a missing interpreter is
+# reported before either app is even built, not after two release builds and
+# a full measurement run.
 require curl
+require python3
 
 # PIDs of the two servers, and the scratch dir for equivalence-check output.
 # Declared empty up front (rather than left unset) so `cleanup` can test them
@@ -92,6 +97,12 @@ start() { # name dir port pidvar — records the real server PID into $pidvar
 # anything. Without `-f`, curl still exits 0 on an HTTP error response, still
 # captures its status line and body, and the mismatch it represents is
 # reported the same way any other divergence is — not treated as a crash.
+#
+# Byte-identical is necessary but not sufficient: two empty files (a server
+# that never answered, `curl` unable to connect) also `cmp -s` equal, and so
+# do two 404s from a route that stopped being registered in both apps at
+# once. Neither is "equivalent" in any sense worth measuring, so each file's
+# first line must actually be a 200 before the byte comparison is trusted.
 check_equivalence() {
   local failed=0
   local afile="$WORKDIR/a" bfile="$WORKDIR/b"
@@ -100,6 +111,19 @@ check_equivalence() {
         | tr -d '\r' | grep -viE '^date:' >"$afile"
     curl -sS -D- "http://127.0.0.1:$AXUM_PORT$route" \
         | tr -d '\r' | grep -viE '^date:' >"$bfile"
+
+    local astatus bstatus
+    astatus=$(head -n1 "$afile")
+    bstatus=$(head -n1 "$bfile")
+    if [[ "$astatus" != "HTTP/1.1 200"* ]]; then
+      echo "NOT OK on $route: churust returned '${astatus:-<empty response>}', not 200" >&2
+      failed=1
+    fi
+    if [[ "$bstatus" != "HTTP/1.1 200"* ]]; then
+      echo "NOT OK on $route: axum returned '${bstatus:-<empty response>}', not 200" >&2
+      failed=1
+    fi
+
     if ! cmp -s "$afile" "$bfile"; then
       echo "MISMATCH on $route" >&2
       diff "$afile" "$bfile" >&2 || true
@@ -112,6 +136,18 @@ check_equivalence() {
 measure() { # route port
   oha --no-tui -c "$CONNECTIONS" -z "$DURATION" --json \
       "http://127.0.0.1:$2$1" 2>/dev/null
+}
+
+# Short, throwaway run against a route, discarded rather than reported. The
+# first `measure` call after a process starts pays for whatever is still
+# cold — allocator warm-up, lazy-initialised statics, the OS's own page-cache
+# and branch-predictor state — costs every later call in the same process
+# does not pay again. Without this, only the first row of the table would
+# carry that one-time cost, making it look slower relative to the other
+# routes for a reason that has nothing to do with the route itself.
+warm_up() { # route port
+  oha --no-tui -c "$CONNECTIONS" -z "$WARMUP" --json \
+      "http://127.0.0.1:$2$1" >/dev/null 2>&1
 }
 
 main() {
@@ -142,6 +178,12 @@ main() {
   # machine without oha installed. Only the measurement step needs it.
   require oha "install with: cargo install oha --locked"
 
+  echo "warming up..."
+  for route in "${ROUTES[@]}"; do
+    warm_up "$route" "$CHURUST_PORT"
+    warm_up "$route" "$AXUM_PORT"
+  done
+
   local stamp host out
   stamp=$(date -u +%Y-%m-%d)
   host=$(hostname | tr -d '\n')
@@ -165,8 +207,8 @@ main() {
     echo "|---|---|---|"
     for route in "${ROUTES[@]}"; do
       local c a
-      c=$(measure "$route" "$CHURUST_PORT" | python3 -c 'import json,sys; print(f"{json.load(sys.stdin)["summary"]["requestsPerSec"]:.0f}")')
-      a=$(measure "$route" "$AXUM_PORT" | python3 -c 'import json,sys; print(f"{json.load(sys.stdin)["summary"]["requestsPerSec"]:.0f}")')
+      c=$(measure "$route" "$CHURUST_PORT" | python3 -c 'import json,sys; print(round(json.load(sys.stdin)["summary"]["requestsPerSec"]))')
+      a=$(measure "$route" "$AXUM_PORT" | python3 -c 'import json,sys; print(round(json.load(sys.stdin)["summary"]["requestsPerSec"]))')
       echo "| \`${route}\` | ${c} | ${a} |"
     done
   } | tee "$out"

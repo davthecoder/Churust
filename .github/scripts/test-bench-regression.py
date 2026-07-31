@@ -18,6 +18,12 @@ import sys
 HERE = pathlib.Path(__file__).resolve().parent
 SCRIPT = HERE / "check-bench-regression.py"
 FIXTURES = HERE / "fixtures"
+# Must match the factor `.github/workflows/bench.yml`'s "Fail on a regression
+# past 20%" step actually passes to check-bench-regression.py. There is no
+# single source for this value -- it is duplicated here on purpose, so this
+# suite exercises the same threshold CI enforces. If bench.yml's threshold
+# ever changes without this one following, the fixtures below stop proving
+# anything about the live gate; keep the two in sync by hand.
 FACTOR = "1.20"
 
 # fixture name -> (expected exit code, what it proves)

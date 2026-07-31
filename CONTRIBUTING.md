@@ -101,8 +101,8 @@ a shared machine.
 socket. To compare a change against `main`:
 
 ```sh
-git checkout main && cargo bench -p churust-core -- --save-baseline main
-git checkout - && cargo bench -p churust-core -- --baseline main
+git checkout main && cargo bench -p churust-core --locked -- --save-baseline main
+git checkout - && cargo bench -p churust-core --locked -- --baseline main
 ```
 
 CI runs this on every PR against the merge base and comments the table. It fails

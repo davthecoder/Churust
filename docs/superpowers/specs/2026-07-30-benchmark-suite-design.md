@@ -1,7 +1,7 @@
 # Benchmark suite
 
 **Date:** 2026-07-30
-**Status:** approved, not yet implemented
+**Status:** implemented
 
 ## Why
 
@@ -53,14 +53,14 @@ One file per concern rather than one per module, so each stays small enough to
 read in full when a number moves.
 
 - **`routing.rs`** — route-shape sensitivity: static hit, single param,
-  wildcard, deep path, miss, and a backtracking case. Measured through
+  wildcard, deep path, and miss. Measured through
   `App::process` rather than against `Router` directly, because `RouteBuilder`'s
   constructor is `pub(crate)` and a benchmark is an external crate — it cannot
   populate a bare `Router`. Every number therefore carries the same constant
   dispatch overhead, so these show relative movement between route shapes, not
   routing's absolute cost. The app is built once outside the measured closure.
 - **`dispatch.rs`** — `App::process` end to end: a bare `200`, the same with
-  three middleware installed, one driving extractors, and a `404`. This is the
+  three middleware installed, and a `404`. This is the
   same entry point `TestClient` uses, so it exercises the real pipeline without a
   socket.
 
@@ -69,12 +69,13 @@ read in full when a number moves.
   reached. `App::process` is downstream of it, so no in-process benchmark can
   measure that check. It would need a bench that drives a real socket, which the
   comparison half does and this half deliberately does not.
-- **`headers.rs`** — `Vary` merge, cookie render and parse, and
-  `Error → Response` carrying one header versus three; the last is the 0.3.3
-  change from `insert` to first-replaces-then-appends. Security headers are
-  measured as `App::process` with them on versus `without_security_headers()`,
-  since `SecurityHeaders::apply_to` is `pub(crate)`.
-- **`extract.rs`** — `Path`, `Query` and `Json` decode, since an extractor runs
+- **`headers.rs`** — `Vary` merge (empty versus an existing list of three
+  fields), and `Error → Response` carrying one header versus three; the last is
+  the 0.3.3 change from `insert` to first-replaces-then-appends. Security
+  headers are measured as `App::process` with them on versus
+  `without_security_headers()`, since `SecurityHeaders::apply_to` is
+  `pub(crate)`.
+- **`extract.rs`** — `Path` and `Query` decode, since an extractor runs
   per request per handler argument.
 
 ### What a benchmark can reach
