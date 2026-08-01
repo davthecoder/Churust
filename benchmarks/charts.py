@@ -164,11 +164,11 @@ def fmt(n: float) -> str:
 # -----------------------------------------------------------------------------
 
 THROUGHPUT = [
-    ("Churust", 691_046, True),
-    ("actix-web", 653_543, False),
-    ("axum", 394_652, False),
-    ("Ktor (Netty)", 303_490, False),
-    ("Go net/http", 288_846, False),
+    ("Churust", 699_200, True),
+    ("actix-web", 675_053, False),
+    ("axum", 457_647, False),
+    ("Ktor (Netty)", 307_924, False),
+    ("Go net/http", 306_546, False),
 ]
 
 
@@ -184,7 +184,7 @@ def chart_throughput() -> str:
             w,
             h,
             "Requests per second by framework, ordinary keep-alive HTTP/1.1",
-            "Churust 691k, actix-web 654k, axum 395k, Ktor 303k, Go net/http 289k "
+            "Churust 699k, actix-web 675k, axum 458k, Ktor 308k, Go net/http 307k "
             "requests per second. Higher is better.",
             "tp",
         ),
@@ -244,11 +244,11 @@ def chart_throughput() -> str:
 # -----------------------------------------------------------------------------
 
 PIPELINED = [
-    ("actix-web", 5_669_946, False),
-    ("Churust", 3_996_416, True),
-    ("Ktor (Netty)", 1_137_799, False),
-    ("Go net/http", 377_301, False),
-    ("axum", 24_542, False),
+    ("actix-web", 5_803_188, False),
+    ("Churust", 4_156_521, True),
+    ("Ktor (Netty)", 1_189_703, False),
+    ("Go net/http", 376_534, False),
+    ("axum", 24_667, False),
 ]
 
 
@@ -264,7 +264,7 @@ def chart_pipelined() -> str:
             w,
             h,
             "Requests per second with HTTP/1.1 pipelining at depth 16",
-            "actix-web 5.67M, Churust 4.00M, Ktor 1.14M, Go net/http 377k, axum 25k "
+            "actix-web 5.80M, Churust 4.16M, Ktor 1.19M, Go net/http 377k, axum 25k "
             "requests per second. actix-web leads this mode.",
             "pl",
         ),
@@ -326,11 +326,11 @@ def chart_pipelined() -> str:
 
 # Milliseconds at the 99th percentile, keep-alive.
 P99 = [
-    ("actix-web", 0.553, False),
-    ("Ktor (Netty)", 2.56, False),
-    ("Churust", 3.13, True),
-    ("Go net/http", 5.69, False),
-    ("axum", 9.14, False),
+    ("axum", 0.342, False),
+    ("actix-web", 0.412, False),
+    ("Churust", 1.12, True),
+    ("Ktor (Netty)", 1.95, False),
+    ("Go net/http", 2.55, False),
 ]
 
 
@@ -346,8 +346,8 @@ def chart_p99() -> str:
             w,
             h,
             "Tail latency at the 99th percentile, keep-alive",
-            "actix-web 0.55ms, Ktor 2.56ms, Churust 3.13ms, Go net/http 5.69ms, axum 9.14ms. "
-            "Lower is better; actix-web is best and Churust is third.",
+            "axum 0.34ms, actix-web 0.41ms, Churust 1.12ms, Ktor 1.95ms, Go net/http 2.55ms. "
+            "Lower is better; axum is best and Churust is third.",
             "p99",
         ),
         titles(
@@ -356,7 +356,7 @@ def chart_p99() -> str:
         ),
     ]
 
-    for gv in (2, 4, 6, 8):
+    for gv in (0.5, 1.0, 1.5, 2.0, 2.5):
         gx = x0 + (x1 - x0) * gv / peak
         out.append(
             f'<line class="grid" x1="{gx:.1f}" y1="{top - 8}" x2="{gx:.1f}" '
@@ -364,7 +364,7 @@ def chart_p99() -> str:
         )
         out.append(
             f'<text class="mut" x="{gx:.1f}" y="{top - 14}" font-size="10.5" '
-            f'text-anchor="middle">{gv}ms</text>'
+            f'text-anchor="middle">{gv:g}ms</text>'
         )
 
     y = top
@@ -399,7 +399,7 @@ def chart_p99() -> str:
         footnote(
             w,
             h - 20,
-            "worker instead of being picked up by an idle one. The shared-runtime default is 379us.",
+            "worker instead of being picked up by an idle one. The shared-runtime default is 444us.",
         )
     )
     out.append("</svg>")
@@ -411,10 +411,10 @@ def chart_p99() -> str:
 # -----------------------------------------------------------------------------
 
 CPU = [
-    ("actix-web", 7.27, False),
-    ("Churust", 8.49, True),
-    ("axum", 11.74, False),
-    ("Go net/http", 13.64, False),
+    ("actix-web", 7.34, False),
+    ("Churust", 8.59, True),
+    ("axum", 8.74, False),
+    ("Go net/http", 13.19, False),
     ("Ktor (Netty)", 19.79, False),
 ]
 
@@ -431,7 +431,7 @@ def chart_cpu() -> str:
             w,
             h,
             "Server CPU microseconds per request by framework",
-            "actix-web 7.27, Churust 8.49, axum 11.74, Go net/http 13.64, Ktor 19.79 "
+            "actix-web 7.34, Churust 8.59, axum 8.74, Go net/http 13.19, Ktor 19.79 "
             "microseconds of CPU per request. Lower is better; actix-web is best.",
             "cpu",
         ),
@@ -494,21 +494,21 @@ def chart_before_after() -> str:
     w, h = 900, 392
     x0, x1 = 168, 700
     row, gap, top = 28, 22, 96
-    data = [("Before", 393_165, False), ("After", 691_046, True)]
-    peak = 691_046
+    data = [("Before", 390_772, False), ("After", 699_200, True)]
+    peak = 699_200
 
     out = [
         header(
             w,
             h,
             "Churust throughput before and after this work",
-            "Churust went from 393 thousand to 691 thousand requests per second on "
-            "keep-alive load, a 1.76 times change, while its 99th-percentile latency "
-            "went from 379 microseconds to 3.13 milliseconds.",
+            "Churust went from 391 thousand to 699 thousand requests per second on "
+            "keep-alive load, a 1.79 times change, while its 99th-percentile latency "
+            "went from 444 microseconds to 1.12 milliseconds.",
             "ba",
         ),
         titles(
-            "Churust, before and after this work — 1.76× on keep-alive",
+            "Churust, before and after this work — 1.79× on keep-alive",
             "Same kernel, same harness, same pinned cores · only the binary differs",
         ),
     ]
@@ -534,7 +534,7 @@ def chart_before_after() -> str:
         "Dropping the per-request extension-map allocation, and several others",
         "TCP_NODELAY on by default",
         "",
-        "Bought with tail latency: p99 379us before, 3.13ms after — the affinity",
+        "Bought with tail latency: p99 444us before, 1.12ms after — the affinity",
         "trade, and why run_sharded is opt-in rather than the default.",
     ]
     ny = y + 18

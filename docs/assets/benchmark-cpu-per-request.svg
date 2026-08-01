@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 364" width="900" height="364" role="img" aria-labelledby="cpu-t cpu-d">
 <title id="cpu-t">Server CPU microseconds per request by framework</title>
-<desc id="cpu-d">actix-web 7.27, Churust 8.49, axum 11.74, Go net/http 13.64, Ktor 19.79 microseconds of CPU per request. Lower is better; actix-web is best.</desc>
+<desc id="cpu-d">actix-web 7.34, Churust 8.59, axum 8.74, Go net/http 13.19, Ktor 19.79 microseconds of CPU per request. Lower is better; actix-web is best.</desc>
 <style>
 text{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;}
 .s{fill:#fcfcfb}.ink{fill:#0b0b0b}.ink2{fill:#52514e}.mut{fill:#898781}.acc{fill:#2a78d6}.peer{fill:#898781}.s2{fill:#eb6834}.grid{stroke:#e1e0d9}.axis{stroke:#c3c2b7}.acc-s{stroke:#2a78d6}.s2-s{stroke:#eb6834}.ring{stroke:#fcfcfb}
@@ -17,17 +17,17 @@ text{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;}
 <line class="grid" x1="705.6" y1="84" x2="705.6" y2="296" stroke-width="1"/>
 <text class="mut" x="705.6" y="78" font-size="10.5" text-anchor="middle">20</text>
 <text class="ink2" x="154" y="108.5" font-size="13" font-weight="400" text-anchor="end">actix-web</text>
-<path class="peer" d="M168,92 H359.434057604851 A4,4 0 0 1 363.434057604851,96 V112 A4,4 0 0 1 359.434057604851,116 H168 Z"/>
-<text class="ink2" x="373.4" y="108.5" font-size="13" font-weight="400">7.27 µs</text>
+<path class="peer" d="M168,92 H361.3158160687216 A4,4 0 0 1 365.3158160687216,96 V112 A4,4 0 0 1 361.3158160687216,116 H168 Z"/>
+<text class="ink2" x="375.3" y="108.5" font-size="13" font-weight="400">7.34 µs</text>
 <text class="ink" x="154" y="152.5" font-size="13" font-weight="600" text-anchor="end">Churust</text>
-<path class="acc" d="M168,136 H392.2304194037393 A4,4 0 0 1 396.2304194037393,140 V156 A4,4 0 0 1 392.2304194037393,160 H168 Z"/>
-<text class="ink" x="406.2" y="152.5" font-size="13" font-weight="600">8.49 µs</text>
+<path class="acc" d="M168,136 H394.9186457806974 A4,4 0 0 1 398.9186457806974,140 V156 A4,4 0 0 1 394.9186457806974,160 H168 Z"/>
+<text class="ink" x="408.9" y="152.5" font-size="13" font-weight="600">8.59 µs</text>
 <text class="ink2" x="154" y="196.5" font-size="13" font-weight="400" text-anchor="end">axum</text>
-<path class="peer" d="M168,180 H479.5977766548762 A4,4 0 0 1 483.5977766548762,184 V200 A4,4 0 0 1 479.5977766548762,204 H168 Z"/>
-<text class="ink2" x="493.6" y="196.5" font-size="13" font-weight="400">11.74 µs</text>
+<path class="peer" d="M168,180 H398.9509853461344 A4,4 0 0 1 402.9509853461344,184 V200 A4,4 0 0 1 398.9509853461344,204 H168 Z"/>
+<text class="ink2" x="413.0" y="196.5" font-size="13" font-weight="400">8.74 µs</text>
 <text class="ink2" x="154" y="240.5" font-size="13" font-weight="400" text-anchor="end">Go net/http</text>
-<path class="peer" d="M168,224 H530.6740778170794 A4,4 0 0 1 534.6740778170794,228 V244 A4,4 0 0 1 530.6740778170794,248 H168 Z"/>
-<text class="ink2" x="544.7" y="240.5" font-size="13" font-weight="400">13.64 µs</text>
+<path class="peer" d="M168,224 H518.5770591207681 A4,4 0 0 1 522.5770591207681,228 V244 A4,4 0 0 1 518.5770591207681,248 H168 Z"/>
+<text class="ink2" x="532.6" y="240.5" font-size="13" font-weight="400">13.19 µs</text>
 <text class="ink2" x="154" y="284.5" font-size="13" font-weight="400" text-anchor="end">Ktor (Netty)</text>
 <path class="peer" d="M168,268 H696.0 A4,4 0 0 1 700.0,272 V288 A4,4 0 0 1 696.0,292 H168 Z"/>
 <text class="ink2" x="710.0" y="284.5" font-size="13" font-weight="400">19.79 µs</text>

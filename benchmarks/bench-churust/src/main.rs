@@ -78,5 +78,18 @@ fn main() -> std::io::Result<()> {
         })
         .build();
 
+    // `SHARDED=0` serves on the default shared work-stealing runtime instead, so
+    // one binary can be measured both ways. Throughput and tail latency both
+    // move between them; see benchmarks/results/.
+    if std::env::var("SHARDED").as_deref() == Ok("0") {
+        return tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+            .block_on(app.start());
+    }
+
+    // No `#[tokio::main]`: `run_sharded` builds and owns its own runtimes, and a
+    // multi-threaded runtime wrapped around it would sit idle underneath the
+    // single-threaded ones doing the work.
     app.run_sharded(workers)
 }

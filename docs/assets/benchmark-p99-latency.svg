@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 378" width="900" height="378" role="img" aria-labelledby="p99-t p99-d">
 <title id="p99-t">Tail latency at the 99th percentile, keep-alive</title>
-<desc id="p99-d">actix-web 0.55ms, Ktor 2.56ms, Churust 3.13ms, Go net/http 5.69ms, axum 9.14ms. Lower is better; actix-web is best and Churust is third.</desc>
+<desc id="p99-d">axum 0.34ms, actix-web 0.41ms, Churust 1.12ms, Ktor 1.95ms, Go net/http 2.55ms. Lower is better; axum is best and Churust is third.</desc>
 <style>
 text{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;}
 .s{fill:#fcfcfb}.ink{fill:#0b0b0b}.ink2{fill:#52514e}.mut{fill:#898781}.acc{fill:#2a78d6}.peer{fill:#898781}.s2{fill:#eb6834}.grid{stroke:#e1e0d9}.axis{stroke:#c3c2b7}.acc-s{stroke:#2a78d6}.s2-s{stroke:#eb6834}.ring{stroke:#fcfcfb}
@@ -8,30 +8,32 @@ text{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;}
 </style>
 <rect class="s" width="900" height="378" rx="10"/>
 <text class="ink" x="28" y="34" font-size="17" font-weight="600">Tail latency — Churust's weakest result</text><text class="mut" x="28" y="55" font-size="12.5">99th-percentile response time under keep-alive load · lower is better</text>
-<line class="grid" x1="284.4" y1="84" x2="284.4" y2="296" stroke-width="1"/>
-<text class="mut" x="284.4" y="78" font-size="10.5" text-anchor="middle">2ms</text>
-<line class="grid" x1="400.8" y1="84" x2="400.8" y2="296" stroke-width="1"/>
-<text class="mut" x="400.8" y="78" font-size="10.5" text-anchor="middle">4ms</text>
-<line class="grid" x1="517.2" y1="84" x2="517.2" y2="296" stroke-width="1"/>
-<text class="mut" x="517.2" y="78" font-size="10.5" text-anchor="middle">6ms</text>
-<line class="grid" x1="633.6" y1="84" x2="633.6" y2="296" stroke-width="1"/>
-<text class="mut" x="633.6" y="78" font-size="10.5" text-anchor="middle">8ms</text>
-<text class="ink2" x="154" y="108.5" font-size="13" font-weight="400" text-anchor="end">actix-web</text>
-<path class="peer" d="M168,92 H196.18774617067834 A4,4 0 0 1 200.18774617067834,96 V112 A4,4 0 0 1 196.18774617067834,116 H168 Z"/>
-<text class="ink2" x="210.2" y="108.5" font-size="13" font-weight="400">0.553 ms</text>
-<text class="ink2" x="154" y="152.5" font-size="13" font-weight="400" text-anchor="end">Ktor (Netty)</text>
-<path class="peer" d="M168,136 H313.00656455142234 A4,4 0 0 1 317.00656455142234,140 V156 A4,4 0 0 1 313.00656455142234,160 H168 Z"/>
-<text class="ink2" x="327.0" y="152.5" font-size="13" font-weight="400">2.56 ms</text>
+<line class="grid" x1="272.3" y1="84" x2="272.3" y2="296" stroke-width="1"/>
+<text class="mut" x="272.3" y="78" font-size="10.5" text-anchor="middle">0.5ms</text>
+<line class="grid" x1="376.6" y1="84" x2="376.6" y2="296" stroke-width="1"/>
+<text class="mut" x="376.6" y="78" font-size="10.5" text-anchor="middle">1ms</text>
+<line class="grid" x1="480.9" y1="84" x2="480.9" y2="296" stroke-width="1"/>
+<text class="mut" x="480.9" y="78" font-size="10.5" text-anchor="middle">1.5ms</text>
+<line class="grid" x1="585.3" y1="84" x2="585.3" y2="296" stroke-width="1"/>
+<text class="mut" x="585.3" y="78" font-size="10.5" text-anchor="middle">2ms</text>
+<line class="grid" x1="689.6" y1="84" x2="689.6" y2="296" stroke-width="1"/>
+<text class="mut" x="689.6" y="78" font-size="10.5" text-anchor="middle">2.5ms</text>
+<text class="ink2" x="154" y="108.5" font-size="13" font-weight="400" text-anchor="end">axum</text>
+<path class="peer" d="M168,92 H235.35058823529414 A4,4 0 0 1 239.35058823529414,96 V112 A4,4 0 0 1 235.35058823529414,116 H168 Z"/>
+<text class="ink2" x="249.4" y="108.5" font-size="13" font-weight="400">0.342 ms</text>
+<text class="ink2" x="154" y="152.5" font-size="13" font-weight="400" text-anchor="end">actix-web</text>
+<path class="peer" d="M168,136 H249.95450980392155 A4,4 0 0 1 253.95450980392155,140 V156 A4,4 0 0 1 249.95450980392155,160 H168 Z"/>
+<text class="ink2" x="264.0" y="152.5" font-size="13" font-weight="400">0.412 ms</text>
 <text class="ink" x="154" y="196.5" font-size="13" font-weight="600" text-anchor="end">Churust</text>
-<path class="acc" d="M168,180 H346.18380743982493 A4,4 0 0 1 350.18380743982493,184 V200 A4,4 0 0 1 346.18380743982493,204 H168 Z"/>
-<text class="ink" x="360.2" y="196.5" font-size="13" font-weight="600">3.13 ms</text>
-<text class="ink2" x="154" y="240.5" font-size="13" font-weight="400" text-anchor="end">Go net/http</text>
-<path class="peer" d="M168,224 H495.1903719912473 A4,4 0 0 1 499.1903719912473,228 V244 A4,4 0 0 1 495.1903719912473,248 H168 Z"/>
-<text class="ink2" x="509.2" y="240.5" font-size="13" font-weight="400">5.69 ms</text>
-<text class="ink2" x="154" y="284.5" font-size="13" font-weight="400" text-anchor="end">axum</text>
+<path class="acc" d="M168,180 H397.66274509803924 A4,4 0 0 1 401.66274509803924,184 V200 A4,4 0 0 1 397.66274509803924,204 H168 Z"/>
+<text class="ink" x="411.7" y="196.5" font-size="13" font-weight="600">1.12 ms</text>
+<text class="ink2" x="154" y="240.5" font-size="13" font-weight="400" text-anchor="end">Ktor (Netty)</text>
+<path class="peer" d="M168,224 H570.8235294117646 A4,4 0 0 1 574.8235294117646,228 V244 A4,4 0 0 1 570.8235294117646,248 H168 Z"/>
+<text class="ink2" x="584.8" y="240.5" font-size="13" font-weight="400">1.95 ms</text>
+<text class="ink2" x="154" y="284.5" font-size="13" font-weight="400" text-anchor="end">Go net/http</text>
 <path class="peer" d="M168,268 H696.0 A4,4 0 0 1 700.0,272 V288 A4,4 0 0 1 696.0,292 H168 Z"/>
-<text class="ink2" x="710.0" y="284.5" font-size="13" font-weight="400">9.14 ms</text>
+<text class="ink2" x="710.0" y="284.5" font-size="13" font-weight="400">2.55 ms</text>
 <line class="axis" x1="168" y1="84" x2="168" y2="296" stroke-width="1"/>
 <text class="mut" x="28" y="342" font-size="11">The cost of run_sharded: pinning a connection to one runtime means it waits for that</text>
-<text class="mut" x="28" y="358" font-size="11">worker instead of being picked up by an idle one. The shared-runtime default is 379us.</text>
+<text class="mut" x="28" y="358" font-size="11">worker instead of being picked up by an idle one. The shared-runtime default is 444us.</text>
 </svg>

@@ -293,6 +293,32 @@ echo
 python3 - "$ROUNDS" "$RESULTS" <<'PY'
 import sys, statistics, collections
 
+
+def to_ms(v):
+    """wrk prints latency with a unit attached — 405.00us, 1.16ms, 2.25s.
+
+    Parsed to a number before anything compares or sorts it. Sorting the raw
+    strings is wrong in a way that looks right: "1.16ms" sorts before
+    "405.00us", so the median of a set spanning two units came out as whichever
+    value happened to land in the middle alphabetically. Every p99 this harness
+    reported before this function existed was wrong.
+    """
+    v = v.strip()
+    for suffix, scale in (("us", 0.001), ("ms", 1.0), ("s", 1000.0)):
+        if v.endswith(suffix):
+            try:
+                return float(v[: -len(suffix)]) * scale
+            except ValueError:
+                return float("nan")
+    return float("nan")
+
+
+def fmt_ms(v):
+    if v != v:
+        return "n/a"
+    return f"{v * 1000:.0f} us" if v < 1 else f"{v:.2f} ms"
+
+
 rounds = sys.argv[1]
 rows = collections.defaultdict(list)
 for line in sys.argv[2].splitlines():
@@ -300,7 +326,7 @@ for line in sys.argv[2].splitlines():
     if not line:
         continue
     app, mode, rps, cpu, flag, p99 = line.split("|")
-    rows[(mode, app)].append((float(rps), float(cpu), flag, p99))
+    rows[(mode, app)].append((float(rps), float(cpu), flag, to_ms(p99)))
 
 for mode, title in (
     ("keepalive", "Keep-alive, no pipelining — the realistic shape"),
@@ -317,7 +343,7 @@ for mode, title in (
              min(r for r, _, _, _ in v),
              max(r for r, _, _, _ in v),
              sum(1 for _, _, f, _ in v if f != "clean"),
-             sorted(p for _, _, _, p in v)[len(v) // 2])
+             statistics.median(p for _, _, _, p in v))
             for a, v in entries
         ),
         key=lambda t: -t[1],
@@ -331,7 +357,7 @@ for mode, title in (
         # entirely; say so beside the number rather than leaving a reader to
         # notice it in the range.
         note = " ⚠" if hi > lo * 3 else ""
-        print(f"| {app} | {rps:,.0f} | {rps / best:.2f}x | {cpu:.2f} | {p99} | {lo:,.0f}–{hi:,.0f}{note} | {bad} |")
+        print(f"| {app} | {rps:,.0f} | {rps / best:.2f}x | {cpu:.2f} | {fmt_ms(p99)} | {lo:,.0f}–{hi:,.0f}{note} | {bad} |")
     if any(hi > lo * 3 for _, _, _, lo, hi, _, _ in ranked):
         print("\n⚠ = at least one round differed from the others by more than 3x. "
               "Treat that row's median as provisional and re-run.")

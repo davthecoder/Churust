@@ -191,28 +191,30 @@ refuses to measure at all unless every app returns the same bytes.
 
 | framework | req/s | vs. Churust | server CPU µs/req | p99 latency |
 |---|---:|---:|---:|---:|
-| **Churust** | **691,046** | — | 8.49 | 3.13 ms |
-| actix-web 4.14 | 653,543 | 0.95× | **7.27** | **553 µs** |
-| axum 0.8 | 394,652 | 0.57× | 11.74 | 9.14 ms |
-| Ktor 3.5 (Netty) | 303,490 | 0.44× | 19.79 | 2.56 ms |
-| Go 1.26 `net/http` | 288,846 | 0.42× | 13.64 | 5.69 ms |
+| **Churust** | **699,200** | — | 8.59 | 1.12 ms |
+| actix-web 4.14 | 675,053 | 0.97× | **7.34** | 412 µs |
+| axum 0.8 | 457,647 | 0.65× | 8.74 | **342 µs** |
+| Ktor 3.5 (Netty) | 307,924 | 0.44× | 19.79 | 1.95 ms |
+| Go 1.26 `net/http` | 306,546 | 0.44× | 13.19 | 2.55 ms |
 
-**Churust is first on throughput** for this shape of load — 1.06× actix-web,
-1.75× axum, 2.28× Ktor, 2.39× Go — and **third on tail latency**, which for most
+**Churust is first on throughput** for this shape of load — 1.04× actix-web,
+1.53× axum, 2.27× Ktor, 2.28× Go — and **third on tail latency**, which for most
 services is the number that matters more. Four things a reader deserves before
 quoting any of it:
 
-- **actix-web answers its slowest one-in-a-hundred request in 553 µs where
-  Churust takes 3.13 ms**, and it does so on 17% less CPU per request. If the
-  99th percentile is a user-visible number for you, that row is the one to read.
+- **axum and actix-web answer their slowest one-in-a-hundred request in 342 µs
+  and 412 µs where Churust takes 1.12 ms**, and actix-web does it on 15% less CPU
+  per request. If the 99th percentile is a user-visible number for you, that
+  column is the one to read.
 - **The tail is the price of `App::run_sharded`,** not an accident. Pinning a
-  connection to one runtime for its life is worth 1.76× the throughput and costs
-  8.3× the p99 — measured, [both rows](benchmarks/results/2026-08-01-linux-docker.md).
+  connection to one runtime for its life is worth 1.79× the throughput and costs
+  2.5× the p99 — measured, [both rows](benchmarks/results/2026-08-01-linux-docker.md).
   That is exactly why it is opt-in and the shared work-stealing runtime is still
   the default.
-- **With HTTP/1.1 pipelining the order changes:** actix-web 5.67M against
-  Churust's 4.00M. Pipelining is not what most traffic looks like, which is why
-  it is not the headline, but it is published rather than omitted.
+- **With HTTP/1.1 pipelining the order changes:** actix-web 5.80M against
+  Churust's 4.16M. That gap is not in Churust's own code — its whole dispatch
+  layer costs 398 ns of the 1.76 µs a pipelined request spends — it is in the
+  HTTP/1 implementation underneath, and closing it would mean not using hyper.
 - **Every route returns a constant.** This is dispatch overhead. It says nothing
   about an application that talks to a database.
 
