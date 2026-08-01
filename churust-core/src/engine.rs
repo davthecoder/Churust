@@ -24,6 +24,30 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
 
+/// Refuse to serve a TLS-configured application that was built without the
+/// `tls` feature.
+///
+/// Before this check, that combination started successfully and served
+/// plaintext on the port the operator had configured a certificate for. Nothing
+/// said so: the build succeeded, the server came up, and requests were answered
+/// — in clear text, on a port every client and every runbook treated as HTTPS.
+///
+/// An error at startup is the only safe answer. A warning would be missed in
+/// exactly the deployments that most need it, and serving unencrypted traffic
+/// the configuration says is encrypted is worse than not serving at all.
+fn refuse_tls_without_the_feature(app: &App) -> std::io::Result<()> {
+    if cfg!(not(feature = "tls")) && app.config().tls.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "TLS is configured but this binary was built without the `tls` feature, \
+             so the listener would serve plaintext on a port configured for HTTPS. \
+             Enable the feature (`churust = { version = \"0.3\", features = [\"tls\"] }`) \
+             or remove the TLS configuration.",
+        ));
+    }
+    Ok(())
+}
+
 /// Serve `app` on `addr` until `shutdown` resolves (graceful drain).
 ///
 /// Uses HTTP/1.1 (`hyper::server::conn::http1::Builder`).  The plan
@@ -55,6 +79,7 @@ pub async fn serve<F>(app: App, addr: SocketAddr, shutdown: F) -> std::io::Resul
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    refuse_tls_without_the_feature(&app)?;
     let listener = bind_tcp(addr, app.config().backlog)?;
     let limits = std::sync::Arc::new(AcceptLimits::from(app.config()));
     serve_listener(app, listener, limits, shutdown).await
@@ -91,6 +116,7 @@ pub async fn serve_on<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    refuse_tls_without_the_feature(&app)?;
     let limits = std::sync::Arc::new(AcceptLimits::from(app.config()));
     serve_listener(app, listener, limits, shutdown).await
 }
@@ -1007,6 +1033,7 @@ where
             "no addresses to bind",
         ));
     }
+    refuse_tls_without_the_feature(&app)?;
     let workers = workers.max(1);
 
     // Bound before a single worker starts, for the reason `serve_many`
@@ -1021,6 +1048,22 @@ where
     let conn_cfg = ConnSettings::from(app.config());
     let nodelay = app.config().tcp_nodelay;
     let shutdown_timeout_ms = app.config().shutdown_timeout_ms;
+
+    // Built once, before any worker starts, for the same reason the listeners
+    // are: a certificate that cannot be loaded must stop the server rather than
+    // be discovered per connection. Cloning a `TlsAcceptor` is an `Arc` clone,
+    // so each worker holding one costs nothing.
+    #[cfg(feature = "tls")]
+    let tls_acceptor = match &app.config().tls {
+        Some(t) => Some(acceptor_from_pem(&t.cert, &t.key)?),
+        None => None,
+    };
+
+    // Shared with the workers, not just the acceptor: the handshake happens on
+    // the worker in this engine, so the budget that bounds handshakes has to
+    // reach it. A `Semaphore` is runtime-agnostic, so one shared across several
+    // single-threaded runtimes bounds exactly what it says it does.
+    let limits = std::sync::Arc::new(AcceptLimits::from(app.config()));
 
     // One handoff queue per worker. Unbounded because the thing that bounds
     // admission is the connection semaphore below, which is taken *before* the
@@ -1037,10 +1080,23 @@ where
         // allocation so the per-request refcount it touches is its own. See
         // `App::replica` for the measurement that made this worth doing.
         let app = app.replica();
+        #[cfg(feature = "tls")]
+        let acceptor = tls_acceptor.clone();
+        let limits = limits.clone();
         handles.push(
             std::thread::Builder::new()
                 .name(format!("churust-worker-{i}"))
-                .spawn(move || worker_loop(app, rx, conn_cfg, shutdown_timeout_ms))?,
+                .spawn(move || {
+                    worker_loop(
+                        app,
+                        rx,
+                        conn_cfg,
+                        shutdown_timeout_ms,
+                        limits,
+                        #[cfg(feature = "tls")]
+                        acceptor,
+                    )
+                })?,
         );
     }
 
@@ -1052,7 +1108,6 @@ where
         .build()?;
 
     accept_rt.block_on(async move {
-        let limits = std::sync::Arc::new(AcceptLimits::from(app.config()));
         let (stop, _) = tokio::sync::broadcast::channel::<()>(1);
         let mut loops = Vec::with_capacity(listeners.len());
         let senders = std::sync::Arc::new(senders);
@@ -1192,6 +1247,10 @@ fn worker_loop(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<Handoff>,
     cfg: ConnSettings,
     shutdown_timeout_ms: u64,
+    // Only the TLS build reads this: it carries the handshake budget, and
+    // without `tls` there are no handshakes to bound.
+    #[cfg_attr(not(feature = "tls"), allow(unused_variables))] limits: std::sync::Arc<AcceptLimits>,
+    #[cfg(feature = "tls")] tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
 ) {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1213,6 +1272,53 @@ fn worker_loop(
             }
             match tokio::net::TcpStream::from_std(std_stream) {
                 Ok(stream) => {
+                    // TLS terminates here, on the worker, rather than on the
+                    // acceptor: a handshake is expensive to answer and cheap to
+                    // ask for, so doing it on the single accept loop would let
+                    // one peer's slow ClientHello stall every other connection's
+                    // admission. The budget and the deadline are the shared
+                    // engine's, applied the same way — the deadline covers the
+                    // wait for the budget as well as the handshake, because what
+                    // is being bounded is how long an unproven peer may hold a
+                    // connection permit.
+                    #[cfg(feature = "tls")]
+                    if let Some(acceptor) = tls_acceptor.clone() {
+                        let app = app.clone();
+                        let token = drain.token();
+                        let handshakes = limits.handshakes.clone();
+                        let deadline = limits.tls_handshake_timeout;
+                        tokio::spawn(async move {
+                            let queue_and_shake = async {
+                                let permit = match &handshakes {
+                                    Some(sem) => sem.clone().acquire_owned().await.ok(),
+                                    None => None,
+                                };
+                                (acceptor.accept(stream).await, permit)
+                            };
+                            let (accepted, permit) = match deadline {
+                                Some(limit) => {
+                                    match tokio::time::timeout(limit, queue_and_shake).await {
+                                        Ok(pair) => pair,
+                                        Err(_) => {
+                                            tracing::debug!(%peer, "TLS handshake timed out");
+                                            return;
+                                        }
+                                    }
+                                }
+                                None => queue_and_shake.await,
+                            };
+                            match accepted {
+                                Ok(tls) => {
+                                    drop(permit);
+                                    serve_stream(app, tls, cfg, peer, token, slot).await;
+                                }
+                                Err(e) => {
+                                    tracing::debug!(%peer, error = %e, "TLS handshake failed")
+                                }
+                            }
+                        });
+                        continue;
+                    }
                     serve_stream(app.clone(), stream, cfg, peer, drain.token(), slot).await;
                 }
                 Err(e) => tracing::debug!(%peer, error = %e, "could not adopt handed-over socket"),
@@ -1239,6 +1345,7 @@ where
             "no addresses to bind",
         ));
     }
+    refuse_tls_without_the_feature(&app)?;
 
     // Bind everything first, so a failure is reported *before* any address
     // starts serving. Binding inside the spawned tasks meant a failure was not
