@@ -322,6 +322,15 @@ impl AppBuilder {
     ///
     /// Leave it on unless you know the workload pipelines. See
     /// [`ServerConfig::tcp_nodelay`] for what turning it off costs.
+    ///
+    /// ```
+    /// use churust_core::{Call, Churust};
+    /// let app = Churust::server()
+    ///     .tcp_nodelay(false) // only for a client that pipelines
+    ///     .routing(|r| { r.get("/", |_c: Call| async { "ok" }); })
+    ///     .build();
+    /// assert!(!app.config().tcp_nodelay);
+    /// ```
     pub fn tcp_nodelay(mut self, on: bool) -> Self {
         self.config.tcp_nodelay = on;
         self
@@ -332,6 +341,15 @@ impl AppBuilder {
     ///
     /// Turn this on only for a workload that actually pipelines. See
     /// [`ServerConfig::pipeline_flush`] for why it is not the default.
+    ///
+    /// ```
+    /// use churust_core::{Call, Churust};
+    /// let app = Churust::server()
+    ///     .pipeline_flush(true)
+    ///     .routing(|r| { r.get("/", |_c: Call| async { "ok" }); })
+    ///     .build();
+    /// assert!(app.config().pipeline_flush);
+    /// ```
     pub fn pipeline_flush(mut self, on: bool) -> Self {
         self.config.pipeline_flush = on;
         self

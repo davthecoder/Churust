@@ -38,7 +38,9 @@ fn start(workers: usize) -> (u16, Shutdown) {
     };
 
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-    let addr = format!("127.0.0.1:{port}").parse().expect("a valid address");
+    let addr = format!("127.0.0.1:{port}")
+        .parse()
+        .expect("a valid address");
     let handle = std::thread::spawn(move || {
         churust_core::engine::serve_sharded(app, vec![addr], workers, async move {
             let _ = rx.await;
@@ -49,7 +51,13 @@ fn start(workers: usize) -> (u16, Shutdown) {
     // before it is listening, so a fixed sleep is either slow or flaky.
     for _ in 0..200 {
         if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return (port, Shutdown { tx: Some(tx), handle: Some(handle) });
+            return (
+                port,
+                Shutdown {
+                    tx: Some(tx),
+                    handle: Some(handle),
+                },
+            );
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
@@ -143,11 +151,7 @@ fn a_connection_survives_more_than_one_request() {
         .expect("a read deadline");
 
     for id in [1u64, 2, 3] {
-        write!(
-            sock,
-            "GET /user/{id} HTTP/1.1\r\nHost: localhost\r\n\r\n"
-        )
-        .expect("write");
+        write!(sock, "GET /user/{id} HTTP/1.1\r\nHost: localhost\r\n\r\n").expect("write");
         let mut reader = BufReader::new(&mut sock);
         let mut status = String::new();
         reader.read_line(&mut status).expect("a status line");
@@ -198,10 +202,7 @@ fn binding_a_taken_port_is_an_error_not_a_panic() {
         .build();
     let result =
         churust_core::engine::serve_sharded(app, vec![addr], 2, std::future::pending::<()>());
-    assert!(
-        result.is_err(),
-        "binding an occupied port reported success"
-    );
+    assert!(result.is_err(), "binding an occupied port reported success");
 }
 
 #[test]
@@ -211,6 +212,7 @@ fn no_addresses_is_an_error() {
             r.get("/", |_c: Call| async { "ok" });
         })
         .build();
-    let result = churust_core::engine::serve_sharded(app, Vec::new(), 2, std::future::pending::<()>());
+    let result =
+        churust_core::engine::serve_sharded(app, Vec::new(), 2, std::future::pending::<()>());
     assert!(result.is_err(), "serving nowhere reported success");
 }
