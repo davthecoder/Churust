@@ -625,6 +625,12 @@ struct ConnActivity {
     /// Fixed reference point, so activity is a cheap integer rather than a
     /// mutex around an `Instant`.
     origin: tokio::time::Instant,
+    /// Whether anything ever waits on `request_finished`.
+    ///
+    /// Only the `keep_alive_ms == 0` branch of the connection loop does, and
+    /// that is off by default. Without this flag every completed request paid
+    /// an atomic read-modify-write to store a permit no one would ever consume.
+    notify_on_finish: bool,
     /// Signalled when a request finishes, for the `keep_alive_ms == 0` close.
     ///
     /// `notify_one` rather than `notify_waiters`, because the two are not
@@ -666,8 +672,12 @@ impl Drop for InFlight {
             .in_flight
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         // After the decrement, so a loop woken by this observes the count it is
-        // about to act on rather than the one that was still standing.
-        self.0.request_finished.notify_one();
+        // about to act on rather than the one that was still standing. Skipped
+        // entirely when no branch of the connection loop is listening — see
+        // `notify_on_finish`.
+        if self.0.notify_on_finish {
+            self.0.request_finished.notify_one();
+        }
     }
 }
 
@@ -772,8 +782,9 @@ impl hyper::body::Body for EngineBody {
 }
 
 impl ConnActivity {
-    fn new() -> Self {
+    fn new(notify_on_finish: bool) -> Self {
         Self {
+            notify_on_finish,
             in_flight: std::sync::atomic::AtomicUsize::new(0),
             last_ms: std::sync::atomic::AtomicU64::new(0),
             served: std::sync::atomic::AtomicBool::new(false),
@@ -1766,7 +1777,7 @@ async fn serve_stream<S>(
     // The idle watchdog needs to know when this connection last did anything.
     // hyper exposes no per-request hook, but the service *is* the per-request
     // hook: every request on this connection passes through the closure below.
-    let activity = std::sync::Arc::new(ConnActivity::new());
+    let activity = std::sync::Arc::new(ConnActivity::new(cfg.keep_alive_ms == 0));
     // Subscribe before the token is moved into the guard: the connection loop
     // watches the shutdown signal, the guard owns the drain's release side.
     let mut signal = token.signal.clone();
@@ -1899,6 +1910,18 @@ async fn serve_stream<S>(
         }));
         let mut idle = std::pin::pin!(idle);
 
+        // Built once, not once per iteration. `select!` re-evaluates its branch
+        // expressions every pass, and `wait_for` registers a waiter on the
+        // watch's notify list when polled and removes it when dropped — two
+        // mutex round-trips, paid on every connection wake, which at these
+        // request rates means paid per request. The signal fires at most once
+        // and the branch disables itself afterwards, so one future covers the
+        // connection's whole life.
+        let shutdown_signal = async move {
+            let _ = signal.wait_for(|fired| *fired).await;
+        };
+        let mut shutdown_signal = std::pin::pin!(shutdown_signal);
+
         // Parked until a shutdown signal arms it; see the signal branch below.
         let linger = tokio::time::sleep(std::time::Duration::from_secs(3_600));
         let mut linger = std::pin::pin!(linger);
@@ -1929,6 +1952,18 @@ async fn serve_stream<S>(
         let mut negotiation = std::pin::pin!(negotiation);
 
         loop {
+            // The negotiation deadline bounds how long a peer may take to
+            // *choose* a protocol. Once one is chosen the question is settled,
+            // but the branch below only disarmed itself when the timer fired —
+            // so for the remainder of `header_read_timeout_ms`, every wake on
+            // an already-negotiated connection polled a timer that could no
+            // longer do anything. At these request rates that is a poll per
+            // request. Reading the flag here settles it on the first wake after
+            // negotiation instead.
+            if negotiation_armed && negotiated.get() {
+                negotiation_armed = false;
+            }
+
             tokio::select! {
                 // Bias the connection: with both branches ready, finishing the
                 // request in hand beats re-checking a signal we have already
@@ -1936,8 +1971,9 @@ async fn serve_stream<S>(
                 biased;
                 _ = conn.as_mut() => break,
                 // `wait_for` rather than `changed` so a signal that fired
-                // before this task got scheduled is still seen.
-                _ = signal.wait_for(|fired| *fired), if !winding_down => {
+                // before this task got scheduled is still seen. Never polled
+                // again once it has fired: `winding_down` disables the branch.
+                _ = shutdown_signal.as_mut(), if !winding_down => {
                     winding_down = true;
                     // Finish the in-flight request, refuse further ones on this
                     // connection, then let the loop poll it to completion.
