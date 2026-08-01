@@ -79,6 +79,18 @@ Pipelining is not a simulation of browser traffic. `run.sh` reports the
 unpipelined run next to it for exactly that reason, and the results file says
 plainly that its ranking is noise.
 
+## The charts
+
+`charts.py` renders the figures in `../docs/assets/` from the numbers in
+`results/`. It has no dependencies and it does not parse the results files:
+the numbers are transcribed into the script with the file they came from named
+beside them, because a chart that silently redraws itself when a results file
+changes is a chart nobody can date.
+
+```sh
+python3 charts.py
+```
+
 ## Server CPU per request
 
 Both modes record how much CPU each server process spent, divided by the

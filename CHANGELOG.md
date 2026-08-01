@@ -86,8 +86,10 @@ whole set.
 
 Together, on the comparison harness at pipeline depth 64, these took Churust
 from 353,000 requests a second — level with axum, as a framework sharing hyper
-and tokio with axum would be — to 3.10M, an 8.8x change. That is 12x axum, 2.3x
-Ktor, 32x Go's `net/http`, and 2% ahead of actix-web at that depth. The margin
+and tokio with axum would be — to 3.10M, an 8.8x change. In that run it is 12x
+axum, 2.3x Ktor, 32x Go's `net/http`, and 2% ahead of actix-web. axum and Ktor
+both vary run to run, so the durable claim is roughly 9x-12x axum and 2x-4x Ktor
+rather than those single figures. The margin
 over actix-web does not hold at every pipeline depth, and
 `benchmarks/results/2026-08-01-Davids-MBP.md` publishes the sweep that shows
 where it does not, along with everything else that could bias the comparison.

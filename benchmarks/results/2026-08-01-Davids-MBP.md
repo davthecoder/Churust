@@ -13,6 +13,8 @@ here returns a constant. Read `benchmarks/README.md` before quoting any of it.
 
 ## Pipelined (depth 64, median of 3 rounds)
 
+![Requests per second by framework](../../docs/assets/benchmark-throughput.svg)
+
 | framework | req/s | vs. best | server CPU µs/req |
 |---|---:|---:|---:|
 | **churust** | **3,101,706** | **1.00x** | 1.87 |
@@ -29,6 +31,8 @@ expected to sit. It now answers 3.10M.
 hold at every depth.** Repeating just those two for five rounds, alternating
 which went first, Churust won all five: 3.08-3.12M against 2.99-3.09M. But
 sweeping the pipeline depth shows the ranking changing hands:
+
+![Churust and actix-web across pipeline depths](../../docs/assets/benchmark-depth-sweep.svg)
 
 | pipeline depth | churust | actix-web | winner |
 |---:|---:|---:|---|
@@ -50,6 +54,8 @@ numbers existed, and the sweep above is published so it cannot be mistaken for a
 depth picked to flatter.
 
 ### Where the 8.8x came from
+
+![Churust before and after: 353k to 3.10M requests per second](../../docs/assets/benchmark-before-after.svg)
 
 None of it was in the routing or the extractors a profiler points at first.
 In order of size:
@@ -107,7 +113,11 @@ make.
 
 The CPU column is the one thing this mode still says honestly, because it does
 not depend on how fast the wire is: the three Rust servers spend 24-29 µs of CPU
-per request where Go and Ktor spend 53-55.
+per request where Go and Ktor spend 53-55. Under the pipelined load, where the
+wire is not the constraint, the same measure separates the five cleanly — and
+puts actix-web first:
+
+![Server CPU per request: actix-web 1.03, Churust 1.87, Ktor 7.23, Go 32.67, axum 40.51 microseconds](../../docs/assets/benchmark-cpu-per-request.svg)
 
 ## Fairness notes
 
