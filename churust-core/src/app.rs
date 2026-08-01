@@ -1109,12 +1109,28 @@ impl App {
     /// Pins each connection to one runtime for its whole life. Where the
     /// default [`start`](App::start) lets a connection's wakeups, handler and
     /// writes land on whichever worker thread is free — paying an atomic, a
-    /// cache miss and often a syscall at each hop — this pays none of them, at
-    /// the cost of not being able to lend a busy worker an idle worker's core.
-    /// Reach for it when requests are many, short and uniform; keep
-    /// [`start`](App::start) when they are not. See
-    /// [`engine::serve_sharded`](crate::engine::serve_sharded) for the
-    /// measurements behind that trade.
+    /// cache miss and often a syscall at each hop — this pays none of them.
+    ///
+    /// # The trade, measured
+    ///
+    /// On this project's comparison harness, the same application on the same
+    /// pinned cores:
+    ///
+    /// | | requests/second | p99 latency |
+    /// |---|---:|---:|
+    /// | [`start`](App::start) (shared runtime) | 393,165 | **379 µs** |
+    /// | `run_sharded` | **691,046** | 3.13 ms |
+    ///
+    /// **1.76× the throughput for 8.3× the tail latency.** With per-connection
+    /// affinity, a request that lands on a busy worker waits for that worker
+    /// instead of being picked up by an idle one, and the slowest percentile is
+    /// where that shows up.
+    ///
+    /// Reach for it when throughput is the constraint and requests are many,
+    /// short and uniform. Keep [`start`](App::start) when the 99th percentile is
+    /// a number anyone looks at. See
+    /// [`engine::serve_sharded`](crate::engine::serve_sharded) for why the
+    /// acceptor is centralised rather than using `SO_REUSEPORT`.
     ///
     /// `workers` of `0` means one per available core.
     ///

@@ -181,48 +181,46 @@ Every Churust crate is released in lockstep on one version number, so
 ## Performance
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/davthecoder/Churust/main/docs/assets/benchmark-throughput.svg" alt="Requests per second, HTTP/1.1 pipelined at depth 64: Churust 3.10M, actix-web 3.04M, Ktor 1.37M, axum 251k, Go net/http 98k" width="900" />
+  <img src="https://raw.githubusercontent.com/davthecoder/Churust/main/docs/assets/benchmark-throughput.svg" alt="Requests per second under ordinary keep-alive HTTP/1.1: Churust 691k, actix-web 654k, axum 395k, Ktor 303k, Go net/http 289k" width="900" />
 </p>
 
-Five servers, three routes, byte-identical responses, one machine, interleaved
-rounds. `run.sh` refuses to measure at all unless every app returns the same
-bytes — the [harness](benchmarks/) is built around that check, because two apps
-doing different work produce a number that means nothing.
+Five servers, three routes, byte-identical responses, on a Linux kernel. One
+server runs at a time, the order rotates each round, the server is pinned to
+eight CPUs and the load generator to four, and [the harness](benchmarks/)
+refuses to measure at all unless every app returns the same bytes.
 
-| framework | req/s | vs. Churust | server CPU µs/req |
-|---|---:|---:|---:|
-| **Churust** | **3,101,706** | — | 1.87 |
-| actix-web | 3,038,968 | 0.98× | **1.03** |
-| Ktor 3.5 (Netty) | 1,366,326 | 0.44× | 7.23 |
-| axum 0.8 | 251,405 | 0.08× | 40.51 |
-| Go 1.26 `net/http` | 97,619 | 0.03× | 32.67 |
+| framework | req/s | vs. Churust | server CPU µs/req | p99 latency |
+|---|---:|---:|---:|---:|
+| **Churust** | **691,046** | — | 8.49 | 3.13 ms |
+| actix-web 4.14 | 653,543 | 0.95× | **7.27** | **553 µs** |
+| axum 0.8 | 394,652 | 0.57× | 11.74 | 9.14 ms |
+| Ktor 3.5 (Netty) | 303,490 | 0.44× | 19.79 | 2.56 ms |
+| Go 1.26 `net/http` | 288,846 | 0.42× | 13.64 | 5.69 ms |
 
-**What this does and does not say.** Four things a reader deserves up front:
+**Churust is first on throughput** for this shape of load — 1.06× actix-web,
+1.75× axum, 2.28× Ktor, 2.39× Go — and **third on tail latency**, which for most
+services is the number that matters more. Four things a reader deserves before
+quoting any of it:
 
-- **Churust is in actix-web's class, not ahead of it.** The margin changes
-  hands with pipeline depth — Churust leads by 2% at depth 64, and trails by 3%
-  at 16 and by 13% at 128 and 256. actix-web also reaches its number on *half*
-  the CPU per request, which is headroom Churust does not have. The
-  [full sweep](docs/assets/benchmark-depth-sweep.svg) is published rather than
-  the one depth Churust wins.
-- **Most of the gap to axum is one switch, not a routing difference.** hyper
-  answers each request in a pipelined batch with its own flush; Churust now
-  aggregates them and `axum::serve` exposes no way to. On an unpipelined load
-  the two are indistinguishable.
-- **Under load a browser would actually generate, all five are identical.**
-  Plain keep-alive on this machine puts every server between 45k and 52k req/s,
-  because macOS's loopback path saturates there — two *different* servers
-  measured simultaneously get 22.4k each. That table ranks nothing, and it is
-  printed next to the other one saying so.
-- **Every route returns a constant.** This measures dispatch overhead. It says
-  nothing about an application that talks to a database.
+- **actix-web answers its slowest one-in-a-hundred request in 553 µs where
+  Churust takes 3.13 ms**, and it does so on 17% less CPU per request. If the
+  99th percentile is a user-visible number for you, that row is the one to read.
+- **The tail is the price of `App::run_sharded`,** not an accident. Pinning a
+  connection to one runtime for its life is worth 1.76× the throughput and costs
+  8.3× the p99 — measured, [both rows](benchmarks/results/2026-08-01-linux-docker.md).
+  That is exactly why it is opt-in and the shared work-stealing runtime is still
+  the default.
+- **With HTTP/1.1 pipelining the order changes:** actix-web 5.67M against
+  Churust's 4.00M. Pipelining is not what most traffic looks like, which is why
+  it is not the headline, but it is published rather than omitted.
+- **Every route returns a constant.** This is dispatch overhead. It says nothing
+  about an application that talks to a database.
 
-Churust served **353,000 req/s** on this same benchmark before the 0.3.4 work —
-level with axum, which is where a framework sharing hyper and tokio with axum
-belongs. The 8.8× since then came from aggregating pipelined flushes, removing
-per-request atomics from shared cache lines, pinning connections to one runtime
-per core (`App::run_sharded`), and deleting a per-request allocation. None of it
-was in routing or extraction.
+Run it yourself — it needs nothing but Docker:
+
+```sh
+docker build -f benchmarks/Dockerfile -t churust-bench . && docker run --rm churust-bench
+```
 
 Full method, every caveat, and the numbers behind the charts:
 [`benchmarks/README.md`](benchmarks/README.md) ·

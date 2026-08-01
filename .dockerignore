@@ -1,0 +1,13 @@
+# The build context is the repository root, and target/ is gigabytes of host
+# artefacts that a Linux image cannot use anyway.
+target
+**/target
+book/book
+graphify-out
+.git
+.idea
+.superpowers
+benchmarks/bench-ktor/build
+benchmarks/bench-ktor/.gradle
+benchmarks/bench-ktor/.kotlin
+benchmarks/bench-go/bench-go

@@ -1,36 +1,36 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 364" width="900" height="364" role="img" aria-labelledby="cpu-t cpu-d">
 <title id="cpu-t">Server CPU microseconds per request by framework</title>
-<desc id="cpu-d">actix-web 1.03, Churust 1.87, Ktor 7.23, Go net/http 32.67, axum 40.51 microseconds of CPU per request. Lower is better; actix-web is best.</desc>
+<desc id="cpu-d">actix-web 7.27, Churust 8.49, axum 11.74, Go net/http 13.64, Ktor 19.79 microseconds of CPU per request. Lower is better; actix-web is best.</desc>
 <style>
 text{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;}
 .s{fill:#fcfcfb}.ink{fill:#0b0b0b}.ink2{fill:#52514e}.mut{fill:#898781}.acc{fill:#2a78d6}.peer{fill:#898781}.s2{fill:#eb6834}.grid{stroke:#e1e0d9}.axis{stroke:#c3c2b7}.acc-s{stroke:#2a78d6}.s2-s{stroke:#eb6834}.ring{stroke:#fcfcfb}
 @media (prefers-color-scheme:dark){.s{fill:#1a1a19}.ink{fill:#ffffff}.ink2{fill:#c3c2b7}.mut{fill:#898781}.acc{fill:#3987e5}.peer{fill:#898781}.s2{fill:#d95926}.grid{stroke:#2c2c2a}.axis{stroke:#383835}.acc-s{stroke:#3987e5}.s2-s{stroke:#d95926}.ring{stroke:#1a1a19}}
 </style>
 <rect class="s" width="900" height="364" rx="10"/>
-<text class="ink" x="28" y="34" font-size="17" font-weight="600">Server CPU per request — actix-web is the most efficient</text><text class="mut" x="28" y="55" font-size="12.5">Microseconds of process CPU per request served, at depth 64 · lower is better</text>
-<line class="grid" x1="299.3" y1="84" x2="299.3" y2="296" stroke-width="1"/>
-<text class="mut" x="299.3" y="78" font-size="10.5" text-anchor="middle">10</text>
-<line class="grid" x1="430.7" y1="84" x2="430.7" y2="296" stroke-width="1"/>
-<text class="mut" x="430.7" y="78" font-size="10.5" text-anchor="middle">20</text>
-<line class="grid" x1="562.0" y1="84" x2="562.0" y2="296" stroke-width="1"/>
-<text class="mut" x="562.0" y="78" font-size="10.5" text-anchor="middle">30</text>
-<line class="grid" x1="693.3" y1="84" x2="693.3" y2="296" stroke-width="1"/>
-<text class="mut" x="693.3" y="78" font-size="10.5" text-anchor="middle">40</text>
+<text class="ink" x="28" y="34" font-size="17" font-weight="600">Server CPU per request — actix-web is the most efficient</text><text class="mut" x="28" y="55" font-size="12.5">Microseconds of process CPU per request served, keep-alive · lower is better</text>
+<line class="grid" x1="302.4" y1="84" x2="302.4" y2="296" stroke-width="1"/>
+<text class="mut" x="302.4" y="78" font-size="10.5" text-anchor="middle">5</text>
+<line class="grid" x1="436.8" y1="84" x2="436.8" y2="296" stroke-width="1"/>
+<text class="mut" x="436.8" y="78" font-size="10.5" text-anchor="middle">10</text>
+<line class="grid" x1="571.2" y1="84" x2="571.2" y2="296" stroke-width="1"/>
+<text class="mut" x="571.2" y="78" font-size="10.5" text-anchor="middle">15</text>
+<line class="grid" x1="705.6" y1="84" x2="705.6" y2="296" stroke-width="1"/>
+<text class="mut" x="705.6" y="78" font-size="10.5" text-anchor="middle">20</text>
 <text class="ink2" x="154" y="108.5" font-size="13" font-weight="400" text-anchor="end">actix-web</text>
-<path class="peer" d="M168,92 H177.5265366576154 A4,4 0 0 1 181.5265366576154,96 V112 A4,4 0 0 1 177.5265366576154,116 H168 Z"/>
-<text class="ink2" x="191.5" y="108.5" font-size="13" font-weight="400">1.03 µs</text>
+<path class="peer" d="M168,92 H359.434057604851 A4,4 0 0 1 363.434057604851,96 V112 A4,4 0 0 1 359.434057604851,116 H168 Z"/>
+<text class="ink2" x="373.4" y="108.5" font-size="13" font-weight="400">7.27 µs</text>
 <text class="ink" x="154" y="152.5" font-size="13" font-weight="600" text-anchor="end">Churust</text>
-<path class="acc" d="M168,136 H188.55788694149592 A4,4 0 0 1 192.55788694149592,140 V156 A4,4 0 0 1 188.55788694149592,160 H168 Z"/>
-<text class="ink" x="202.6" y="152.5" font-size="13" font-weight="600">1.87 µs</text>
-<text class="ink2" x="154" y="196.5" font-size="13" font-weight="400" text-anchor="end">Ktor (Netty)</text>
-<path class="peer" d="M168,180 H258.94840780054307 A4,4 0 0 1 262.94840780054307,184 V200 A4,4 0 0 1 258.94840780054307,204 H168 Z"/>
-<text class="ink2" x="272.9" y="196.5" font-size="13" font-weight="400">7.23 µs</text>
+<path class="acc" d="M168,136 H392.2304194037393 A4,4 0 0 1 396.2304194037393,140 V156 A4,4 0 0 1 392.2304194037393,160 H168 Z"/>
+<text class="ink" x="406.2" y="152.5" font-size="13" font-weight="600">8.49 µs</text>
+<text class="ink2" x="154" y="196.5" font-size="13" font-weight="400" text-anchor="end">axum</text>
+<path class="peer" d="M168,180 H479.5977766548762 A4,4 0 0 1 483.5977766548762,184 V200 A4,4 0 0 1 479.5977766548762,204 H168 Z"/>
+<text class="ink2" x="493.6" y="196.5" font-size="13" font-weight="400">11.74 µs</text>
 <text class="ink2" x="154" y="240.5" font-size="13" font-weight="400" text-anchor="end">Go net/http</text>
-<path class="peer" d="M168,224 H593.0407306837819 A4,4 0 0 1 597.0407306837819,228 V244 A4,4 0 0 1 593.0407306837819,248 H168 Z"/>
-<text class="ink2" x="607.0" y="240.5" font-size="13" font-weight="400">32.67 µs</text>
-<text class="ink2" x="154" y="284.5" font-size="13" font-weight="400" text-anchor="end">axum</text>
+<path class="peer" d="M168,224 H530.6740778170794 A4,4 0 0 1 534.6740778170794,228 V244 A4,4 0 0 1 530.6740778170794,248 H168 Z"/>
+<text class="ink2" x="544.7" y="240.5" font-size="13" font-weight="400">13.64 µs</text>
+<text class="ink2" x="154" y="284.5" font-size="13" font-weight="400" text-anchor="end">Ktor (Netty)</text>
 <path class="peer" d="M168,268 H696.0 A4,4 0 0 1 700.0,272 V288 A4,4 0 0 1 696.0,292 H168 Z"/>
-<text class="ink2" x="710.0" y="284.5" font-size="13" font-weight="400">40.51 µs</text>
+<text class="ink2" x="710.0" y="284.5" font-size="13" font-weight="400">19.79 µs</text>
 <line class="axis" x1="168" y1="84" x2="168" y2="296" stroke-width="1"/>
-<text class="mut" x="28" y="342" font-size="11">The figure that survives a saturated network path — it does not depend on how fast the wire is.</text>
+<text class="mut" x="28" y="342" font-size="11">Churust buys its throughput with more CPU than actix-web spends. The figure does not depend on how fast the wire is.</text>
 </svg>

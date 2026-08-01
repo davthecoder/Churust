@@ -1,34 +1,34 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 364" width="900" height="364" role="img" aria-labelledby="tp-t tp-d">
-<title id="tp-t">Requests per second by framework, HTTP/1.1 pipelined at depth 64</title>
-<desc id="tp-d">Churust 3.10M, actix-web 3.04M, Ktor 1.37M, axum 251k, Go net/http 98k requests per second. Higher is better.</desc>
+<title id="tp-t">Requests per second by framework, ordinary keep-alive HTTP/1.1</title>
+<desc id="tp-d">Churust 691k, actix-web 654k, axum 395k, Ktor 303k, Go net/http 289k requests per second. Higher is better.</desc>
 <style>
 text{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;}
 .s{fill:#fcfcfb}.ink{fill:#0b0b0b}.ink2{fill:#52514e}.mut{fill:#898781}.acc{fill:#2a78d6}.peer{fill:#898781}.s2{fill:#eb6834}.grid{stroke:#e1e0d9}.axis{stroke:#c3c2b7}.acc-s{stroke:#2a78d6}.s2-s{stroke:#eb6834}.ring{stroke:#fcfcfb}
 @media (prefers-color-scheme:dark){.s{fill:#1a1a19}.ink{fill:#ffffff}.ink2{fill:#c3c2b7}.mut{fill:#898781}.acc{fill:#3987e5}.peer{fill:#898781}.s2{fill:#d95926}.grid{stroke:#2c2c2a}.axis{stroke:#383835}.acc-s{stroke:#3987e5}.s2-s{stroke:#d95926}.ring{stroke:#1a1a19}}
 </style>
 <rect class="s" width="900" height="364" rx="10"/>
-<text class="ink" x="28" y="34" font-size="17" font-weight="600">Requests per second — HTTP/1.1 pipelined, depth 64</text><text class="mut" x="28" y="55" font-size="12.5">Apple M2 Max, 12 cores · median of 3 rounds · higher is better</text>
-<line class="grid" x1="339.5" y1="84" x2="339.5" y2="296" stroke-width="1"/>
-<text class="mut" x="339.5" y="78" font-size="10.5" text-anchor="middle">1M</text>
-<line class="grid" x1="511.0" y1="84" x2="511.0" y2="296" stroke-width="1"/>
-<text class="mut" x="511.0" y="78" font-size="10.5" text-anchor="middle">2M</text>
-<line class="grid" x1="682.6" y1="84" x2="682.6" y2="296" stroke-width="1"/>
-<text class="mut" x="682.6" y="78" font-size="10.5" text-anchor="middle">3M</text>
+<text class="ink" x="28" y="34" font-size="17" font-weight="600">Requests per second — ordinary keep-alive, no pipelining</text><text class="mut" x="28" y="55" font-size="12.5">Linux 6.12, 8 pinned cores · 64 connections · median of 5 rounds · higher is better</text>
+<line class="grid" x1="322.0" y1="84" x2="322.0" y2="296" stroke-width="1"/>
+<text class="mut" x="322.0" y="78" font-size="10.5" text-anchor="middle">200k</text>
+<line class="grid" x1="475.9" y1="84" x2="475.9" y2="296" stroke-width="1"/>
+<text class="mut" x="475.9" y="78" font-size="10.5" text-anchor="middle">400k</text>
+<line class="grid" x1="629.9" y1="84" x2="629.9" y2="296" stroke-width="1"/>
+<text class="mut" x="629.9" y="78" font-size="10.5" text-anchor="middle">600k</text>
 <text class="ink" x="154" y="108.5" font-size="13" font-weight="600" text-anchor="end">Churust</text>
 <path class="acc" d="M168,92 H696.0 A4,4 0 0 1 700.0,96 V112 A4,4 0 0 1 696.0,116 H168 Z"/>
-<text class="ink" x="710.0" y="108.5" font-size="13" font-weight="600">3.10M</text>
+<text class="ink" x="710.0" y="108.5" font-size="13" font-weight="600">691k</text>
 <text class="ink2" x="154" y="152.5" font-size="13" font-weight="400" text-anchor="end">actix-web</text>
-<path class="peer" d="M168,136 H685.23927154927 A4,4 0 0 1 689.23927154927,140 V156 A4,4 0 0 1 685.23927154927,160 H168 Z"/>
-<text class="ink2" x="699.2" y="152.5" font-size="13" font-weight="400">3.04M</text>
-<text class="ink2" x="154" y="196.5" font-size="13" font-weight="400" text-anchor="end">Ktor (Netty)</text>
-<path class="peer" d="M168,180 H398.3502034041911 A4,4 0 0 1 402.3502034041911,184 V200 A4,4 0 0 1 398.3502034041911,204 H168 Z"/>
-<text class="ink2" x="412.4" y="196.5" font-size="13" font-weight="400">1.37M</text>
-<text class="ink2" x="154" y="240.5" font-size="13" font-weight="400" text-anchor="end">axum</text>
-<path class="peer" d="M168,224 H207.12061168918007 A4,4 0 0 1 211.12061168918007,228 V244 A4,4 0 0 1 207.12061168918007,248 H168 Z"/>
-<text class="ink2" x="221.1" y="240.5" font-size="13" font-weight="400">251k</text>
+<path class="peer" d="M168,136 H667.1284111332675 A4,4 0 0 1 671.1284111332675,140 V156 A4,4 0 0 1 667.1284111332675,160 H168 Z"/>
+<text class="ink2" x="681.1" y="152.5" font-size="13" font-weight="400">654k</text>
+<text class="ink2" x="154" y="196.5" font-size="13" font-weight="400" text-anchor="end">axum</text>
+<path class="peer" d="M168,180 H467.82183530474094 A4,4 0 0 1 471.82183530474094,184 V200 A4,4 0 0 1 467.82183530474094,204 H168 Z"/>
+<text class="ink2" x="481.8" y="196.5" font-size="13" font-weight="400">395k</text>
+<text class="ink2" x="154" y="240.5" font-size="13" font-weight="400" text-anchor="end">Ktor (Netty)</text>
+<path class="peer" d="M168,224 H397.64100219088164 A4,4 0 0 1 401.64100219088164,228 V244 A4,4 0 0 1 397.64100219088164,248 H168 Z"/>
+<text class="ink2" x="411.6" y="240.5" font-size="13" font-weight="400">303k</text>
 <text class="ink2" x="154" y="284.5" font-size="13" font-weight="400" text-anchor="end">Go net/http</text>
-<path class="peer" d="M168,268 H180.74346569275102 A4,4 0 0 1 184.74346569275102,272 V288 A4,4 0 0 1 180.74346569275102,292 H168 Z"/>
-<text class="ink2" x="194.7" y="284.5" font-size="13" font-weight="400">98k</text>
+<path class="peer" d="M168,268 H386.3673561528466 A4,4 0 0 1 390.3673561528466,272 V288 A4,4 0 0 1 386.3673561528466,292 H168 Z"/>
+<text class="ink2" x="400.4" y="284.5" font-size="13" font-weight="400">289k</text>
 <line class="axis" x1="168" y1="84" x2="168" y2="296" stroke-width="1"/>
-<text class="mut" x="28" y="342" font-size="11">Every route returns a constant. One machine, one moment — not a general ranking. Method and caveats in benchmarks/results/.</text>
+<text class="mut" x="28" y="342" font-size="11">Every route returns a constant, so this is dispatch overhead. One machine, one moment. Method and caveats in benchmarks/results/.</text>
 </svg>

@@ -4,7 +4,7 @@
 Run: python3 charts.py   (writes ../docs/assets/*.svg)
 
 The figures below are transcribed from
-`results/2026-08-01-Davids-MBP.md` and nowhere else. Keeping them here rather
+`results/2026-08-01-linux-docker.md` and nowhere else. Keeping them here rather
 than parsing that file is deliberate — a chart that silently redraws itself when
 a results file changes is a chart nobody can date. Change a number here only by
 copying it from a results file, and say which one.
@@ -18,7 +18,7 @@ import pathlib
 
 OUT = pathlib.Path(__file__).parent.parent / "docs" / "assets"
 
-SOURCE = "benchmarks/results/2026-08-01-Davids-MBP.md"
+SOURCE = "benchmarks/results/2026-08-01-linux-docker.md"
 
 # --- palette -----------------------------------------------------------------
 #
@@ -164,11 +164,11 @@ def fmt(n: float) -> str:
 # -----------------------------------------------------------------------------
 
 THROUGHPUT = [
-    ("Churust", 3_101_706, True),
-    ("actix-web", 3_038_968, False),
-    ("Ktor (Netty)", 1_366_326, False),
-    ("axum", 251_405, False),
-    ("Go net/http", 97_619, False),
+    ("Churust", 691_046, True),
+    ("actix-web", 653_543, False),
+    ("axum", 394_652, False),
+    ("Ktor (Netty)", 303_490, False),
+    ("Go net/http", 288_846, False),
 ]
 
 
@@ -183,19 +183,19 @@ def chart_throughput() -> str:
         header(
             w,
             h,
-            "Requests per second by framework, HTTP/1.1 pipelined at depth 64",
-            "Churust 3.10M, actix-web 3.04M, Ktor 1.37M, axum 251k, Go net/http 98k "
+            "Requests per second by framework, ordinary keep-alive HTTP/1.1",
+            "Churust 691k, actix-web 654k, axum 395k, Ktor 303k, Go net/http 289k "
             "requests per second. Higher is better.",
             "tp",
         ),
         titles(
-            "Requests per second — HTTP/1.1 pipelined, depth 64",
-            "Apple M2 Max, 12 cores · median of 3 rounds · higher is better",
+            "Requests per second — ordinary keep-alive, no pipelining",
+            "Linux 6.12, 8 pinned cores · 64 connections · median of 5 rounds · higher is better",
         ),
     ]
 
     # Gridlines at clean values, behind the bars.
-    for gv in (1_000_000, 2_000_000, 3_000_000):
+    for gv in (200_000, 400_000, 600_000):
         gx = x0 + (x1 - x0) * gv / peak
         out.append(
             f'<line class="grid" x1="{gx:.1f}" y1="{top - 8}" x2="{gx:.1f}" '
@@ -203,7 +203,7 @@ def chart_throughput() -> str:
         )
         out.append(
             f'<text class="mut" x="{gx:.1f}" y="{top - 14}" font-size="10.5" '
-            f'text-anchor="middle">{gv // 1_000_000}M</text>'
+            f'text-anchor="middle">{gv // 1000}k</text>'
         )
 
     y = top
@@ -231,7 +231,7 @@ def chart_throughput() -> str:
         footnote(
             w,
             h - 22,
-            "Every route returns a constant. One machine, one moment — not a general ranking. "
+            "Every route returns a constant, so this is dispatch overhead. One machine, one moment. "
             "Method and caveats in benchmarks/results/.",
         )
     )
@@ -240,110 +240,166 @@ def chart_throughput() -> str:
 
 
 # -----------------------------------------------------------------------------
-# 2. Depth sweep — the honesty chart
+# 2. Pipelined throughput — the mode Churust loses
 # -----------------------------------------------------------------------------
 
-DEPTHS = [16, 64, 128, 256]
-SWEEP = {
-    "Churust": [772_040, 3_086_219, 4_524_352, 5_030_548],
-    "actix-web": [795_389, 3_015_567, 5_116_388, 5_677_437],
-}
+PIPELINED = [
+    ("actix-web", 5_669_946, False),
+    ("Churust", 3_996_416, True),
+    ("Ktor (Netty)", 1_137_799, False),
+    ("Go net/http", 377_301, False),
+    ("axum", 24_542, False),
+]
 
 
-def chart_depth_sweep() -> str:
-    import math
-
-    w, h = 900, 430
-    left, right, top, bottom = 78, 782, 104, 322
-    peak = 6_000_000
-
-    def px(d: int) -> float:
-        lo, hi = math.log2(DEPTHS[0]), math.log2(DEPTHS[-1])
-        return left + (right - left) * (math.log2(d) - lo) / (hi - lo)
-
-    def py(v: float) -> float:
-        return bottom - (bottom - top) * v / peak
+def chart_pipelined() -> str:
+    w, row, gap = 900, 24, 20
+    top = 92
+    h = top + len(PIPELINED) * (row + gap) + 66
+    x0, x1 = 168, 700
+    peak = max(v for _, v, _ in PIPELINED)
 
     out = [
         header(
             w,
             h,
-            "Churust and actix-web throughput across HTTP/1.1 pipeline depths",
-            "At depth 16 actix-web leads by 3 percent, at 64 Churust leads by 2 percent, "
-            "at 128 and 256 actix-web leads by 13 percent.",
-            "ds",
+            "Requests per second with HTTP/1.1 pipelining at depth 16",
+            "actix-web 5.67M, Churust 4.00M, Ktor 1.14M, Go net/http 377k, axum 25k "
+            "requests per second. actix-web leads this mode.",
+            "pl",
         ),
         titles(
-            "The margin against actix-web changes hands with pipeline depth",
-            "Requests per second · Churust leads at depth 64 only · higher is better",
+            "With pipelining, actix-web leads — Churust is second",
+            "Requests per second at pipeline depth 16 · a client shape most traffic is not",
         ),
     ]
 
-    for gv in range(0, 6_000_001, 2_000_000):
-        gy = py(gv)
+    for gv in (2_000_000, 4_000_000):
+        gx = x0 + (x1 - x0) * gv / peak
         out.append(
-            f'<line class="grid" x1="{left}" y1="{gy:.1f}" x2="{right + 8}" '
-            f'y2="{gy:.1f}" stroke-width="1"/>'
+            f'<line class="grid" x1="{gx:.1f}" y1="{top - 8}" x2="{gx:.1f}" '
+            f'y2="{top + len(PIPELINED) * (row + gap) - gap + 4}" stroke-width="1"/>'
         )
         out.append(
-            f'<text class="mut" x="{left - 12}" y="{gy + 4:.1f}" font-size="10.5" '
-            f'text-anchor="end">{gv // 1_000_000}M</text>'
+            f'<text class="mut" x="{gx:.1f}" y="{top - 14}" font-size="10.5" '
+            f'text-anchor="middle">{gv // 1_000_000}M</text>'
         )
 
-    for d in DEPTHS:
+    y = top
+    for name, value, is_subject in PIPELINED:
+        bw = (x1 - x0) * value / peak
+        cls = "acc" if is_subject else "peer"
+        weight = "600" if is_subject else "400"
+        ink = "ink" if is_subject else "ink2"
         out.append(
-            f'<text class="mut" x="{px(d):.1f}" y="{bottom + 22}" font-size="11.5" '
-            f'text-anchor="middle">{d}</text>'
+            f'<text class="{ink}" x="{x0 - 14}" y="{y + row / 2 + 4.5}" font-size="13" '
+            f'font-weight="{weight}" text-anchor="end">{esc(name)}</text>'
         )
-    out.append(
-        f'<text class="ink2" x="{(left + right) / 2:.1f}" y="{bottom + 46}" '
-        f'font-size="12" text-anchor="middle">pipeline depth (requests per batch)</text>'
-    )
-    out.append(
-        f'<line class="axis" x1="{left}" y1="{bottom}" x2="{right + 8}" '
-        f'y2="{bottom}" stroke-width="1"/>'
-    )
-
-    for name, cls, dot in (("Churust", "acc-s", "acc"), ("actix-web", "s2-s", "s2")):
-        pts = " ".join(f"{px(d):.1f},{py(v):.1f}" for d, v in zip(DEPTHS, SWEEP[name]))
+        out.append(f'<path class="{cls}" d="{bar_path(x0, y, x0 + bw, row)}"/>')
         out.append(
-            f'<polyline class="{cls}" points="{pts}" fill="none" stroke-width="2" '
-            f'stroke-linejoin="round" stroke-linecap="round"/>'
+            f'<text class="{ink}" x="{x0 + bw + 10:.1f}" y="{y + row / 2 + 4.5}" '
+            f'font-size="13" font-weight="{weight}">{fmt(value)}</text>'
         )
-        for d, v in zip(DEPTHS, SWEEP[name]):
-            # A 2px surface ring keeps the markers legible where the two
-            # series cross at depth 64.
-            out.append(
-                f'<circle class="ring" cx="{px(d):.1f}" cy="{py(v):.1f}" r="5.5" '
-                f'fill="none" stroke-width="3"/>'
-            )
-            out.append(
-                f'<circle class="{dot}" cx="{px(d):.1f}" cy="{py(v):.1f}" r="4.5"/>'
-            )
+        y += row + gap
 
-    # End labels only: a value on every point would be eleven numbers of noise.
     out.append(
-        f'<text class="ink" x="{px(256) + 14:.1f}" y="{py(SWEEP["Churust"][-1]) + 4:.1f}" '
-        f'font-size="12" font-weight="600">5.03M</text>'
+        f'<line class="axis" x1="{x0}" y1="{top - 8}" x2="{x0}" '
+        f'y2="{y - gap + 4}" stroke-width="1"/>'
     )
-    out.append(
-        f'<text class="ink" x="{px(256) + 14:.1f}" y="{py(SWEEP["actix-web"][-1]) + 4:.1f}" '
-        f'font-size="12" font-weight="600">5.68M</text>'
-    )
-
-    # Legend in the header, clear of the axis furniture at the foot.
-    lx, ly = 618, 40
-    out.append(f'<circle class="acc" cx="{lx}" cy="{ly - 4}" r="5"/>')
-    out.append(f'<text class="ink2" x="{lx + 14}" y="{ly}" font-size="12.5">Churust</text>')
-    out.append(f'<circle class="s2" cx="{lx + 96}" cy="{ly - 4}" r="5"/>')
-    out.append(f'<text class="ink2" x="{lx + 110}" y="{ly}" font-size="12.5">actix-web</text>')
-
     out.append(
         footnote(
             w,
-            h - 22,
-            "Published in full rather than at the one depth Churust wins. "
-            "Method and caveats in benchmarks/results/.",
+            h - 36,
+            "axum is last because it cannot aggregate pipelined writes — axum::serve exposes no way",
+        )
+    )
+    out.append(
+        footnote(w, h - 20, "to ask for it — so a batch of 16 costs it 16 write syscalls.")
+    )
+    out.append("</svg>")
+    return "\n".join(out)
+
+
+# -----------------------------------------------------------------------------
+# 3. Tail latency — the other mode Churust loses
+# -----------------------------------------------------------------------------
+
+# Milliseconds at the 99th percentile, keep-alive.
+P99 = [
+    ("actix-web", 0.553, False),
+    ("Ktor (Netty)", 2.56, False),
+    ("Churust", 3.13, True),
+    ("Go net/http", 5.69, False),
+    ("axum", 9.14, False),
+]
+
+
+def chart_p99() -> str:
+    w, row, gap = 900, 24, 20
+    top = 92
+    h = top + len(P99) * (row + gap) + 66
+    x0, x1 = 168, 700
+    peak = max(v for _, v, _ in P99)
+
+    out = [
+        header(
+            w,
+            h,
+            "Tail latency at the 99th percentile, keep-alive",
+            "actix-web 0.55ms, Ktor 2.56ms, Churust 3.13ms, Go net/http 5.69ms, axum 9.14ms. "
+            "Lower is better; actix-web is best and Churust is third.",
+            "p99",
+        ),
+        titles(
+            "Tail latency — Churust's weakest result",
+            "99th-percentile response time under keep-alive load · lower is better",
+        ),
+    ]
+
+    for gv in (2, 4, 6, 8):
+        gx = x0 + (x1 - x0) * gv / peak
+        out.append(
+            f'<line class="grid" x1="{gx:.1f}" y1="{top - 8}" x2="{gx:.1f}" '
+            f'y2="{top + len(P99) * (row + gap) - gap + 4}" stroke-width="1"/>'
+        )
+        out.append(
+            f'<text class="mut" x="{gx:.1f}" y="{top - 14}" font-size="10.5" '
+            f'text-anchor="middle">{gv}ms</text>'
+        )
+
+    y = top
+    for name, value, is_subject in P99:
+        bw = (x1 - x0) * value / peak
+        cls = "acc" if is_subject else "peer"
+        weight = "600" if is_subject else "400"
+        ink = "ink" if is_subject else "ink2"
+        out.append(
+            f'<text class="{ink}" x="{x0 - 14}" y="{y + row / 2 + 4.5}" font-size="13" '
+            f'font-weight="{weight}" text-anchor="end">{esc(name)}</text>'
+        )
+        out.append(f'<path class="{cls}" d="{bar_path(x0, y, x0 + bw, row)}"/>')
+        out.append(
+            f'<text class="{ink}" x="{x0 + bw + 10:.1f}" y="{y + row / 2 + 4.5}" '
+            f'font-size="13" font-weight="{weight}">{value:g} ms</text>'
+        )
+        y += row + gap
+
+    out.append(
+        f'<line class="axis" x1="{x0}" y1="{top - 8}" x2="{x0}" '
+        f'y2="{y - gap + 4}" stroke-width="1"/>'
+    )
+    out.append(
+        footnote(
+            w,
+            h - 36,
+            "The cost of run_sharded: pinning a connection to one runtime means it waits for that",
+        )
+    )
+    out.append(
+        footnote(
+            w,
+            h - 20,
+            "worker instead of being picked up by an idle one. The shared-runtime default is 379us.",
         )
     )
     out.append("</svg>")
@@ -355,11 +411,11 @@ def chart_depth_sweep() -> str:
 # -----------------------------------------------------------------------------
 
 CPU = [
-    ("actix-web", 1.03, False),
-    ("Churust", 1.87, True),
-    ("Ktor (Netty)", 7.23, False),
-    ("Go net/http", 32.67, False),
-    ("axum", 40.51, False),
+    ("actix-web", 7.27, False),
+    ("Churust", 8.49, True),
+    ("axum", 11.74, False),
+    ("Go net/http", 13.64, False),
+    ("Ktor (Netty)", 19.79, False),
 ]
 
 
@@ -375,17 +431,17 @@ def chart_cpu() -> str:
             w,
             h,
             "Server CPU microseconds per request by framework",
-            "actix-web 1.03, Churust 1.87, Ktor 7.23, Go net/http 32.67, axum 40.51 "
+            "actix-web 7.27, Churust 8.49, axum 11.74, Go net/http 13.64, Ktor 19.79 "
             "microseconds of CPU per request. Lower is better; actix-web is best.",
             "cpu",
         ),
         titles(
             "Server CPU per request — actix-web is the most efficient",
-            "Microseconds of process CPU per request served, at depth 64 · lower is better",
+            "Microseconds of process CPU per request served, keep-alive · lower is better",
         ),
     ]
 
-    for gv in (10, 20, 30, 40):
+    for gv in (5, 10, 15, 20):
         gx = x0 + (x1 - x0) * gv / peak
         out.append(
             f'<line class="grid" x1="{gx:.1f}" y1="{top - 8}" x2="{gx:.1f}" '
@@ -421,7 +477,8 @@ def chart_cpu() -> str:
         footnote(
             w,
             h - 22,
-            "The figure that survives a saturated network path — it does not depend on how fast the wire is."
+            "Churust buys its throughput with more CPU than actix-web spends. "
+            "The figure does not depend on how fast the wire is."
         )
     )
     out.append("</svg>")
@@ -434,24 +491,25 @@ def chart_cpu() -> str:
 
 
 def chart_before_after() -> str:
-    w, h = 900, 336
+    w, h = 900, 392
     x0, x1 = 168, 700
     row, gap, top = 28, 22, 96
-    data = [("Before", 353_000, False), ("After", 3_101_706, True)]
-    peak = 3_101_706
+    data = [("Before", 393_165, False), ("After", 691_046, True)]
+    peak = 691_046
 
     out = [
         header(
             w,
             h,
             "Churust throughput before and after this work",
-            "Churust went from 353 thousand to 3.10 million requests per second, "
-            "an 8.8 times change, on the same benchmark and the same machine.",
+            "Churust went from 393 thousand to 691 thousand requests per second on "
+            "keep-alive load, a 1.76 times change, while its 99th-percentile latency "
+            "went from 379 microseconds to 3.13 milliseconds.",
             "ba",
         ),
         titles(
-            "Churust, before and after this work — 8.8×",
-            "Same benchmark, same machine, same routes · requests per second at depth 64",
+            "Churust, before and after this work — 1.76× on keep-alive",
+            "Same kernel, same harness, same pinned cores · only the binary differs",
         ),
     ]
 
@@ -471,10 +529,13 @@ def chart_before_after() -> str:
         y += row + gap
 
     notes = [
-        "Aggregating pipelined response flushes — 4.1×",
-        "Removing per-request atomics on shared cache lines — 1.45× then 1.29×",
-        "One runtime per core, connections pinned — 1.4×",
-        "Dropping the per-request extension-map allocation — 1.29×",
+        "Removing per-request atomics from shared cache lines",
+        "One runtime per core, connections pinned (App::run_sharded)",
+        "Dropping the per-request extension-map allocation, and several others",
+        "TCP_NODELAY on by default",
+        "",
+        "Bought with tail latency: p99 379us before, 3.13ms after — the affinity",
+        "trade, and why run_sharded is opt-in rather than the default.",
     ]
     ny = y + 18
     out.append(
@@ -489,7 +550,7 @@ def chart_before_after() -> str:
         footnote(
             w,
             h - 20,
-            "None of it in routing or extraction. Method and caveats in benchmarks/results/.",
+            "None of it in routing or extraction. Pipelined workloads gain far more; see the results.",
         )
     )
     out.append("</svg>")
@@ -500,7 +561,8 @@ def main() -> None:
     OUT.mkdir(parents=True, exist_ok=True)
     charts = {
         "benchmark-throughput.svg": chart_throughput(),
-        "benchmark-depth-sweep.svg": chart_depth_sweep(),
+        "benchmark-pipelined.svg": chart_pipelined(),
+        "benchmark-p99-latency.svg": chart_p99(),
         "benchmark-cpu-per-request.svg": chart_cpu(),
         "benchmark-before-after.svg": chart_before_after(),
     }

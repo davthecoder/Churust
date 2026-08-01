@@ -1,7 +1,46 @@
 # Comparison harness
 
-Churust against actix-web, axum, Ktor and Go on identical work. Run by hand, on
-a machine that is otherwise idle.
+Churust against actix-web, axum, Ktor and Go on identical work.
+
+There are two ways to run it, and **the Docker one is the one to trust**:
+
+```sh
+docker build -f benchmarks/Dockerfile -t churust-bench .   # from the repo root
+docker run --rm churust-bench
+```
+
+Knobs: `ROUNDS` (default `3`), `DURATION` (`10s`), `CONNECTIONS` (`256`),
+`THREADS` (`4`), `DEPTH` (`16`), `APPS` (all five), `WARMUP`, `JVM_WARMUP` —
+pass them with `docker run -e ROUNDS=5 …`.
+
+## Why the container is the real harness
+
+Two reasons, and they are the two things that decide whether a benchmark is
+about the software or about the room it was run in.
+
+**It runs on a Linux kernel.** macOS's loopback path saturates around 45–50k
+small round-trips a second, which is *below* what any of these servers can
+answer. Measured there, an ordinary keep-alive load reports the same number for
+all five and the benchmark is a measurement of the host. The evidence for that
+is in [Why the load is pipelined](#why-the-load-is-pipelined) below; the short
+version is that two *different* servers measured simultaneously get half each,
+which is not a fact about either of them. Linux's ceiling is roughly an order of
+magnitude higher, so the realistic workload — a client that does not pipeline —
+is bounded by the server and can be the headline instead of a workaround.
+
+**It runs one server at a time.** Four idle servers are not free: a JVM runs GC
+and JIT threads with no traffic at all, and five resident processes share caches
+and memory bandwidth with whichever one is being measured. `run-linux.sh` starts
+a server, warms it, measures it, stops it, and only then starts the next.
+
+Running sequentially gives up the protection that interleaving bought — a
+machine that slows down mid-run would otherwise dump all of that on whoever went
+last — so it is replaced: **the order rotates every round**, so each framework is
+measured first in one round and last in another, and the reported figure is the
+median across rounds. Each row also reports its spread, so a framework whose
+number moved between rounds says so instead of hiding behind a median.
+
+## The other way: run.sh, on the host
 
 ```sh
 cargo install oha --locked
@@ -12,6 +51,11 @@ brew install wrk gradle          # or your platform's equivalent
 Knobs: `DURATION` (default `10s`), `WRK_DURATION` (`8s`), `CONNECTIONS` (`64`),
 `DEPTH` (`64`), `ROUNDS` (`3`), `APPS` (all five), `BENCH_JAVA_HOME`, and one
 `*_PORT` per app.
+
+This keeps all five servers up and interleaves the measurements. It is still
+useful — it needs no container, and interleaving is the better answer to a
+machine that drifts — but on macOS its keep-alive numbers are the host's and not
+the frameworks', and it is the one that had to pipeline to say anything at all.
 
 `APPS` is how you cope with a missing toolchain: `APPS="churust axum" ./run.sh`
 runs the two that need nothing but cargo.
@@ -29,8 +73,10 @@ everyone writing one.
 
 ## The gate: same work, or no measurement
 
-`run.sh` refuses to measure unless all five apps return equivalent status,
-headers and body on every route. Two apps doing different work produce a number
+Both harnesses refuse to measure unless all five apps return equivalent status,
+headers and body on every route. `run-linux.sh` captures each app's responses
+while it is the one running and compares them once every app has been seen;
+`run.sh` compares them live. Two apps doing different work produce a number
 that means nothing, and that is the usual reason framework benchmarks cannot be
 trusted.
 
