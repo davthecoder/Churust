@@ -531,6 +531,21 @@ struct AcceptLimits {
 }
 
 impl AcceptLimits {
+    /// Like [`AcceptLimits::from`], but with the connection budget replaced.
+    ///
+    /// The sharded engine's `SO_REUSEPORT` path needs a *per-worker* budget:
+    /// every worker acquires a permit before it accepts, so several workers
+    /// drawing on one shared budget deadlock the moment the budget is smaller
+    /// than the number of workers — one worker holds the only permit while the
+    /// kernel hands the connection to another that is still waiting for one.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn with_connections(cfg: &crate::app::ServerConfig, connections: usize) -> Self {
+        let mut limits = Self::from(cfg);
+        limits.connections = (connections > 0)
+            .then(|| std::sync::Arc::new(tokio::sync::Semaphore::new(connections)));
+        limits
+    }
+
     fn from(cfg: &crate::app::ServerConfig) -> Self {
         // `0` means unlimited for every one of these, so a caller who does not
         // want a bound is not forced to invent a large number.
@@ -1036,34 +1051,144 @@ where
     refuse_tls_without_the_feature(&app)?;
     let workers = workers.max(1);
 
+    let backlog = app.config().backlog;
+    // One budget for the process however the connections are distributed.
+    let limits = std::sync::Arc::new(AcceptLimits::from(app.config()));
+
+    // On Linux the kernel can do the distribution, so the workers each own a
+    // listener and run the ordinary accept loop — the same `serve_listener`
+    // the shared engine uses, with its TLS branch, its backoff and its drain,
+    // rather than a second implementation of all three.
+
+    // Linux distributes accepted connections across SO_REUSEPORT listeners in
+    // the kernel; nothing else here does. See `reuseport_listeners`.
+    //
+    // Except when the connection cap is too small to divide. Each worker
+    // acquires a permit before accepting, so a budget shared across listeners
+    // starves: one worker holds the permit, the kernel delivers the connection
+    // to another, and nobody serves it. Splitting the budget per worker fixes
+    // that and keeps the total bounded — but only while there is at least one
+    // permit each to split. Below that the central acceptor is the only shape
+    // that honours the number the operator configured, and honouring a
+    // denial-of-service bound outranks the throughput of a configuration
+    // nobody runs in production.
+    #[cfg(target_os = "linux")]
+    {
+        let cap = app.config().max_connections;
+        if cap == 0 || cap >= workers {
+            let per_worker = if cap == 0 { 0 } else { cap / workers };
+            let limits =
+                std::sync::Arc::new(AcceptLimits::with_connections(app.config(), per_worker));
+            return serve_sharded_reuseport(app, addrs, workers, backlog, limits, shutdown);
+        }
+        return serve_sharded_central(app, addrs, workers, backlog, limits, shutdown);
+    }
+    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(target_os = "linux"))]
+    serve_sharded_central(app, addrs, workers, backlog, limits, shutdown)
+}
+
+/// The Linux implementation: one `SO_REUSEPORT` listener per worker, each
+/// running the ordinary accept loop.
+#[cfg(target_os = "linux")]
+fn serve_sharded_reuseport<F>(
+    app: App,
+    addrs: Vec<SocketAddr>,
+    workers: usize,
+    backlog: u32,
+    limits: std::sync::Arc<AcceptLimits>,
+    shutdown: F,
+) -> std::io::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let (stop, _) = tokio::sync::broadcast::channel::<()>(1);
+    let mut handles = Vec::with_capacity(workers * addrs.len());
+
+    for addr in &addrs {
+        for listener in reuseport_listeners(*addr, backlog, workers)? {
+            let app = app.replica();
+            let limits = limits.clone();
+            let mut rx = stop.subscribe();
+            handles.push(
+                std::thread::Builder::new()
+                    .name(format!("churust-worker-{}", handles.len()))
+                    .spawn(move || {
+                        let rt = match tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                        {
+                            Ok(rt) => rt,
+                            Err(e) => {
+                                tracing::error!(error = %e, "worker runtime could not be built");
+                                return;
+                            }
+                        };
+                        rt.block_on(async move {
+                            let listener = match tokio::net::TcpListener::from_std(listener) {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    tracing::error!(error = %e, "worker listener not adopted");
+                                    return;
+                                }
+                            };
+                            let _ = serve_listener(app, listener, limits, async move {
+                                let _ = rx.recv().await;
+                            })
+                            .await;
+                        });
+                    })?,
+            );
+        }
+    }
+
+    // A runtime just to await the caller's shutdown future and fan it out.
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(shutdown);
+    let _ = stop.send(());
+    for h in handles {
+        let _ = h.join();
+    }
+    return Ok(());
+}
+
+/// Accept centrally and hand each socket to a worker.
+///
+/// The only shape off Linux, where `SO_REUSEPORT` does not distribute, and the
+/// shape on Linux too when the connection cap is smaller than the worker count
+/// — see `serve_sharded`.
+fn serve_sharded_central<F>(
+    app: App,
+    addrs: Vec<SocketAddr>,
+    workers: usize,
+    backlog: u32,
+    limits: std::sync::Arc<AcceptLimits>,
+    shutdown: F,
+) -> std::io::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     // Bound before a single worker starts, for the reason `serve_many`
     // documents: a server that came up on half its addresses and said nothing
     // is worse than one that refused to start.
-    let backlog = app.config().backlog;
     let listeners = addrs
         .iter()
         .map(|addr| bind_tcp_std(*addr, backlog))
         .collect::<std::io::Result<Vec<_>>>()?;
-
     let conn_cfg = ConnSettings::from(app.config());
     let nodelay = app.config().tcp_nodelay;
     let shutdown_timeout_ms = app.config().shutdown_timeout_ms;
 
-    // Built once, before any worker starts, for the same reason the listeners
-    // are: a certificate that cannot be loaded must stop the server rather than
-    // be discovered per connection. Cloning a `TlsAcceptor` is an `Arc` clone,
-    // so each worker holding one costs nothing.
+    // A certificate that cannot be loaded must stop the server rather than be
+    // discovered per connection. Cloning a `TlsAcceptor` is an `Arc` clone, so
+    // each worker holding one costs nothing.
     #[cfg(feature = "tls")]
     let tls_acceptor = match &app.config().tls {
         Some(t) => Some(acceptor_from_pem(&t.cert, &t.key)?),
         None => None,
     };
-
-    // Shared with the workers, not just the acceptor: the handshake happens on
-    // the worker in this engine, so the budget that bounds handshakes has to
-    // reach it. A `Semaphore` is runtime-agnostic, so one shared across several
-    // single-threaded runtimes bounds exactly what it says it does.
-    let limits = std::sync::Arc::new(AcceptLimits::from(app.config()));
 
     // One handoff queue per worker. Unbounded because the thing that bounds
     // admission is the connection semaphore below, which is taken *before* the
@@ -1148,6 +1273,43 @@ where
         let _ = h.join();
     }
     Ok(())
+}
+
+/// One listener per worker, all bound to the same address with `SO_REUSEPORT`.
+///
+/// Linux distributes accepted connections across such listeners in the kernel,
+/// hashing by connection so each socket gets a share. That is strictly better
+/// than accepting centrally and handing sockets to workers: no channel, no
+/// re-registering the socket with a second runtime, and no acceptor thread
+/// competing with the workers for the cores they were pinned to.
+///
+/// Deliberately Linux-only. On macOS and the BSDs `SO_REUSEPORT` means only
+/// "several sockets may bind here" — the last bind takes essentially
+/// everything, and a twelve-worker build measured exactly what a one-worker
+/// build measured because eleven never received a connection. Those platforms
+/// keep the central acceptor, which behaves the same everywhere at the cost of
+/// the handoff.
+#[cfg(target_os = "linux")]
+fn reuseport_listeners(
+    addr: SocketAddr,
+    backlog: u32,
+    n: usize,
+) -> std::io::Result<Vec<std::net::TcpListener>> {
+    (0..n)
+        .map(|_| {
+            let domain = match addr {
+                SocketAddr::V4(_) => socket2::Domain::IPV4,
+                SocketAddr::V6(_) => socket2::Domain::IPV6,
+            };
+            let socket = socket2::Socket::new(domain, socket2::Type::STREAM, None)?;
+            socket.set_reuse_address(true)?;
+            socket.set_reuse_port(true)?;
+            socket.bind(&addr.into())?;
+            socket.listen(backlog.min(i32::MAX as u32) as i32)?;
+            socket.set_nonblocking(true)?;
+            Ok(socket.into())
+        })
+        .collect()
 }
 
 /// One accepted connection on its way to a worker.
