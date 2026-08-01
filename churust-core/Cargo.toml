@@ -21,6 +21,13 @@ all-features = true
 
 [dependencies]
 tokio.workspace = true
+# Binding with a chosen backlog, and without a runtime in scope. Was unix-only,
+# for the Unix-socket listener; `serve_sharded` needs it everywhere, because it
+# binds before the acceptor's runtime exists and tokio's `TcpSocket::listen`
+# panics without a reactor. Honouring the `backlog` knob on the sharded path is
+# what makes this cross-platform rather than a second listener that quietly
+# ignores it.
+socket2.workspace = true
 hyper.workspace = true
 hyper-util.workspace = true
 http-body-util.workspace = true
@@ -117,9 +124,6 @@ multipart = []
 # HTTP/3 over QUIC. Implies `tls`: QUIC has no plaintext mode, so there is no
 # such thing as h3 without a certificate.
 http3 = ["tls", "dep:quinn", "dep:h3", "dep:h3-quinn"]
-
-[target.'cfg(unix)'.dependencies]
-socket2 = { workspace = true }
 
 # `harness = false` because Criterion supplies its own `main`; the default
 # libtest harness would swallow the benchmark arguments.

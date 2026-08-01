@@ -17,10 +17,15 @@
 /// Returns `None` when the input contains a malformed escape (`%zz`, a
 /// truncated `%4`) or decodes to bytes that are not valid UTF-8. Callers turn
 /// `None` into `400 Bad Request`.
-pub(crate) fn decode_path_segment(raw: &str) -> Option<String> {
+///
+/// [`Cow`] rather than `String` because a segment with no `%` in it — which is
+/// every segment of nearly every request — needs no decoding and therefore no
+/// allocation. Returning `String` meant the router heap-allocated and copied
+/// once per path segment on the hot path to hand back bytes it already had.
+pub(crate) fn decode_path_segment(raw: &str) -> Option<std::borrow::Cow<'_, str>> {
     // Overwhelmingly the common case, and worth not allocating for.
     if !raw.contains('%') {
-        return Some(raw.to_string());
+        return Some(std::borrow::Cow::Borrowed(raw));
     }
 
     let bytes = raw.as_bytes();
@@ -44,7 +49,7 @@ pub(crate) fn decode_path_segment(raw: &str) -> Option<String> {
 
     // Reject rather than replace. U+FFFD would map distinct byte sequences onto
     // the same string, and that string then feeds a path-safety decision.
-    String::from_utf8(out).ok()
+    String::from_utf8(out).ok().map(std::borrow::Cow::Owned)
 }
 
 /// What to do when a request path is a non-canonical spelling of a route.

@@ -13,7 +13,99 @@ whole set.
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **`App::run_sharded` — one runtime per core, with connections pinned.** The
+  default [`App::start`] runs every connection on one shared work-stealing
+  runtime, which balances perfectly but lets a connection's read wakeup, its
+  handler and its write each land on a different thread. Each of those hops is
+  an atomic, a cross-core cache miss and usually an `unpark` syscall. Measured
+  on the comparison harness, that was the difference between 8.7 µs and 21.7 µs
+  of server CPU per request — the same work costing two and a half times as much
+  because of *where* it ran. `run_sharded` gives each worker its own
+  single-threaded runtime and pins a connection to one for its life. It is not
+  the default, and should not be: with per-connection affinity a worker whose
+  connections are busy cannot borrow an idle worker's core. Choose it for many
+  short, uniform requests.
+
+  One acceptor hands sockets out round-robin rather than each worker binding the
+  same address with `SO_REUSEPORT`. On Linux `SO_REUSEPORT` distributes; on macOS
+  and the BSDs it only means "several sockets may bind here" and the last bind
+  takes essentially everything. Measured on macOS, a twelve-worker
+  `SO_REUSEPORT` build served exactly what a one-worker build served, because
+  eleven of the twelve never received a connection.
+
+- **`tcp_nodelay` (default on) and `pipeline_flush` (default off).** Churust
+  never disabled Nagle's algorithm on accepted connections. With it on, a small
+  write waits for more data to send while the peer's delayed ACK waits for a
+  response, and the standoff breaks on a timer — tens of milliseconds added to a
+  response the server produced in microseconds. It is now off by default, as it
+  is in every other general-purpose HTTP server.
+
+  `pipeline_flush` is its counterpart for the one workload Nagle was helping:
+  a client that pipelines. hyper answers each request in a pipelined batch with
+  its own flush, so a batch of 64 costs 64 write syscalls; with this on it costs
+  one. Off by default, because a client that does *not* pipeline would then wait
+  for a flush that only comes when the connection has nothing left to read.
+
+### Changed
+
+- **The request path no longer contends on shared reference counts.** It cloned
+  the application handle five times per request, plus the middleware chain, the
+  state map and the matched handler. Every one of those is an atomic
+  read-modify-write on a cache line that every core serving requests is also
+  writing to, and at a million requests a second that line becomes the thing
+  they all queue for. Measured directly: twelve workers sharing one `AppInner`
+  reached 1.29M requests a second where twelve *processes* not sharing it
+  reached 2.07M — same code, same cores, differing only in whether one integer
+  was contended. The path now clones once, into a per-worker replica, so the
+  write is core-local. Behaviour is unchanged: an application is immutable once
+  built, so two replicas cannot disagree.
+
+- **Fewer allocations per request.** The router percent-decoded every path
+  segment into a fresh `String` and collected two `Vec`s to do it, then cloned
+  the captured parameters; the pipeline rebuilt its terminal closure, its boxed
+  future and a `VecDeque` of middleware on every request; `Call::new` allocated
+  a state map that was overwritten a moment later; the engine wrapped every
+  response body in two boxes where one would do, and built a boxed body stream
+  for requests that had no body at all. None of that is gone by being made
+  faster — it is gone.
+
+- **The peer address rides on the `Call` instead of in its extensions.**
+  `http::Extensions` allocates its backing map on the first insert, and on an
+  ordinary request the engine's only insert was this one: a heap allocation and
+  free per request to carry sixteen bytes. `Call::peer_addr` still consults the
+  extension as well, so anything seeding one by hand — the HTTP/3 transport
+  does — keeps working. Worth 29% of throughput on the comparison harness on
+  its own.
+
+- **Security headers cost one hash per header instead of two, and one map
+  growth instead of several.** `contains_key` followed by `insert` hashed each
+  name twice, and adding six headers to a map holding one made it rehash
+  everything it already held more than once per response.
+
+Together, on the comparison harness at pipeline depth 64, these took Churust
+from 353,000 requests a second — level with axum, as a framework sharing hyper
+and tokio with axum would be — to 3.10M, an 8.8x change. That is 12x axum, 2.3x
+Ktor, 32x Go's `net/http`, and 2% ahead of actix-web at that depth. The margin
+over actix-web does not hold at every pipeline depth, and
+`benchmarks/results/2026-08-01-Davids-MBP.md` publishes the sweep that shows
+where it does not, along with everything else that could bias the comparison.
+
+### Breaking
+
+- **`ServerConfig` gained two public fields** (`tcp_nodelay`, `pipeline_flush`),
+  so code constructing one with a struct literal rather than through
+  `ServerConfig::default()` or the builder will not compile. Nothing in the
+  workspace does; the builder is the supported route and gained
+  `AppBuilder::tcp_nodelay` and `AppBuilder::pipeline_flush` to match.
+
+### Fixed
+
+- **`serve_sharded` binds before it builds a runtime,** which `bind_tcp` cannot
+  do: tokio's `TcpSocket::listen` panics without a reactor in scope. `socket2` is
+  no longer a unix-only dependency for that reason, so the `backlog` knob is
+  honoured on the sharded path on every platform rather than silently dropped.
 
 ## [0.3.3] - 2026-07-30
 
