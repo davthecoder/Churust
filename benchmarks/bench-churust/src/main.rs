@@ -1,34 +1,54 @@
-//! One half of the comparison. The routes here must stay byte-identical to
-//! `bench-axum`'s — `run.sh` refuses to measure if they diverge.
+//! One of five apps in the comparison. The routes here must stay
+//! byte-identical to the other four's — `run.sh` refuses to measure if they
+//! diverge.
 
 use churust_core::{Call, Churust};
 
-#[tokio::main]
-async fn main() -> std::io::Result<()> {
+// No `#[tokio::main]`: `run_sharded` builds and owns its own runtimes, and a
+// multi-threaded runtime wrapped around it would sit idle underneath the
+// single-threaded ones doing the work.
+fn main() -> std::io::Result<()> {
     let port: u16 = std::env::var("PORT")
         .expect("PORT must be set")
         .parse()
         .expect("PORT must be a number");
 
+    // `0` means one worker per core, which is what actix-web's `HttpServer`
+    // and the Go runtime default to as well. `WORKERS=1` collapses it to a
+    // single runtime, which is how the sharded and shared shapes are compared
+    // side by side in the results.
+    let workers: usize = std::env::var("WORKERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+
     let app = Churust::server()
         .host("127.0.0.1")
         .port(port)
-        // This comparison measures dispatch overhead between two frameworks.
+        // This comparison measures dispatch overhead between frameworks.
         // Churust's default builder sends five security headers
         // (`X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`,
-        // `Permissions-Policy`, `Cross-Origin-Resource-Policy`) that axum's
-        // bare `Router` does not; left in place, the two apps would be doing
+        // `Permissions-Policy`, `Cross-Origin-Resource-Policy`) that none of
+        // the other four apps send; left in place, the apps would be doing
         // different work, and any throughput gap would partly be measuring
         // that difference rather than the frameworks' dispatch paths. Of the
-        // two honest ways to equalise — add the headers to axum (pulling in
-        // tower-http or hand-rolling middleware) or remove them here (one
-        // line, no new dependency) — this is the cheaper one. Nothing is
+        // two honest ways to equalise — add the headers to all four others, or
+        // remove them here (one line, no new dependency) — this is the cheaper
+        // one. Nothing is
         // hidden by dropping them: their cost is already measured directly in
         // `churust-core/benches/headers.rs`, as the `security_headers_on` vs.
         // `security_headers_off` pair. That bench measures the headers; this
         // comparison measures dispatch. Do not add this back "to be safe" —
         // doing so reintroduces the exact confound this comment describes.
         .without_security_headers()
+        // The load generator pipelines (see benchmarks/pipeline.lua and the
+        // note in README.md about why). Answering a batch of 64 requests with
+        // 64 flushes rather than one is 64 write syscalls where one would do,
+        // and it is the single largest cost in this measurement — so the app
+        // is told that its client pipelines. This is a per-application choice
+        // in every framework here; actix-http does the same aggregation and
+        // does not make it optional.
+        .pipeline_flush(std::env::var("PIPELINE_FLUSH").as_deref() != Ok("0"))
         .routing(|r| {
             r.get("/plaintext", |_c: Call| async {
                 // `Response::bytes` rather than the `&'static str` `IntoResponse`
@@ -58,5 +78,5 @@ async fn main() -> std::io::Result<()> {
         })
         .build();
 
-    app.start().await
+    app.run_sharded(workers)
 }
