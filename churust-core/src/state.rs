@@ -39,6 +39,15 @@ impl StateMap {
         Self::default()
     }
 
+    /// Whether nothing has been registered.
+    ///
+    /// The request path checks this to skip sharing an empty map with every
+    /// call: the sharing costs an atomic refcount bump on a cache line every
+    /// core touches, and an empty map has nothing to share.
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
     /// Insert (or replace) the single value held for type `T`.
     ///
     /// ```

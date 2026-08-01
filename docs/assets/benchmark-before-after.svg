@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 336" width="900" height="336" role="img" aria-labelledby="ba-t ba-d">
+<title id="ba-t">Churust throughput before and after this work</title>
+<desc id="ba-d">Churust went from 353 thousand to 3.10 million requests per second, an 8.8 times change, on the same benchmark and the same machine.</desc>
+<style>
+text{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;}
+.s{fill:#fcfcfb}.ink{fill:#0b0b0b}.ink2{fill:#52514e}.mut{fill:#898781}.acc{fill:#2a78d6}.peer{fill:#898781}.s2{fill:#eb6834}.grid{stroke:#e1e0d9}.axis{stroke:#c3c2b7}.acc-s{stroke:#2a78d6}.s2-s{stroke:#eb6834}.ring{stroke:#fcfcfb}
+@media (prefers-color-scheme:dark){.s{fill:#1a1a19}.ink{fill:#ffffff}.ink2{fill:#c3c2b7}.mut{fill:#898781}.acc{fill:#3987e5}.peer{fill:#898781}.s2{fill:#d95926}.grid{stroke:#2c2c2a}.axis{stroke:#383835}.acc-s{stroke:#3987e5}.s2-s{stroke:#d95926}.ring{stroke:#1a1a19}}
+</style>
+<rect class="s" width="900" height="336" rx="10"/>
+<text class="ink" x="28" y="34" font-size="17" font-weight="600">Churust, before and after this work — 8.8×</text><text class="mut" x="28" y="55" font-size="12.5">Same benchmark, same machine, same routes · requests per second at depth 64</text>
+<text class="ink2" x="154" y="114.5" font-size="13" text-anchor="end">Before</text>
+<path class="peer" d="M168,96 H224.54603498848698 A4,4 0 0 1 228.54603498848698,100 V120 A4,4 0 0 1 224.54603498848698,124 H168 Z"/>
+<text class="ink" x="238.5" y="114.5" font-size="14" font-weight="600">353k</text>
+<text class="ink2" x="154" y="164.5" font-size="13" text-anchor="end">After</text>
+<path class="acc" d="M168,146 H696.0 A4,4 0 0 1 700.0,150 V170 A4,4 0 0 1 696.0,174 H168 Z"/>
+<text class="ink" x="710.0" y="164.5" font-size="14" font-weight="600">3.10M</text>
+<text class="ink2" x="154" y="214" font-size="12" font-weight="600" text-anchor="end">What did it</text>
+<text class="mut" x="168" y="214" font-size="11.5">Aggregating pipelined response flushes — 4.1×</text>
+<text class="mut" x="168" y="231" font-size="11.5">Removing per-request atomics on shared cache lines — 1.45× then 1.29×</text>
+<text class="mut" x="168" y="248" font-size="11.5">One runtime per core, connections pinned — 1.4×</text>
+<text class="mut" x="168" y="265" font-size="11.5">Dropping the per-request extension-map allocation — 1.29×</text>
+<text class="mut" x="28" y="316" font-size="11">None of it in routing or extraction. Method and caveats in benchmarks/results/.</text>
+</svg>

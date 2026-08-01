@@ -188,14 +188,26 @@ impl SecurityHeaders {
     /// present, which is the same rule that lets a handler override a default,
     /// so calling it twice on one response cannot change the result.
     pub(crate) fn apply_to(&self, headers: &mut http::HeaderMap, over_tls: bool) {
-        let mut set = |name: &HeaderName, value: &Option<HeaderValue>| {
+        // One growth for the whole set, rather than one per header that happens
+        // to cross a load-factor boundary. `HeaderMap` rehashes everything it
+        // already holds when it grows, and adding six headers to a map holding
+        // one made it do that more than once per response — the largest single
+        // source of `memmove` on the response path when this was profiled.
+        let mut wanted = self.set_count();
+        if over_tls && self.hsts.is_some() {
+            wanted += 1;
+        }
+        headers.reserve(wanted);
+
+        let mut set = |name: &'static HeaderName, value: &Option<HeaderValue>| {
             let Some(v) = value else { return };
             // The application wins. A handler that set this header did so on
             // purpose, and silently overwriting it would be a trap.
-            if headers.contains_key(name) {
-                return;
-            }
-            headers.insert(name, v.clone());
+            //
+            // `entry` hashes the name once and both looks the slot up and fills
+            // it; the `contains_key` + `insert` pair this replaces hashed the
+            // same name twice, and header names are hashed with SipHash.
+            headers.entry(name).or_insert_with(|| v.clone());
         };
 
         set(&X_CONTENT_TYPE_OPTIONS, &self.content_type_options);
@@ -210,6 +222,24 @@ impl SecurityHeaders {
         if over_tls {
             set(&STRICT_TRANSPORT_SECURITY, &self.hsts);
         }
+    }
+
+    /// How many of the non-HSTS headers this configuration actually sends.
+    ///
+    /// HSTS is excluded because whether it is sent depends on the transport,
+    /// which only [`apply_to`](Self::apply_to) knows.
+    fn set_count(&self) -> usize {
+        [
+            self.content_type_options.is_some(),
+            self.frame_options.is_some(),
+            self.referrer_policy.is_some(),
+            self.csp.is_some(),
+            self.permissions_policy.is_some(),
+            self.cross_origin_resource_policy.is_some(),
+        ]
+        .iter()
+        .filter(|set| **set)
+        .count()
     }
 
     pub(crate) fn into_middleware(self, tls_enabled: bool) -> SecurityHeadersMiddleware {

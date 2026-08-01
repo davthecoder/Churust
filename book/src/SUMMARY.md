@@ -46,6 +46,7 @@
 
 # Reference
 
+- [Performance](reference/performance.md)
 - [Feature flags](reference/feature-flags.md)
 - [Crate map](reference/crate-map.md)
 - [Configuration keys](reference/config.md)

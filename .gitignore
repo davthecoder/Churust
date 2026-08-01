@@ -75,3 +75,17 @@ $RECYCLE.BIN/
 /graphify-out
 /.agents
 skills-lock.json
+
+# Subagent-driven-development scratch: ledgers, briefs, review packages.
+/.superpowers
+
+# Comparison-harness build output. The apps live outside the workspace and
+# build in place, so each one leaves artefacts next to its own sources: Gradle
+# and the Kotlin compiler under bench-ktor, and a linked binary under bench-go
+# that shares its name with the directory and so is not caught by any pattern
+# above. The Rust apps' `target/` directories are already covered by
+# `**/target` near the top of this file.
+/benchmarks/bench-ktor/build
+/benchmarks/bench-ktor/.kotlin
+/benchmarks/bench-ktor/.gradle
+/benchmarks/bench-go/bench-go

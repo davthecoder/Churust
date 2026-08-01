@@ -1,0 +1,142 @@
+# Advisory only. This never gates a release — `release.yml` does not call it —
+# and it fails a PR only on a move large enough to be real.
+name: Bench
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  compare:
+    name: Compare against the merge base
+    runs-on: ubuntu-latest
+    steps:
+      # Full history, because the merge base and the head commit both have to
+      # be checked out and benched.
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      # critcmp always exits 0, so check-bench-regression.py is the only thing
+      # that can fail this job -- which makes it worth checking before either
+      # bench run rather than after. Fails in seconds against committed
+      # fixtures, not after two full builds.
+      - name: Test the regression checker
+        run: python3 .github/scripts/test-bench-regression.py
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # Same pin as ci.yml, release.yml and ci-float.yml, so a regression
+          # this job reports is never actually a toolchain difference.
+          toolchain: "1.96.0"
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install critcmp
+        run: cargo install critcmp --locked --version 0.1.8
+
+      # `pull_request.base.sha` is the base branch's tip at event time, not
+      # the commit the PR actually forked from. Once main advances past that
+      # fork point, benching `base.sha` would attribute main's own later
+      # changes to the PR -- the opposite of what a job named "Compare
+      # against the merge base" should do. `git merge-base` finds the real
+      # common ancestor instead.
+      - name: Resolve the merge base
+        id: merge_base
+        env:
+          # Passed through env rather than interpolated into the script body:
+          # these two values are commit hashes, not attacker-controllable text,
+          # but routing every `github.event.*` value through env instead of a
+          # `${{ }}` inside `run:` is the pattern to keep once someone adds a
+          # field that isn't as safe, e.g. a PR title.
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          echo "sha=$(git merge-base "$BASE_SHA" "$HEAD_SHA")" >> "$GITHUB_OUTPUT"
+
+      # Sample size is cut to keep a doubled run inside a few minutes. It widens
+      # the confidence interval, which is acceptable when the gate only fires at
+      # 20%.
+      - name: Bench the merge base
+        env:
+          MERGE_BASE_SHA: ${{ steps.merge_base.outputs.sha }}
+        run: |
+          git checkout --detach "$MERGE_BASE_SHA"
+          cargo bench -p churust-core --locked -- --save-baseline base --sample-size 20
+
+      - name: Bench the head
+        env:
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git checkout --detach "$HEAD_SHA"
+          cargo bench -p churust-core --locked -- --save-baseline pr --sample-size 20
+
+      - name: Compare
+        id: compare
+        run: |
+          critcmp base pr | tee cmp.txt
+
+      # A regression this large is bigger than the runners' own variance, so it
+      # is worth stopping for. Anything smaller is noise and belongs in the
+      # comment, not in a red X.
+      - name: Fail on a regression past 20%
+        run: |
+          python3 .github/scripts/check-bench-regression.py cmp.txt 1.20
+
+      # `if: always()` means this also runs after an earlier step failed, and
+      # a failure that happens before `Compare` writes cmp.txt (a bench crash,
+      # the toolchain step, critcmp itself) would otherwise make
+      # `fs.readFileSync` throw here, burying the job's real error under an
+      # unrelated "file not found". Checking existence first keeps the
+      # comment honest about which case happened.
+      - name: Comment the table
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.existsSync('cmp.txt')
+              ? [
+                  '### Benchmarks vs merge base',
+                  '',
+                  'Runner variance is 20–30%; only moves past 20% fail this job.',
+                  '',
+                  '```',
+                  fs.readFileSync('cmp.txt', 'utf8').trim(),
+                  '```',
+                ].join('\n')
+              : [
+                  '### Benchmarks vs merge base',
+                  '',
+                  'Benchmarks did not complete, so there is no table to show. ' +
+                    'Check the failed step in this run for the real error.',
+                ].join('\n');
+            try {
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body,
+              });
+            } catch (error) {
+              // A pull request from a fork gets a read-only GITHUB_TOKEN no
+              // matter what `permissions:` above says, so createComment 403s
+              // here for every external contribution -- Churust is public,
+              // so that is not an edge case. That is a permissions artifact,
+              // not a benchmark result, and must not turn an otherwise-green
+              // run red: the regression verdict already happened in the
+              // "Fail on a regression past 20%" step and stands on its own
+              // either way. Fall back to the job summary, which needs no
+              // write permission at all.
+              core.warning(
+                `could not comment on the pull request (${error.message}); ` +
+                  'writing the table to the job summary instead.'
+              );
+              await core.summary.addRaw(body).write();
+            }

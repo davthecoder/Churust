@@ -24,30 +24,6 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
 
-/// Convert a [`Body`] into the boxed hyper body the engine writes to the wire:
-/// `Full` for a buffered payload, `StreamBody` for a lazy stream.
-///
-/// The boxed body is the `!Sync` [`UnsyncBoxBody`] rather than the plan's
-/// `BoxBody`: `Body::Stream` wraps a `Pin<Box<dyn Stream + Send>>` (intentionally
-/// `Send` but not `Sync`), and the resolved `http-body-util` 0.1.3 `BodyExt::boxed`
-/// requires `Self: Send + Sync`. `boxed_unsync` only requires `Send`, and hyper
-/// accepts any `http_body::Body` response body, so behavior is unchanged.
-fn into_boxed_body(body: Body) -> UnsyncBoxBody<Bytes, std::io::Error> {
-    match body {
-        Body::Bytes(bytes) => Full::new(bytes)
-            .map_err(|never| match never {})
-            .boxed_unsync(),
-        Body::Stream(stream) => {
-            let frames = stream.map(|chunk| {
-                chunk
-                    .map(Frame::data)
-                    .map_err(|e| std::io::Error::other(e.to_string()))
-            });
-            StreamBody::new(frames).boxed_unsync()
-        }
-    }
-}
-
 /// Serve `app` on `addr` until `shutdown` resolves (graceful drain).
 ///
 /// Uses HTTP/1.1 (`hyper::server::conn::http1::Builder`).  The plan
@@ -137,6 +113,31 @@ fn bind_tcp(addr: SocketAddr, backlog: u32) -> std::io::Result<tokio::net::TcpLi
     socket.listen(backlog)
 }
 
+/// Bind one address with the chosen backlog, without needing a runtime.
+///
+/// [`bind_tcp`] goes through `tokio::net::TcpSocket`, whose `listen` panics
+/// unless a reactor is already in scope. `serve_sharded` binds *before* it
+/// builds the runtime that will accept — that is the whole point of binding
+/// first, so a bad address is reported before any worker starts — so it needs a
+/// listener it can create with no runtime at all and register later.
+fn bind_tcp_std(addr: SocketAddr, backlog: u32) -> std::io::Result<std::net::TcpListener> {
+    let domain = match addr {
+        SocketAddr::V4(_) => socket2::Domain::IPV4,
+        SocketAddr::V6(_) => socket2::Domain::IPV6,
+    };
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, None)?;
+    // Same reason as `bind_tcp`: without it a restart fails while the previous
+    // socket sits in TIME_WAIT.
+    socket.set_reuse_address(true)?;
+    socket.bind(&addr.into())?;
+    // Saturating rather than `as`, so a large `backlog` cannot wrap into a
+    // negative `c_int` and ask the kernel for nonsense.
+    socket.listen(backlog.min(i32::MAX as u32) as i32)?;
+    // tokio requires this of any listener handed to `from_std`.
+    socket.set_nonblocking(true)?;
+    Ok(socket.into())
+}
+
 /// Bind a Unix socket, with the backlog Churust was told to use.
 ///
 /// Bound through a socket for the same reason `bind_tcp` is: neither std's nor
@@ -172,6 +173,7 @@ where
     F: Future<Output = ()> + Send + 'static,
 {
     let conn_cfg = ConnSettings::from(app.config());
+    let nodelay = app.config().tcp_nodelay;
     let shutdown_timeout_ms = app.config().shutdown_timeout_ms;
     let drain = Drain::new();
     let mut backoff = AcceptBackoff::default();
@@ -209,9 +211,28 @@ where
             _ = &mut shutdown => break,
             (slot, accepted) = acquire => {
                 let (stream, peer) = match accepted {
-                    Ok(s) => {
+                    Ok((stream, peer)) => {
                         backoff.reset();
-                        s
+                        // Nagle's algorithm holds a small write back waiting for
+                        // more to send, and the peer's delayed ACK holds the
+                        // acknowledgement back waiting for a response. An HTTP
+                        // response written as a head and a body — which is what
+                        // hyper writes — can land in exactly that standoff, and
+                        // it resolves on the delayed-ACK timer rather than on
+                        // anything either side does. A server that answers in
+                        // microseconds cannot afford to sometimes answer in
+                        // tens of milliseconds instead. Every general-purpose
+                        // HTTP server disables it; Churust simply had not.
+                        //
+                        // A failure here is not fatal: the connection works,
+                        // it is just latency-prone, and refusing to serve it
+                        // would be the larger harm.
+                        if nodelay {
+                            if let Err(e) = stream.set_nodelay(true) {
+                            tracing::debug!(%peer, error = %e, "could not disable Nagle");
+                            }
+                        }
+                        (stream, peer)
                     }
                     Err(e) => {
                         // A persistent error — EMFILE when the descriptor table
@@ -609,49 +630,104 @@ impl Drop for InFlight {
     }
 }
 
-/// A response body that holds an [`InFlight`] guard until it is finished.
+/// The body the engine hands to hyper, and the [`InFlight`] guard that has to
+/// outlive it.
 ///
-/// A transparent wrapper, not a re-stream: `size_hint` and `is_end_stream`
-/// delegate to the inner body so a buffered response keeps its exact length and
-/// hyper still frames it with `Content-Length`. Converting everything to a
-/// stream here would have made every response chunked.
-struct GuardedBody {
-    inner: UnsyncBoxBody<Bytes, std::io::Error>,
+/// One type doing both jobs, because doing them in two cost two heap
+/// allocations per response and the common case needs neither. A buffered
+/// response used to be boxed into an `UnsyncBoxBody` by `into_boxed_body` and
+/// then boxed *again* by `attach_guard` to carry the guard — two allocations
+/// and two layers of dynamic dispatch to wrap a `Bytes` that was already in
+/// hand. Here the buffered case is a plain `Full<Bytes>` in an enum arm and the
+/// guard is a field, so the whole thing is a move.
+///
+/// `size_hint` and `is_end_stream` delegate rather than being left to their
+/// defaults: hyper frames a response with `Content-Length` only when the body
+/// can state its exact size, so a wrong answer here silently turns every
+/// response chunked.
+pub(crate) struct EngineBody {
+    inner: EngineBodyInner,
     /// Dropped with the body — after the last frame, or when the client goes
-    /// away mid-transfer.
-    _guard: InFlight,
+    /// away mid-transfer. `None` on the responses written before a connection
+    /// guard exists.
+    _guard: Option<InFlight>,
 }
 
-impl hyper::body::Body for GuardedBody {
+enum EngineBodyInner {
+    /// A payload already in memory. No boxing: this is the overwhelmingly
+    /// common shape and it is `Unpin`, `Sized`, and known-length.
+    Full(Full<Bytes>),
+    /// A lazily-produced payload. Still boxed — a stream is a `dyn Stream`
+    /// either way — but now boxed once instead of twice.
+    Stream(UnsyncBoxBody<Bytes, std::io::Error>),
+}
+
+impl EngineBody {
+    /// Wrap a Churust [`Body`] for the wire.
+    fn new(body: Body) -> Self {
+        let inner = match body {
+            Body::Bytes(bytes) => EngineBodyInner::Full(Full::new(bytes)),
+            Body::Stream(stream) => {
+                let frames = stream.map(|chunk| {
+                    chunk
+                        .map(Frame::data)
+                        .map_err(|e| std::io::Error::other(e.to_string()))
+                });
+                EngineBodyInner::Stream(StreamBody::new(frames).boxed_unsync())
+            }
+        };
+        Self {
+            inner,
+            _guard: None,
+        }
+    }
+
+    /// A constant body, for the refusals the engine writes itself.
+    fn from_static(bytes: &'static [u8]) -> Self {
+        Self::new(Body::Bytes(Bytes::from_static(bytes)))
+    }
+
+    /// Keep `guard` alive until this body has been fully written.
+    ///
+    /// A field assignment, where the previous shape allocated a box to hold the
+    /// same guard.
+    fn with_guard(mut self, guard: InFlight) -> Self {
+        self._guard = Some(guard);
+        self
+    }
+}
+
+impl hyper::body::Body for EngineBody {
     type Data = Bytes;
     type Error = std::io::Error;
 
     fn poll_frame(
-        mut self: std::pin::Pin<&mut Self>,
+        self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<std::result::Result<Frame<Bytes>, std::io::Error>>> {
-        std::pin::Pin::new(&mut self.inner).poll_frame(cx)
+        // Both arms are `Unpin`, so this needs no projection and no `unsafe` —
+        // which the workspace forbids outright.
+        match &mut self.get_mut().inner {
+            EngineBodyInner::Full(full) => std::pin::Pin::new(full)
+                .poll_frame(cx)
+                .map(|opt| opt.map(|res| res.map_err(|never| match never {}))),
+            EngineBodyInner::Stream(boxed) => std::pin::Pin::new(boxed).poll_frame(cx),
+        }
     }
 
     fn size_hint(&self) -> hyper::body::SizeHint {
-        self.inner.size_hint()
+        match &self.inner {
+            EngineBodyInner::Full(full) => full.size_hint(),
+            EngineBodyInner::Stream(boxed) => boxed.size_hint(),
+        }
     }
 
     fn is_end_stream(&self) -> bool {
-        self.inner.is_end_stream()
+        match &self.inner {
+            EngineBodyInner::Full(full) => full.is_end_stream(),
+            EngineBodyInner::Stream(boxed) => boxed.is_end_stream(),
+        }
     }
-}
-
-/// Keep `guard` alive until the body has been fully written.
-fn attach_guard(
-    body: UnsyncBoxBody<Bytes, std::io::Error>,
-    guard: InFlight,
-) -> UnsyncBoxBody<Bytes, std::io::Error> {
-    GuardedBody {
-        inner: body,
-        _guard: guard,
-    }
-    .boxed_unsync()
 }
 
 impl ConnActivity {
@@ -858,6 +934,7 @@ struct ConnSettings {
     keep_alive_ms: u64,
     h2_max_header_list_size: u32,
     h2_max_concurrent_streams: u32,
+    pipeline_flush: bool,
 }
 
 impl ConnSettings {
@@ -870,8 +947,280 @@ impl ConnSettings {
             keep_alive_ms: cfg.keep_alive_ms,
             h2_max_header_list_size: cfg.h2_max_header_list_size,
             h2_max_concurrent_streams: cfg.h2_max_concurrent_streams,
+            pipeline_flush: cfg.pipeline_flush,
         }
     }
+}
+
+/// Serve `app` on `addrs` across `workers` independent single-threaded
+/// runtimes, until `shutdown` resolves. Blocks the calling thread.
+///
+/// # Why a second way to serve
+///
+/// The ordinary path ([`serve`], [`serve_many`]) runs every connection on one
+/// shared work-stealing runtime. That is the right default: it balances
+/// perfectly under uneven load, and one slow handler cannot monopolise a core.
+/// It also means a connection's read wakeup, its handler and its write can each
+/// land on a different thread, and each of those hops is an atomic operation, a
+/// cross-core cache miss and — often — an `unpark` syscall.
+///
+/// Measured on this project's comparison harness, that overhead was the
+/// difference between 8.7µs and 21.7µs of server CPU per request: the same work
+/// costing two and a half times as much because of where it ran rather than
+/// what it did. Pinning a connection to one runtime for its whole life removes
+/// the hops. It is the shape actix-web uses, and it is most of why actix-web is
+/// faster than every hyper-based server it is compared with.
+///
+/// The trade is real and is the reason this is not the default: with
+/// per-connection affinity a runtime whose connections happen to be busy cannot
+/// borrow an idle one's core. Choose it for many short, uniform requests;
+/// keep the default for uneven or long-running work.
+///
+/// # Why one acceptor rather than `SO_REUSEPORT`
+///
+/// The obvious implementation gives each worker its own listener on the same
+/// address. On Linux that distributes connections across them; on macOS and the
+/// BSDs `SO_REUSEPORT` means only "several sockets may bind here" and the last
+/// bind takes essentially everything. Measured on macOS, a twelve-worker
+/// `SO_REUSEPORT` build served exactly what a one-worker build served, because
+/// eleven of the twelve never received a connection. One accept loop handing
+/// sockets out in round-robin behaves the same everywhere, and accepting is one
+/// syscall against a connection's whole lifetime.
+///
+/// # Errors
+///
+/// Returns an [`std::io::Error`] if any address cannot be bound, or if a worker
+/// thread cannot be started. Binding happens before any worker starts, so a
+/// failure leaves nothing half-serving.
+pub fn serve_sharded<F>(
+    app: App,
+    addrs: Vec<SocketAddr>,
+    workers: usize,
+    shutdown: F,
+) -> std::io::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    if addrs.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "no addresses to bind",
+        ));
+    }
+    let workers = workers.max(1);
+
+    // Bound before a single worker starts, for the reason `serve_many`
+    // documents: a server that came up on half its addresses and said nothing
+    // is worse than one that refused to start.
+    let backlog = app.config().backlog;
+    let listeners = addrs
+        .iter()
+        .map(|addr| bind_tcp_std(*addr, backlog))
+        .collect::<std::io::Result<Vec<_>>>()?;
+
+    let conn_cfg = ConnSettings::from(app.config());
+    let nodelay = app.config().tcp_nodelay;
+    let shutdown_timeout_ms = app.config().shutdown_timeout_ms;
+
+    // One handoff queue per worker. Unbounded because the thing that bounds
+    // admission is the connection semaphore below, which is taken *before* the
+    // accept — a second bound here would only decide which of two already-
+    // admitted connections waits, and would let a momentarily busy worker
+    // stall the accept loop for every other worker too.
+    let mut senders = Vec::with_capacity(workers);
+    let mut handles = Vec::with_capacity(workers);
+
+    for i in 0..workers {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Handoff>();
+        senders.push(tx);
+        // `replica`, not `clone`: each worker gets its own `AppInner`
+        // allocation so the per-request refcount it touches is its own. See
+        // `App::replica` for the measurement that made this worth doing.
+        let app = app.replica();
+        handles.push(
+            std::thread::Builder::new()
+                .name(format!("churust-worker-{i}"))
+                .spawn(move || worker_loop(app, rx, conn_cfg, shutdown_timeout_ms))?,
+        );
+    }
+
+    // The acceptor gets a runtime of its own rather than borrowing a worker's:
+    // a worker blocked on a slow handler must not also be the thing that stops
+    // accepting.
+    let accept_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+
+    accept_rt.block_on(async move {
+        let limits = std::sync::Arc::new(AcceptLimits::from(app.config()));
+        let (stop, _) = tokio::sync::broadcast::channel::<()>(1);
+        let mut loops = Vec::with_capacity(listeners.len());
+        let senders = std::sync::Arc::new(senders);
+
+        for listener in listeners {
+            // Registered with this runtime's reactor now that there is one.
+            let listener = match tokio::net::TcpListener::from_std(listener) {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!(error = %e, "bound listener could not be adopted");
+                    continue;
+                }
+            };
+            let limits = limits.clone();
+            let senders = senders.clone();
+            let mut rx = stop.subscribe();
+            loops.push(tokio::spawn(async move {
+                shard_accept_loop(listener, limits, senders, nodelay, async move {
+                    let _ = rx.recv().await;
+                })
+                .await
+            }));
+        }
+
+        shutdown.await;
+        let _ = stop.send(());
+        for l in loops {
+            let _ = l.await;
+        }
+    });
+
+    // The senders were moved into the block above and are gone with it, which
+    // is what tells each worker there will be no more connections; each then
+    // drains its own live ones and returns.
+    for h in handles {
+        // A worker that panicked has already reported it. Joining anyway is
+        // what makes this function's return mean "everything has stopped".
+        let _ = h.join();
+    }
+    Ok(())
+}
+
+/// One accepted connection on its way to a worker.
+type Handoff = (std::net::TcpStream, SocketAddr, ConnSlot);
+
+/// Accept on one listener and hand each connection to a worker in turn.
+async fn shard_accept_loop<F>(
+    listener: tokio::net::TcpListener,
+    limits: std::sync::Arc<AcceptLimits>,
+    senders: std::sync::Arc<Vec<tokio::sync::mpsc::UnboundedSender<Handoff>>>,
+    nodelay: bool,
+    shutdown: F,
+) where
+    F: Future<Output = ()>,
+{
+    let mut backoff = AcceptBackoff::default();
+    let mut next = 0usize;
+    tokio::pin!(shutdown);
+
+    loop {
+        let acquire = async {
+            let slot = limits.connection_slot().await;
+            (slot, listener.accept().await)
+        };
+
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => break,
+            (slot, accepted) = acquire => {
+                let (stream, peer) = match accepted {
+                    Ok((stream, peer)) => {
+                        backoff.reset();
+                        if nodelay {
+                            if let Err(e) = stream.set_nodelay(true) {
+                            tracing::debug!(%peer, error = %e, "could not disable Nagle");
+                            }
+                        }
+                        (stream, peer)
+                    }
+                    Err(e) => {
+                        let pause = backoff.next_pause();
+                        tracing::warn!(error = %e, pause_ms = pause.as_millis() as u64, "accept failed");
+                        tokio::time::sleep(pause).await;
+                        continue;
+                    }
+                };
+
+                // Back to a plain socket for the trip across. A tokio
+                // `TcpStream` is registered with the reactor of the runtime
+                // that created it, and handing that registration to another
+                // runtime is how a connection ends up never being polled
+                // again. `into_std` deregisters it; the worker registers it
+                // with its own.
+                let std_stream = match stream.into_std() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::warn!(%peer, error = %e, "could not detach accepted socket");
+                        continue;
+                    }
+                };
+
+                // Round-robin. Not least-loaded: knowing which worker is least
+                // loaded costs a shared counter written on every connection by
+                // every worker, and with connections that outlive a single
+                // request the difference washes out anyway.
+                //
+                // A send only fails if that worker's runtime is gone, which is
+                // a worker that panicked. Falling through to the next one keeps
+                // the server serving on the survivors rather than dropping
+                // every connection that hashes to a dead thread; the failed
+                // send hands the payload back so it can be offered onward.
+                let n = senders.len();
+                let mut payload = (std_stream, peer, slot);
+                let mut delivered = false;
+                for attempt in 0..n {
+                    match senders[(next + attempt) % n].send(payload) {
+                        Ok(()) => {
+                            delivered = true;
+                            break;
+                        }
+                        Err(returned) => payload = returned.0,
+                    }
+                }
+                if !delivered {
+                    tracing::error!(%peer, "every worker is gone; dropping the connection");
+                }
+                next = next.wrapping_add(1);
+            }
+        }
+    }
+}
+
+/// One worker: a single-threaded runtime that serves whatever the acceptor
+/// hands it, for as long as the acceptor is alive.
+fn worker_loop(
+    app: App,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<Handoff>,
+    cfg: ConnSettings,
+    shutdown_timeout_ms: u64,
+) {
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            tracing::error!(error = %e, "worker runtime could not be built");
+            return;
+        }
+    };
+
+    rt.block_on(async move {
+        let drain = Drain::new();
+        while let Some((std_stream, peer, slot)) = rx.recv().await {
+            if let Err(e) = std_stream.set_nonblocking(true) {
+                tracing::debug!(%peer, error = %e, "could not set the socket non-blocking");
+                continue;
+            }
+            match tokio::net::TcpStream::from_std(std_stream) {
+                Ok(stream) => {
+                    serve_stream(app.clone(), stream, cfg, peer, drain.token(), slot).await;
+                }
+                Err(e) => tracing::debug!(%peer, error = %e, "could not adopt handed-over socket"),
+            }
+        }
+        // The acceptor is gone. Finish what is still in flight.
+        drain.wait(shutdown_timeout_ms).await;
+    });
 }
 
 /// Serve on several addresses at once, until `shutdown` resolves.
@@ -1156,11 +1505,19 @@ async fn serve_stream<S>(
     // socket so the permit outlives the HTTP connection future.
     let guard = ConnGuard::new(slot, token);
 
+    // Taken once for the connection. See `App::security_snapshot`.
+    let security = app.security_snapshot();
+
     let svc = {
         let activity = activity.clone();
         let guard = guard.clone();
         service_fn(move |req: HyperRequest<Incoming>| {
+            // The one `Arc` clone the request path makes. It is moved from here
+            // all the way into the pipeline's terminal rather than cloned again
+            // at each hop, which is what the rest of this path was reworked to
+            // allow.
             let app = app.clone();
+            let security = security.clone();
             let activity = activity.clone();
             let conn_guard = guard.clone();
             async move {
@@ -1173,12 +1530,21 @@ async fn serve_stream<S>(
                 // decrement pinned the connection as busy forever, exempt from
                 // the idle watchdog and from the shutdown linger.
                 let in_flight = InFlight::new(activity);
-                let res = handle(app, req, cfg.max_body, cfg.timeout_ms, peer, conn_guard).await;
+                let res = handle(
+                    app,
+                    security,
+                    req,
+                    cfg.max_body,
+                    cfg.timeout_ms,
+                    peer,
+                    conn_guard,
+                )
+                .await;
                 // The guard rides on the response body: the connection is still
                 // working while bytes are being written, and releasing it when
                 // the handler returned meant a large download or an SSE stream
                 // counted as idle and was dropped during shutdown.
-                res.map(|r| r.map(|body| attach_guard(body, in_flight)))
+                res.map(|r| r.map(|body| body.with_guard(in_flight)))
             }
         })
     };
@@ -1206,6 +1572,10 @@ async fn serve_stream<S>(
     // reuse *bounded by an idle timeout*, which hyper has no knob for — see
     // the watchdog branch in the connection loop below.
     builder.http1().keep_alive(cfg.keep_alive_ms > 0);
+    // One flush for a whole batch of pipelined replies rather than one per
+    // reply. Off unless asked for — see `ServerConfig::pipeline_flush` for why
+    // it is the wrong default for a client that does not pipeline.
+    builder.http1().pipeline_flush(cfg.pipeline_flush);
     // Without this a client can hold a connection open indefinitely by
     // dribbling header bytes: the per-request timeout cannot help, because
     // there is no request until the header block is complete.
@@ -1473,18 +1843,23 @@ fn tracing_drain_timeout(ms: u64) {
 /// is left alone, so the second application is a no-op.
 async fn handle(
     app: App,
+    security: Option<(crate::security::SecurityHeaders, bool)>,
     req: HyperRequest<Incoming>,
     max_body: usize,
     timeout_ms: u64,
     peer: std::net::SocketAddr,
     conn_guard: ConnGuard,
-) -> Result<HyperResponse<UnsyncBoxBody<Bytes, std::io::Error>>, Infallible> {
-    let mut res = respond(app.clone(), req, max_body, timeout_ms, peer, conn_guard).await?;
-    // `false`: this transport cannot tell TLS from plaintext by itself — the
-    // stream arrives already decrypted, or never was — so the builder's own
-    // certificate is the only evidence, and `apply_security_headers` consults
-    // it. HTTP/3 is the case that can say `true`.
-    app.apply_security_headers(res.headers_mut(), false);
+) -> Result<HyperResponse<EngineBody>, Infallible> {
+    // `app` is moved, not cloned: the security set was taken from it once when
+    // this connection was accepted, so nothing here needs it back afterwards.
+    let mut res = respond(app, req, max_body, timeout_ms, peer, conn_guard).await?;
+    // The `bool` is the builder's own certificate. This transport cannot tell
+    // TLS from plaintext by itself — the stream arrives already decrypted, or
+    // never was — so that is the only evidence available. HTTP/3 is the case
+    // that can say `true` on its own.
+    if let Some((set, over_tls)) = &security {
+        set.apply_to(res.headers_mut(), *over_tls);
+    }
     Ok(res)
 }
 
@@ -1500,7 +1875,7 @@ async fn respond(
     timeout_ms: u64,
     peer: std::net::SocketAddr,
     conn_guard: ConnGuard,
-) -> Result<HyperResponse<UnsyncBoxBody<Bytes, std::io::Error>>, Infallible> {
+) -> Result<HyperResponse<EngineBody>, Infallible> {
     // Refuse a body the client has already declared too large, before the
     // request is dispatched.
     //
@@ -1530,9 +1905,7 @@ async fn respond(
                 // the type is what the accompanying `nosniff` is there to
                 // enforce, and the pair only means something together.
                 .header(http::header::CONTENT_TYPE, TEXT_PLAIN)
-                .body(into_boxed_body(Body::Bytes(bytes::Bytes::from_static(
-                    b"Payload Too Large",
-                ))))
+                .body(EngineBody::from_static(b"Payload Too Large"))
                 .expect("response build is infallible");
             return Ok(res);
         }
@@ -1582,9 +1955,7 @@ async fn respond(
             // As above: a body with no declared type is one the recipient has
             // to guess at.
             .header(http::header::CONTENT_TYPE, TEXT_PLAIN)
-            .body(into_boxed_body(Body::Bytes(bytes::Bytes::from_static(
-                b"Bad Request",
-            ))))
+            .body(EngineBody::from_static(b"Bad Request"))
             .expect("response build is infallible");
         return Ok(res);
     }
@@ -1621,9 +1992,7 @@ async fn respond(
                 // it on this connection can be trusted to mean what it says.
                 .header(http::header::CONNECTION, "close")
                 .header(http::header::CONTENT_TYPE, TEXT_PLAIN)
-                .body(into_boxed_body(Body::Bytes(bytes::Bytes::from_static(
-                    b"Bad Request",
-                ))))
+                .body(EngineBody::from_static(b"Bad Request"))
                 .expect("response build is infallible");
             return Ok(res);
         }
@@ -1646,31 +2015,56 @@ async fn respond(
 
     let (parts, body) = req.into_parts();
 
+    // A request that has already ended carries nothing to stream, and wrapping
+    // "nothing" in a `Limited`, a `BodyDataStream`, a `map` and a `Box::pin`
+    // costs a heap allocation to arrive at an empty buffer. `is_end_stream` is
+    // hyper's own answer to "is there a body here" — true for a `GET` with no
+    // `Content-Length` and for an explicit `Content-Length: 0` — and those are
+    // the overwhelming majority of requests a server answers. A body that
+    // exists, or that is chunked and so cannot say yet, takes the stream path
+    // below unchanged.
+    let empty_body = http_body::Body::is_end_stream(&body);
+
     // The body is handed to the handler as a stream rather than collected here.
     // Collecting first made `max_body_bytes` a hard ceiling on upload size and
     // made memory scale with concurrent uploads. `Limited` still enforces the
     // cap; exceeding it now surfaces as an error item in the stream, which
     // `Call::try_receive_bytes` turns back into `413` for handlers that buffer.
-    let limited = Limited::new(body, max_body);
-    let body_stream: crate::call::BodyStream = Box::pin(BodyDataStream::new(limited).map(|r| {
-        r.map_err(|e| {
-            // Match the error's *type*, not its message. The message belongs
-            // to http-body-util and can change in a patch release, which would
-            // silently turn every oversized body into a `400`.
-            if e.downcast_ref::<http_body_util::LengthLimitError>()
-                .is_some()
-            {
-                crate::Error::new(StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
-            } else {
-                crate::Error::bad_request(format!("error reading request body: {e}"))
-            }
-        })
-    }));
+    let body_stream: Option<crate::call::BodyStream> = if empty_body {
+        None
+    } else {
+        let limited = Limited::new(body, max_body);
+        Some(Box::pin(BodyDataStream::new(limited).map(|r| {
+            r.map_err(|e| {
+                // Match the error's *type*, not its message. The message belongs
+                // to http-body-util and can change in a patch release, which would
+                // silently turn every oversized body into a `400`.
+                if e.downcast_ref::<http_body_util::LengthLimitError>()
+                    .is_some()
+                {
+                    crate::Error::new(StatusCode::PAYLOAD_TOO_LARGE, "request body too large")
+                } else {
+                    crate::Error::bad_request(format!("error reading request body: {e}"))
+                }
+            })
+        })))
+    };
+
+    // A buffered empty body where there was nothing to stream. Identical to
+    // what draining the stream would have produced, without the allocation.
+    let build_call = move || {
+        let mut call =
+            crate::call::Call::new(parts.method, parts.uri, parts.headers, bytes::Bytes::new());
+        call.set_peer(peer);
+        match body_stream {
+            Some(stream) => call.with_body_stream(stream),
+            None => call,
+        }
+    };
 
     #[cfg(feature = "ws")]
     let process = {
         let mut extensions = http::Extensions::new();
-        extensions.insert(crate::call::PeerAddr(peer));
         if let Some(on_upgrade) = on_upgrade {
             extensions.insert(crate::ws::OnUpgradeHandle::new(on_upgrade));
             // So the upgraded socket keeps this connection's budget share.
@@ -1681,21 +2075,15 @@ async fn respond(
                 max_message_bytes: ws_max_message_bytes,
             });
         }
-        app.process_call(
-            crate::call::Call::new(parts.method, parts.uri, parts.headers, bytes::Bytes::new())
-                .with_body_stream(body_stream),
-            extensions,
-        )
+        app.process_call(build_call(), extensions)
     };
     #[cfg(not(feature = "ws"))]
     let process = {
-        let mut extensions = http::Extensions::new();
-        extensions.insert(crate::call::PeerAddr(peer));
-        app.process_call(
-            crate::call::Call::new(parts.method, parts.uri, parts.headers, bytes::Bytes::new())
-                .with_body_stream(body_stream),
-            extensions,
-        )
+        // Empty on an ordinary request, and an empty `Extensions` allocates
+        // nothing. The peer address rides on the `Call` itself; see
+        // `Call::set_peer`.
+        let extensions = http::Extensions::new();
+        app.process_call(build_call(), extensions)
     };
 
     let res = if timeout_ms == 0 {
@@ -1713,6 +2101,6 @@ async fn respond(
         *headers = res.headers;
     }
     Ok(builder
-        .body(into_boxed_body(res.body))
+        .body(EngineBody::new(res.body))
         .expect("response build is infallible"))
 }

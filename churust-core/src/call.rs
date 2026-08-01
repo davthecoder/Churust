@@ -100,6 +100,20 @@ impl std::fmt::Debug for RequestBody {
     }
 }
 
+/// The state map a [`Call`] reads when its application registered none.
+///
+/// A borrow of one shared empty map rather than a shared `Arc` to one. The
+/// `Arc` looks equivalent and is not: cloning it is an atomic read-modify-write
+/// on a single cache line, and a server answering a million requests a second
+/// across twelve cores turns that one line into the thing every core is
+/// queueing for. Measured on the comparison harness, per-request refcount
+/// traffic on shared lines was worth 60% of throughput. Returning `&StateMap`
+/// touches nothing.
+fn empty_state() -> &'static StateMap {
+    static EMPTY: std::sync::OnceLock<StateMap> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(StateMap::default)
+}
+
 /// Per-request context: the single object a handler receives (Ktor-style).
 ///
 /// A `Call` bundles the request method, URI, headers, captured path
@@ -141,7 +155,17 @@ pub struct Call {
     headers: HeaderMap,
     params: Params,
     body: RequestBody,
-    state: Arc<StateMap>,
+    /// `None` until an application supplies one. See [`empty_state`] for why
+    /// this is not an `Arc` to a shared empty map.
+    state: Option<Arc<StateMap>>,
+    /// The socket this call arrived on, when it arrived on one.
+    ///
+    /// A field rather than an entry in `extensions`, because
+    /// `http::Extensions` allocates its backing map on the first insert and the
+    /// engine's only insert on an ordinary request was this one — a heap
+    /// allocation and free per request to carry sixteen bytes the `Call`
+    /// could hold directly.
+    peer: Option<std::net::SocketAddr>,
     extensions: http::Extensions,
 }
 
@@ -159,9 +183,20 @@ impl Call {
             headers,
             params: Params::new(),
             body: RequestBody::Buffered(body),
-            state: Arc::new(StateMap::default()),
+            // Nothing at all, rather than an allocation or a refcount bump.
+            // Every call the engine builds has its state supplied by
+            // `set_state` a moment later, and the `Arc::new(StateMap::default())`
+            // this replaces was a heap allocation per request whose only purpose
+            // was to be dropped unread.
+            state: None,
+            peer: None,
             extensions: http::Extensions::new(),
         }
+    }
+
+    /// Record the socket this call arrived on. Engine use.
+    pub(crate) fn set_peer(&mut self, peer: std::net::SocketAddr) {
+        self.peer = Some(peer);
     }
 
     /// The request HTTP method.
@@ -332,7 +367,7 @@ impl Call {
     }
 
     /// Injected by `App::process` before the pipeline runs.
-    pub(crate) fn set_state(&mut self, state: Arc<StateMap>) {
+    pub(crate) fn set_state(&mut self, state: Option<Arc<StateMap>>) {
         self.state = state;
     }
 
@@ -346,7 +381,10 @@ impl Call {
     /// the addresses you actually trust, since the header is client-supplied
     /// and trivially forged.
     pub fn peer_addr(&self) -> Option<std::net::SocketAddr> {
-        self.get::<PeerAddr>().map(|p| p.0)
+        // The extension is still consulted, so a caller that seeds one by hand
+        // — the h3 transport does, and so does anything driving `process_call`
+        // directly — keeps working.
+        self.peer.or_else(|| self.get::<PeerAddr>().map(|p| p.0))
     }
 
     /// The value of request cookie `name`, percent-decoded.
@@ -389,6 +427,7 @@ impl Call {
         );
         c.params = self.params.clone();
         c.state = self.state.clone();
+        c.peer = self.peer;
         c.extensions = self.extensions.clone();
         c
     }
@@ -440,7 +479,10 @@ impl Call {
     /// # });
     /// ```
     pub fn state<T: Send + Sync + 'static>(&self) -> Option<Arc<T>> {
-        self.state.get::<T>()
+        match &self.state {
+            Some(map) => map.get::<T>(),
+            None => empty_state().get::<T>(),
+        }
     }
 
     /// Iterate over the captured path parameters as `(name, value)` pairs, in
@@ -809,7 +851,7 @@ mod tests {
         let mut c = call("/", "");
         let mut sm = StateMap::default();
         sm.insert(99u32);
-        c.set_state(std::sync::Arc::new(sm));
+        c.set_state(Some(std::sync::Arc::new(sm)));
         assert_eq!(*c.state::<u32>().unwrap(), 99);
     }
 

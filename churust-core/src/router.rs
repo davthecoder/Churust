@@ -112,7 +112,25 @@ pub enum Match {
     BadPath,
 }
 
-#[derive(Default)]
+/// [`Match`], but with the fast path holding a borrowed handler.
+///
+/// Internal, so it may carry a lifetime where [`Match`] cannot.
+pub(crate) enum BorrowedMatch<'a> {
+    /// The common case: an exact match, handler borrowed from the router.
+    Found {
+        handler: &'a BoxHandler,
+        params: crate::call::Params,
+    },
+    /// A wildcard match, which comes back from [`Router::route`] owned.
+    OwnedFound {
+        handler: BoxHandler,
+        params: crate::call::Params,
+    },
+    /// Anything that is not a match.
+    Other(Match),
+}
+
+#[derive(Default, Clone)]
 struct Node {
     statics: HashMap<String, Node>,
     param: Option<(String, Box<Node>)>,      // {name}
@@ -122,12 +140,13 @@ struct Node {
 
 /// One registered route: a handler plus the guards that must pass for it to
 /// serve. Several may share a method; the first whose guards pass wins.
+#[derive(Clone)]
 struct Candidate {
     guards: Vec<crate::guard::BoxGuard>,
     handler: BoxHandler,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct BoxHandlers(HashMap<Method, Vec<Candidate>>);
 
 impl BoxHandlers {
@@ -209,7 +228,7 @@ impl std::fmt::Debug for Node {
 ///     _ => panic!("expected wildcard match"),
 /// }
 /// ```
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Router {
     root: Node,
     /// Every `(method, pattern)` registered, in registration order.
@@ -328,21 +347,33 @@ impl Router {
     pub fn route(&self, method: &Method, path: &str, call: &crate::call::Call) -> Match {
         // Split first, decode second. Decoding before splitting would let %2F
         // manufacture separators and forge extra path segments.
+        //
+        // `Cow`, and borrowed from `path` in the ordinary case: the previous
+        // shape (`Vec<String>` immediately re-borrowed into a second
+        // `Vec<&str>`) allocated one `String` per segment plus two `Vec`s on
+        // every single request, to end up pointing at bytes the caller already
+        // owned. Only a segment that actually contains a `%` allocates now.
         let decoded = match decode_segments(path) {
             Some(d) => d,
             None => return Match::BadPath,
         };
-        let segments: Vec<&str> = decoded.iter().map(String::as_str).collect();
+        let segments: Vec<&str> = decoded.iter().map(std::convert::AsRef::as_ref).collect();
         let mut params = crate::call::Params::new();
 
         // 1. Exact search. Static beats param, and a leaf that cannot serve
         //    this request is passed over rather than settled for.
-        let found = Self::walk_matching(&self.root, &segments, 0, &mut params, &mut |node, p| {
-            node.handlers
-                .pick(method, call)
-                .map(|h| (h.clone(), p.clone()))
+        //
+        // The accepted branch's captures are read off `params` afterwards
+        // rather than cloned into the closure. `walk_matching` returns straight
+        // up the stack the moment `accept` says yes — every rollback sits on
+        // the `None` path — so on a hit `params` already holds exactly the
+        // accepted branch's captures and nothing else. Cloning them was one
+        // `Vec` plus two `String`s per captured parameter, discarded a line
+        // later.
+        let found = Self::walk_matching(&self.root, &segments, 0, &mut params, &mut |node, _| {
+            node.handlers.pick(method, call).cloned()
         });
-        if let Some((handler, params)) = found {
+        if let Some(handler) = found {
             return Match::Found { handler, params };
         }
 
@@ -387,6 +418,57 @@ impl Router {
             }
             _ if !exact_allow.is_empty() => Match::MethodNotAllowed { allow: exact_allow },
             _ => Match::NotFound,
+        }
+    }
+
+    /// Route `path` for `method`, borrowing the handler rather than cloning it.
+    ///
+    /// The dispatcher's path. [`route`](Router::route) hands back a
+    /// `BoxHandler`, and `BoxHandler` is an `Arc`: cloning one is an atomic
+    /// read-modify-write on the handler's refcount, and every core serving that
+    /// route hits the same cache line on every request. [`Handler::handle`]
+    /// takes `&self` and returns an owned `'static` future, so the clone buys
+    /// nothing — the borrow is over before there is anything to await.
+    ///
+    /// `route` keeps returning an owned handler: it is public API, and giving
+    /// [`Match`] a lifetime would be a breaking change for a saving only the
+    /// dispatcher is in a position to take.
+    pub(crate) fn route_borrowed(
+        &self,
+        method: &Method,
+        path: &str,
+        call: &crate::call::Call,
+    ) -> BorrowedMatch<'_> {
+        let decoded = match decode_segments(path) {
+            Some(d) => d,
+            None => return BorrowedMatch::Other(Match::BadPath),
+        };
+        let segments: Vec<&str> = decoded.iter().map(std::convert::AsRef::as_ref).collect();
+        let mut params = crate::call::Params::new();
+
+        let found = Self::walk_matching(&self.root, &segments, 0, &mut params, &mut |node, _| {
+            node.handlers.pick(method, call)
+        });
+        if let Some(handler) = found {
+            return BorrowedMatch::Found { handler, params };
+        }
+
+        // Nothing served it, so this is one of the slow paths — a 404, a 405 or
+        // a wildcard. Those are not what this function exists to make fast, so
+        // they go back through `route`, which is the one implementation of what
+        // each of them means.
+        match self.route(method, path, call) {
+            Match::Found { .. } => {
+                // Only reachable through the wildcard fallback, which
+                // `route_borrowed` deliberately does not duplicate.
+                match self.route(method, path, call) {
+                    Match::Found { handler, params } => {
+                        BorrowedMatch::OwnedFound { handler, params }
+                    }
+                    other => BorrowedMatch::Other(other),
+                }
+            }
+            other => BorrowedMatch::Other(other),
         }
     }
 
@@ -487,7 +569,7 @@ impl Router {
             Some(d) => d,
             None => return Vec::new(),
         };
-        let segments: Vec<&str> = decoded.iter().map(String::as_str).collect();
+        let segments: Vec<&str> = decoded.iter().map(std::convert::AsRef::as_ref).collect();
         let mut params = crate::call::Params::new();
         // Every structurally-matching leaf, not just the first: `OPTIONS`
         // describes the resource, and two routes of different shapes matching
@@ -784,19 +866,31 @@ impl crate::handler::Handler for LimitedHandler {
 /// Built once at route registration rather than consulted per request, so a
 /// route in no scope is exactly as cheap as before.
 struct ScopedHandler {
-    chain: Vec<std::sync::Arc<dyn crate::pipeline::Middleware>>,
-    inner: BoxHandler,
+    /// The scope's layers, and the terminal that runs the route itself. Both
+    /// are assembled at registration: per request this handler clones two
+    /// `Arc`s, where it used to build a fresh closure, a fresh boxed future and
+    /// a fresh `VecDeque` every time it ran.
+    chain: std::sync::Arc<[std::sync::Arc<dyn crate::pipeline::Middleware>]>,
+    endpoint: crate::pipeline::Endpoint,
+}
+
+impl ScopedHandler {
+    fn new(chain: Vec<std::sync::Arc<dyn crate::pipeline::Middleware>>, inner: BoxHandler) -> Self {
+        let endpoint: crate::pipeline::Endpoint = std::sync::Arc::new(move |call| {
+            let inner = inner.clone();
+            Box::pin(async move { inner.handle(call).await }) as _
+        });
+        Self {
+            chain: chain.into(),
+            endpoint,
+        }
+    }
 }
 
 impl crate::handler::Handler for ScopedHandler {
     fn handle(&self, call: crate::call::Call) -> crate::handler::HandlerFuture {
-        let inner = self.inner.clone();
-        let endpoint: crate::pipeline::Endpoint = std::sync::Arc::new(move |call| {
-            let inner = inner.clone();
-            Box::pin(async move { inner.handle(call).await })
-        });
-        let chain: std::collections::VecDeque<_> = self.chain.iter().cloned().collect();
-        Box::pin(crate::pipeline::Next::new(chain, endpoint).run(call))
+        let next = crate::pipeline::Next::with_endpoint(self.chain.clone(), self.endpoint.clone());
+        Box::pin(next.run(call))
     }
 }
 
@@ -809,9 +903,14 @@ fn split_segments(path: &str) -> Vec<&str> {
 /// The order is the point. Decoding the whole path first would turn `%2F` into
 /// a separator and let a request forge segments it was never routed through.
 /// Returns `None` if any segment is undecodable, which becomes `400`.
-fn decode_segments(path: &str) -> Option<Vec<String>> {
-    split_segments(path)
-        .into_iter()
+///
+/// Splits lazily rather than through [`split_segments`]: that helper collects
+/// into a `Vec<&str>` that this function immediately consumed and dropped, so
+/// going straight from the iterator to the decoded vector is one heap
+/// allocation fewer on every request.
+fn decode_segments(path: &str) -> Option<Vec<std::borrow::Cow<'_, str>>> {
+    path.split('/')
+        .filter(|s| !s.is_empty())
         .map(crate::path::decode_path_segment)
         .collect()
 }
@@ -950,10 +1049,7 @@ impl<'r> RouteBuilder<'r> {
         let h = if self.chain.is_empty() {
             h
         } else {
-            std::sync::Arc::new(ScopedHandler {
-                chain: self.chain.clone(),
-                inner: h,
-            }) as BoxHandler
+            std::sync::Arc::new(ScopedHandler::new(self.chain.clone(), h)) as BoxHandler
         };
         self.router.add(method.clone(), &full, h);
         self.last = Some((method, full));

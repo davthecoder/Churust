@@ -3,15 +3,14 @@
 //! [`ServerConfig`].
 
 use crate::call::Call;
-use crate::pipeline::{Endpoint, Middleware, Next, Phase};
+use crate::pipeline::{Middleware, Next, Phase};
 use crate::response::Response;
-use crate::router::{Match, RouteBuilder, Router};
+use crate::router::{BorrowedMatch, Match, RouteBuilder, Router};
 use crate::state::StateMap;
 use bytes::Bytes;
 use futures_util::FutureExt;
 use http::header::ALLOW;
 use http::{HeaderMap, HeaderValue, Method, StatusCode, Uri};
-use std::collections::VecDeque;
 use std::sync::Arc;
 
 /// A reusable bundle of behavior that installs itself into an [`AppBuilder`]
@@ -107,6 +106,33 @@ pub struct ServerConfig {
     pub tls_handshake_timeout_ms: u64,
     /// TLS settings, or `None` for plaintext HTTP.
     pub tls: Option<crate::config::TlsSection>,
+    /// Disable Nagle's algorithm on accepted TCP connections.
+    ///
+    /// On by default, and it should stay on for anything answering real
+    /// clients: with Nagle enabled a small write waits for more data to send
+    /// while the peer's delayed ACK waits for a response, and the standoff is
+    /// broken by a timer rather than by either side — tens of milliseconds
+    /// added to a response the server produced in microseconds.
+    ///
+    /// The one workload it costs is HTTP/1.1 *pipelining*, where coalescing the
+    /// responses to a batch of requests into one segment is exactly what you
+    /// want. Turn it off there, and see `pipeline_flush`, which achieves the
+    /// same coalescing without giving up the latency guarantee.
+    pub tcp_nodelay: bool,
+    /// Aggregate the writes for pipelined HTTP/1.1 responses into one flush.
+    ///
+    /// A client that pipelines sends several requests without waiting for the
+    /// replies. Answered one flush at a time, each reply is its own write
+    /// syscall and — with `tcp_nodelay` on — its own packet. Answered as one
+    /// flush, a batch of 64 replies costs one of each.
+    ///
+    /// Off by default because it is the wrong trade for the ordinary case: a
+    /// non-pipelining client's response then waits for a flush that only
+    /// happens once the connection has nothing left to read. Measured on
+    /// loopback with one request in flight at a time, that is a median 90µs
+    /// instead of 56µs — 61% more latency on every response, to help a client
+    /// shape that is rare on the open internet.
+    pub pipeline_flush: bool,
 }
 
 impl Default for ServerConfig {
@@ -132,6 +158,8 @@ impl Default for ServerConfig {
             max_tls_handshakes: 256,
             tls_handshake_timeout_ms: 10_000,
             tls: None,
+            tcp_nodelay: true,
+            pipeline_flush: false,
         }
     }
 }
@@ -287,6 +315,43 @@ impl AppBuilder {
     /// Set the listen backlog (default `1024`).
     pub fn backlog(mut self, n: u32) -> Self {
         self.config.backlog = n;
+        self
+    }
+
+    /// Disable Nagle's algorithm on accepted connections (default `true`).
+    ///
+    /// Leave it on unless you know the workload pipelines. See
+    /// [`ServerConfig::tcp_nodelay`] for what turning it off costs.
+    ///
+    /// ```
+    /// use churust_core::{Call, Churust};
+    /// let app = Churust::server()
+    ///     .tcp_nodelay(false) // only for a client that pipelines
+    ///     .routing(|r| { r.get("/", |_c: Call| async { "ok" }); })
+    ///     .build();
+    /// assert!(!app.config().tcp_nodelay);
+    /// ```
+    pub fn tcp_nodelay(mut self, on: bool) -> Self {
+        self.config.tcp_nodelay = on;
+        self
+    }
+
+    /// Answer a batch of pipelined HTTP/1.1 requests with one flush instead of
+    /// one per response (default `false`).
+    ///
+    /// Turn this on only for a workload that actually pipelines. See
+    /// [`ServerConfig::pipeline_flush`] for why it is not the default.
+    ///
+    /// ```
+    /// use churust_core::{Call, Churust};
+    /// let app = Churust::server()
+    ///     .pipeline_flush(true)
+    ///     .routing(|r| { r.get("/", |_c: Call| async { "ok" }); })
+    ///     .build();
+    /// assert!(app.config().pipeline_flush);
+    /// ```
+    pub fn pipeline_flush(mut self, on: bool) -> Self {
+        self.config.pipeline_flush = on;
         self
     }
 
@@ -706,7 +771,7 @@ impl AppBuilder {
         }
 
         mw.sort_by_key(|(phase, _)| *phase); // stable: install order preserved within a phase
-        let middleware: Vec<Arc<dyn Middleware>> = mw.into_iter().map(|(_, m)| m).collect();
+        let middleware: Arc<[Arc<dyn Middleware>]> = mw.into_iter().map(|(_, m)| m).collect();
         App {
             inner: Arc::new(AppInner {
                 router: self.router,
@@ -720,9 +785,12 @@ impl AppBuilder {
     }
 }
 
-struct AppInner {
+#[derive(Clone)]
+pub(crate) struct AppInner {
     router: Router,
-    middleware: Vec<Arc<dyn Middleware>>,
+    /// Built once, shared by every request. See [`Next`] for why this is a
+    /// slice behind an `Arc` rather than something the pipeline rebuilds.
+    middleware: Arc<[Arc<dyn Middleware>]>,
     config: ServerConfig,
     state: Arc<StateMap>,
     /// Carried through from [`AppBuilder::bind`]. `build` used to drop these,
@@ -784,10 +852,57 @@ impl App {
     /// plaintext mode. Over TCP the builder's own certificate is the only
     /// evidence available, so the flag is false there and
     /// `config.tls.is_some()` decides.
+    /// HTTP/3 only. The TCP transports take a
+    /// [`security_snapshot`](App::security_snapshot) once per connection
+    /// instead, so that the response path can consume its `App` rather than
+    /// keep a second one alive to ask this question afterwards. h3 has no
+    /// equivalent per-connection hook to hang it from.
+    #[cfg(feature = "http3")]
     pub(crate) fn apply_security_headers(&self, headers: &mut HeaderMap, over_tls: bool) {
         if let Some(security) = &self.inner.security {
             security.apply_to(headers, over_tls || self.inner.config.tls.is_some());
         }
+    }
+
+    /// A copy of this application that shares everything expensive and nothing
+    /// contended.
+    ///
+    /// The routes, handlers, middleware and state inside are the same objects —
+    /// they are behind their own `Arc`s and are never cloned per request. What
+    /// is *not* shared is the `AppInner` allocation itself, and therefore its
+    /// reference count. That matters because the request path clones the `App`
+    /// once per request, and when every core is cloning the same `Arc` the
+    /// cache line holding its count becomes the thing they queue for: measured
+    /// on the comparison harness, twelve workers sharing one `AppInner` reached
+    /// 1.29M requests a second where twelve processes not sharing it reached
+    /// 2.07M — the same code, the same cores, differing only in whether one
+    /// integer was contended.
+    ///
+    /// Used by [`engine::serve_sharded`](crate::engine::serve_sharded), which
+    /// hands each worker its own. Not a semantic clone: an application is
+    /// immutable once built, so two replicas cannot disagree.
+    pub(crate) fn replica(&self) -> Self {
+        Self {
+            inner: Arc::new((*self.inner).clone()),
+        }
+    }
+
+    /// The security-header set and whether the transport is already TLS, in a
+    /// form a connection can hold for its whole life.
+    ///
+    /// Taken once per connection rather than read off the `App` once per
+    /// response, so the response path can *consume* its `App` on the way into
+    /// the pipeline instead of keeping a second one alive to ask this question
+    /// afterwards. That second one was an `Arc` clone and drop per request on
+    /// the cache line every core serving requests already contends for.
+    ///
+    /// `None` when the application opted out, which is also the cheapest case:
+    /// nothing to copy and nothing to apply.
+    pub(crate) fn security_snapshot(&self) -> Option<(crate::security::SecurityHeaders, bool)> {
+        self.inner
+            .security
+            .as_ref()
+            .map(|s| (s.clone(), self.inner.config.tls.is_some()))
     }
 
     /// The single request entry point: run one request through the full
@@ -832,19 +947,26 @@ impl App {
         body: Bytes,
         extensions: http::Extensions,
     ) -> Response {
-        self.process_call(Call::new(method, uri, headers, body), extensions)
+        self.clone()
+            .process_call(Call::new(method, uri, headers, body), extensions)
             .await
     }
 
     /// Run the pipeline over an already-built [`Call`]. Engine use: this is how
     /// a streaming request body reaches a handler without being buffered first.
-    pub(crate) async fn process_call(&self, call: Call, extensions: http::Extensions) -> Response {
-        let app = self.clone();
+    pub(crate) async fn process_call(self, call: Call, extensions: http::Extensions) -> Response {
         let fut = async move {
             let mut call = call;
             call.seed_extensions(extensions);
-            call.set_state(app.inner.state.clone());
-            app.run_pipeline(call).await
+            // Only when there is something to share. An application that
+            // registered no state used to pay an `Arc` clone and drop per
+            // request for a map with nothing in it — and that clone is an
+            // atomic on a line every core touches, which is the expensive part
+            // rather than the pointer copy.
+            if !self.inner.state.is_empty() {
+                call.set_state(Some(self.inner.state.clone()));
+            }
+            self.run_pipeline(call).await
         };
         match std::panic::AssertUnwindSafe(fut).catch_unwind().await {
             Ok(res) => res,
@@ -980,12 +1102,89 @@ impl App {
         .await
     }
 
-    async fn run_pipeline(&self, call: Call) -> Response {
-        let inner = self.inner.clone();
-        let endpoint: Endpoint = Arc::new(move |mut call: Call| {
-            let inner = inner.clone();
-            Box::pin(async move {
-                let path = call.path().to_string();
+    /// Serve with one single-threaded runtime per worker, until Ctrl-C. Blocks
+    /// the calling thread and builds its own runtimes, so call it from a plain
+    /// `fn main` — **not** from inside `#[tokio::main]`.
+    ///
+    /// Pins each connection to one runtime for its whole life. Where the
+    /// default [`start`](App::start) lets a connection's wakeups, handler and
+    /// writes land on whichever worker thread is free — paying an atomic, a
+    /// cache miss and often a syscall at each hop — this pays none of them, at
+    /// the cost of not being able to lend a busy worker an idle worker's core.
+    /// Reach for it when requests are many, short and uniform; keep
+    /// [`start`](App::start) when they are not. See
+    /// [`engine::serve_sharded`](crate::engine::serve_sharded) for the
+    /// measurements behind that trade.
+    ///
+    /// `workers` of `0` means one per available core.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`std::io::Error`] if any configured address is invalid or
+    /// cannot be bound, or if a worker thread cannot be started.
+    ///
+    /// ```no_run
+    /// use churust_core::{Churust, Call};
+    /// # fn main() -> std::io::Result<()> {
+    /// let app = Churust::server()
+    ///     .routing(|r| { r.get("/", |_c: Call| async { "hi" }); })
+    ///     .build();
+    /// app.run_sharded(0)
+    /// # }
+    /// ```
+    pub fn run_sharded(self, workers: usize) -> std::io::Result<()> {
+        let workers = match workers {
+            0 => std::thread::available_parallelism().map_or(1, |n| n.get()),
+            n => n,
+        };
+        let addrs = self.bind_addrs()?;
+        crate::engine::serve_sharded(self, addrs, workers, async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+    }
+
+    /// Consumes the handle rather than borrowing it, so the `Arc<AppInner>` the
+    /// caller already owns is *moved* into the pipeline instead of cloned into
+    /// it. Every clone of that pointer is an atomic read-modify-write on one
+    /// cache line shared by every core serving requests, and the request path
+    /// used to do five of them; this is the last one, and it does not happen.
+    async fn run_pipeline(self, call: Call) -> Response {
+        Next::new(self.inner).run(call).await
+    }
+}
+
+/// Whether a lookup actually found a handler.
+fn is_match(m: &crate::router::BorrowedMatch<'_>) -> bool {
+    matches!(
+        m,
+        crate::router::BorrowedMatch::Found { .. }
+            | crate::router::BorrowedMatch::OwnedFound { .. }
+    )
+}
+
+impl AppInner {
+    /// The middleware chain, in the order it runs.
+    pub(crate) fn middleware(&self) -> &[Arc<dyn Middleware>] {
+        &self.middleware
+    }
+
+    /// Route one call and run whatever the router found: the centre of the
+    /// onion, reached once the middleware chain is spent.
+    ///
+    /// A method rather than the boxed closure this used to be. The closure was
+    /// rebuilt on every request — `Arc::new` for the closure, `Box::pin` for
+    /// the future it returned — purely so the pipeline could name its terminal
+    /// uniformly. `Terminal::App` names it without allocating.
+    pub(crate) async fn dispatch(self: Arc<Self>, mut call: Call) -> Response {
+        let inner = self;
+        {
+            {
+                // Borrowed from the call's URI, not copied out of it. This was
+                // `call.path().to_string()` — one heap allocation and copy per
+                // request, for a string every read below could have borrowed.
+                // The borrow ends at the last read of `path`, which is before
+                // `set_params` needs the call mutably.
+                let path = call.uri().path();
                 let method = call.method().clone();
 
                 // RFC 9110 §9.3.7: `OPTIONS *` asks about the server as a
@@ -1022,7 +1221,7 @@ impl App {
                 // serves the alias and does not rewrite the URI — which is what
                 // `PathPolicy::Collapse` documents itself as, and why it is a
                 // migration step rather than a supported posture.
-                if let Some(canonical) = crate::path::canonical_path(&path) {
+                if let Some(canonical) = crate::path::canonical_path(path) {
                     match inner.config.path_policy {
                         crate::path::PathPolicy::Strict => {
                             return Response::text("Not Found").with_status(StatusCode::NOT_FOUND);
@@ -1057,16 +1256,20 @@ impl App {
                     return Response::text("URI Too Long").with_status(StatusCode::URI_TOO_LONG);
                 }
 
-                let mut lookup = inner.router.route(&method, &path, &call);
+                // `route_borrowed`, not `route`: the handler comes back
+                // borrowed from the router, so the hot path does not do an
+                // atomic refcount bump on a cache line every core serving this
+                // route shares. See `Router::route_borrowed`.
+                let mut lookup = inner.router.route_borrowed(&method, path, &call);
 
                 // RFC 9110 §9.3.2: HEAD must be available wherever GET is.
                 // Only synthesized when no HEAD route was registered, so an
                 // explicit HEAD handler always wins.
                 let mut synthesized_head = false;
-                if method == Method::HEAD && !matches!(lookup, Match::Found { .. }) {
-                    if let m @ Match::Found { .. } = inner.router.route(&Method::GET, &path, &call)
-                    {
-                        lookup = m;
+                if method == Method::HEAD && !is_match(&lookup) {
+                    let as_get = inner.router.route_borrowed(&Method::GET, path, &call);
+                    if is_match(&as_get) {
+                        lookup = as_get;
                         synthesized_head = true;
                     }
                 }
@@ -1075,9 +1278,9 @@ impl App {
                 // CORS runs in the Plugins phase and short-circuits preflight
                 // before this endpoint is reached, so an installed Cors keeps
                 // priority over this.
-                if method == Method::OPTIONS && !matches!(lookup, Match::Found { .. }) {
+                if method == Method::OPTIONS && !is_match(&lookup) {
                     if let Some(value) =
-                        crate::router::allow_header_value(inner.router.methods_for(&path))
+                        crate::router::allow_header_value(inner.router.methods_for(path))
                     {
                         return Response::new(StatusCode::NO_CONTENT).with_header(
                             ALLOW,
@@ -1086,15 +1289,39 @@ impl App {
                     }
                 }
 
-                match lookup {
+                let (handler, owned_handler, params, rest) = match lookup {
+                    BorrowedMatch::Found { handler, params } => {
+                        (Some(handler), None, Some(params), None)
+                    }
+                    BorrowedMatch::OwnedFound { handler, params } => {
+                        (None, Some(handler), Some(params), None)
+                    }
+                    BorrowedMatch::Other(other) => (None, None, None, Some(other)),
+                };
+
+                if let Some(params) = params {
+                    call.set_params(params);
+                    // The borrow of the router ends when `handle` returns: it
+                    // hands back an owned `'static` future, so nothing is held
+                    // across the await.
+                    let fut = match (handler, &owned_handler) {
+                        (Some(h), _) => h.handle(call),
+                        (None, Some(h)) => h.handle(call),
+                        (None, None) => unreachable!("params implies a handler"),
+                    };
+                    let res = fut.await;
+                    return if synthesized_head {
+                        strip_body(res)
+                    } else {
+                        res
+                    };
+                }
+
+                match rest.expect("no handler implies a non-match") {
+                    // Unreachable: a `Found` was turned into a handler above.
                     Match::Found { handler, params } => {
                         call.set_params(params);
-                        let res = handler.handle(call).await;
-                        if synthesized_head {
-                            strip_body(res)
-                        } else {
-                            res
-                        }
+                        handler.handle(call).await
                     }
                     // Same generator as the `OPTIONS` arm above: one resource,
                     // one answer. `None` means nothing is registered here at
@@ -1121,11 +1348,8 @@ impl App {
                         Response::text("Bad Request").with_status(StatusCode::BAD_REQUEST)
                     }
                 }
-            }) as _
-        });
-
-        let chain: VecDeque<Arc<dyn Middleware>> = self.inner.middleware.iter().cloned().collect();
-        Next::new(chain, endpoint).run(call).await
+            }
+        }
     }
 }
 

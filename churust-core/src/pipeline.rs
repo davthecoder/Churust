@@ -10,7 +10,6 @@
 use crate::call::Call;
 use crate::response::Response;
 use async_trait::async_trait;
-use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -92,30 +91,101 @@ pub trait Middleware: Send + Sync + 'static {
     async fn handle(&self, call: Call, next: Next) -> Response;
 }
 
+/// What sits at the centre of the onion once the middleware chain is spent.
+///
+/// Two shapes, because the common one does not need to be a closure. An
+/// [`App`](crate::App) always terminates in its own router, and building an
+/// `Arc<dyn Fn(...) -> Pin<Box<dyn Future>>>` to say so meant two heap
+/// allocations per request — one for the closure, one for the future it
+/// returned — to reach a method the app could simply call. [`Terminal::App`]
+/// calls it. [`Terminal::Endpoint`] is the escape hatch for everything that
+/// genuinely does supply its own terminal: scoped route middleware, the tower
+/// adapter, and callers outside this crate.
+pub(crate) enum Terminal {
+    /// The app's own router, and the app's own middleware chain: one pointer
+    /// for both, because they live in the same allocation. Holding the chain
+    /// separately meant a second `Arc` clone per request on a second shared
+    /// cache line, for a slice reachable through the pointer already held.
+    App(Arc<crate::app::AppInner>),
+    /// A caller-supplied terminal, with its own chain alongside.
+    Endpoint(Arc<[Arc<dyn Middleware>]>, Endpoint),
+}
+
 /// The remaining middleware chain plus the terminal [`Endpoint`].
 ///
 /// It is owned (via `Arc` clones) and carries no lifetime parameters, so it
 /// threads cleanly through `async_trait` futures. A [`Middleware`] advances the
 /// pipeline by calling [`Next::run`].
+///
+/// The chain is a shared slice plus a cursor, not a queue that gets consumed.
+/// A `VecDeque` had to be built — one allocation, plus one `Arc` clone per
+/// installed layer — for every request, and then thrown away; the slice is
+/// built once at [`AppBuilder::build`](crate::AppBuilder::build) time and
+/// advancing through it costs an `Arc` clone of the whole thing and an integer.
 pub struct Next {
-    chain: VecDeque<Arc<dyn Middleware>>,
-    endpoint: Endpoint,
+    /// How far into the chain this continuation has advanced.
+    idx: usize,
+    endpoint: Terminal,
 }
 
 impl Next {
-    pub(crate) fn new(chain: VecDeque<Arc<dyn Middleware>>, endpoint: Endpoint) -> Self {
-        Self { chain, endpoint }
+    /// Start the pipeline for an application, consuming the pointer the caller
+    /// already holds rather than cloning it.
+    pub(crate) fn new(inner: Arc<crate::app::AppInner>) -> Self {
+        Self {
+            idx: 0,
+            endpoint: Terminal::App(inner),
+        }
+    }
+
+    /// Start a pipeline that ends somewhere other than an application's router.
+    pub(crate) fn with_endpoint(chain: Arc<[Arc<dyn Middleware>]>, endpoint: Endpoint) -> Self {
+        Self {
+            idx: 0,
+            endpoint: Terminal::Endpoint(chain, endpoint),
+        }
+    }
+
+    /// The layers this continuation is walking.
+    fn chain(&self) -> &[Arc<dyn Middleware>] {
+        match &self.endpoint {
+            Terminal::App(inner) => inner.middleware(),
+            Terminal::Endpoint(chain, _) => chain,
+        }
     }
 
     /// Run the next middleware in the chain, or the [`Endpoint`] if the chain is
     /// exhausted, consuming `self`. Call this from a [`Middleware`] to proceed
     /// inward; not calling it short-circuits the rest of the pipeline.
-    pub async fn run(mut self, call: Call) -> Response {
-        match self.chain.pop_front() {
-            Some(mw) => mw.handle(call, self).await,
-            None => (self.endpoint)(call).await,
+    pub async fn run(self, call: Call) -> Response {
+        match self.chain().get(self.idx) {
+            Some(mw) => {
+                let mw = mw.clone();
+                let rest = Next {
+                    idx: self.idx + 1,
+                    endpoint: self.endpoint,
+                };
+                mw.handle(call, rest).await
+            }
+            None => match self.endpoint {
+                // The `.await` here is on a plain async fn, so the terminal
+                // costs no allocation at all in the ordinary case — the future
+                // is part of this one.
+                Terminal::App(inner) => inner.dispatch(call).await,
+                Terminal::Endpoint(_, ep) => ep(call).await,
+            },
         }
     }
+}
+
+/// An empty middleware chain, for the terminals that have none.
+///
+/// `Arc<[T]>` cannot be constructed as a constant, and `Arc::from(vec![])`
+/// would allocate; this hands out clones of one shared empty slice instead.
+#[cfg(test)]
+pub(crate) fn empty_chain() -> Arc<[Arc<dyn Middleware>]> {
+    static EMPTY: std::sync::OnceLock<Arc<[Arc<dyn Middleware>]>> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(|| Vec::new().into()).clone()
 }
 
 #[cfg(test)]
@@ -170,26 +240,32 @@ mod tests {
 
     #[tokio::test]
     async fn runs_endpoint_when_chain_empty() {
-        let next = Next::new(VecDeque::new(), endpoint());
+        let next = Next::with_endpoint(empty_chain(), endpoint());
         let res = next.run(sample_call()).await;
         assert_eq!(res.body, Bytes::from("inner"));
     }
 
     #[tokio::test]
     async fn middleware_post_processes_response() {
-        let mut chain: VecDeque<Arc<dyn Middleware>> = VecDeque::new();
-        chain.push_back(Arc::new(AddHeader));
-        let res = Next::new(chain, endpoint()).run(sample_call()).await;
+        let chain: Arc<[Arc<dyn Middleware>]> =
+            vec![Arc::new(AddHeader) as Arc<dyn Middleware>].into();
+        let res = Next::with_endpoint(chain, endpoint())
+            .run(sample_call())
+            .await;
         assert_eq!(res.headers.get("x-mw").unwrap(), "1");
         assert_eq!(res.body, Bytes::from("inner"));
     }
 
     #[tokio::test]
     async fn middleware_can_short_circuit() {
-        let mut chain: VecDeque<Arc<dyn Middleware>> = VecDeque::new();
-        chain.push_back(Arc::new(ShortCircuit));
-        chain.push_back(Arc::new(AddHeader)); // should never run
-        let res = Next::new(chain, endpoint()).run(sample_call()).await;
+        let chain: Arc<[Arc<dyn Middleware>]> = vec![
+            Arc::new(ShortCircuit) as Arc<dyn Middleware>,
+            Arc::new(AddHeader) as Arc<dyn Middleware>, // should never run
+        ]
+        .into();
+        let res = Next::with_endpoint(chain, endpoint())
+            .run(sample_call())
+            .await;
         assert_eq!(res.status, StatusCode::FORBIDDEN);
         assert!(res.headers.get("x-mw").is_none());
     }

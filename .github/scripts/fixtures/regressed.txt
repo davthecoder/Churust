@@ -1,0 +1,4 @@
+group                 base                    pr
+-----                 ----                    --
+dispatch/bare_200     1.00   1.0±0.03µs       1.50   1.5±0.04µs
+routing/static        1.00   2.0±0.05µs       1.01   2.02±0.05µs
