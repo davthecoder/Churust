@@ -1119,9 +1119,9 @@ impl App {
     /// | | requests/second | p99 latency |
     /// |---|---:|---:|
     /// | [`start`](App::start) (shared runtime) | 390,772 | **444 µs** |
-    /// | `run_sharded` | **699,200** | 1.12 ms |
+    /// | `run_sharded` | **699,786** | 603 µs |
     ///
-    /// **1.79× the throughput for 2.5× the tail latency.** With per-connection
+    /// **1.79× the throughput, for some tail latency.** With per-connection
     /// affinity, a request that lands on a busy worker waits for that worker
     /// instead of being picked up by an idle one, and the slowest percentile is
     /// where that shows up.

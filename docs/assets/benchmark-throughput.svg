@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 364" width="900" height="364" role="img" aria-labelledby="tp-t tp-d">
 <title id="tp-t">Requests per second by framework, ordinary keep-alive HTTP/1.1</title>
-<desc id="tp-d">Churust 699k, actix-web 675k, axum 458k, Ktor 308k, Go net/http 307k requests per second. Higher is better.</desc>
+<desc id="tp-d">Churust 700k, actix-web 629k, axum 463k, Go net/http 303k, Ktor 299k requests per second. Higher is better.</desc>
 <style>
 text{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;}
 .s{fill:#fcfcfb}.ink{fill:#0b0b0b}.ink2{fill:#52514e}.mut{fill:#898781}.acc{fill:#2a78d6}.peer{fill:#898781}.s2{fill:#eb6834}.grid{stroke:#e1e0d9}.axis{stroke:#c3c2b7}.acc-s{stroke:#2a78d6}.s2-s{stroke:#eb6834}.ring{stroke:#fcfcfb}

@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 392" width="900" height="392" role="img" aria-labelledby="ba-t ba-d">
 <title id="ba-t">Churust throughput before and after this work</title>
-<desc id="ba-d">Churust went from 391 thousand to 699 thousand requests per second on keep-alive load, a 1.79 times change, while its 99th-percentile latency went from 444 microseconds to 1.12 milliseconds.</desc>
+<desc id="ba-d">Churust went from 391 thousand to 699 thousand requests per second on keep-alive load, a 1.79 times change, while its 99th-percentile latency went from 444 microseconds to 603 microseconds.</desc>
 <style>
 text{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;}
 .s{fill:#fcfcfb}.ink{fill:#0b0b0b}.ink2{fill:#52514e}.mut{fill:#898781}.acc{fill:#2a78d6}.peer{fill:#898781}.s2{fill:#eb6834}.grid{stroke:#e1e0d9}.axis{stroke:#c3c2b7}.acc-s{stroke:#2a78d6}.s2-s{stroke:#eb6834}.ring{stroke:#fcfcfb}
@@ -9,18 +9,18 @@ text{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;}
 <rect class="s" width="900" height="392" rx="10"/>
 <text class="ink" x="28" y="34" font-size="17" font-weight="600">Churust, before and after this work — 1.79× on keep-alive</text><text class="mut" x="28" y="55" font-size="12.5">Same kernel, same harness, same pinned cores · only the binary differs</text>
 <text class="ink2" x="154" y="114.5" font-size="13" text-anchor="end">Before</text>
-<path class="peer" d="M168,96 H461.32652173913044 A4,4 0 0 1 465.32652173913044,100 V120 A4,4 0 0 1 461.32652173913044,124 H168 Z"/>
-<text class="ink" x="475.3" y="114.5" font-size="14" font-weight="600">391k</text>
+<path class="peer" d="M168,96 H461.07754084820215 A4,4 0 0 1 465.07754084820215,100 V120 A4,4 0 0 1 461.07754084820215,124 H168 Z"/>
+<text class="ink" x="475.1" y="114.5" font-size="14" font-weight="600">391k</text>
 <text class="ink2" x="154" y="164.5" font-size="13" text-anchor="end">After</text>
 <path class="acc" d="M168,146 H696.0 A4,4 0 0 1 700.0,150 V170 A4,4 0 0 1 696.0,174 H168 Z"/>
-<text class="ink" x="710.0" y="164.5" font-size="14" font-weight="600">699k</text>
+<text class="ink" x="710.0" y="164.5" font-size="14" font-weight="600">700k</text>
 <text class="ink2" x="154" y="214" font-size="12" font-weight="600" text-anchor="end">What did it</text>
 <text class="mut" x="168" y="214" font-size="11.5">Removing per-request atomics from shared cache lines</text>
 <text class="mut" x="168" y="231" font-size="11.5">One runtime per core, connections pinned (App::run_sharded)</text>
 <text class="mut" x="168" y="248" font-size="11.5">Dropping the per-request extension-map allocation, and several others</text>
 <text class="mut" x="168" y="265" font-size="11.5">TCP_NODELAY on by default</text>
 <text class="mut" x="168" y="282" font-size="11.5"></text>
-<text class="mut" x="168" y="299" font-size="11.5">Bought with tail latency: p99 444us before, 1.12ms after — the affinity</text>
+<text class="mut" x="168" y="299" font-size="11.5">Bought with tail latency: p99 444us before, 603us after — the affinity</text>
 <text class="mut" x="168" y="316" font-size="11.5">trade, and why run_sharded is opt-in rather than the default.</text>
 <text class="mut" x="28" y="372" font-size="11">None of it in routing or extraction. Pipelined workloads gain far more; see the results.</text>
 </svg>

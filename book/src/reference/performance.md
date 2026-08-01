@@ -3,15 +3,15 @@
 Churust is fast, and this page is about being precise rather than loud: what was
 measured, against what, on what, and what the number does not cover.
 
-![Requests per second under keep-alive: Churust 699k, actix-web 675k, axum 458k, Ktor 308k, Go net/http 307k](https://raw.githubusercontent.com/davthecoder/Churust/main/docs/assets/benchmark-throughput.svg)
+![Requests per second under keep-alive: Churust 700k, actix-web 629k, axum 463k, Go net/http 303k, Ktor 299k](https://raw.githubusercontent.com/davthecoder/Churust/main/docs/assets/benchmark-throughput.svg)
 
 | framework | req/s | vs. Churust | server CPU µs/req | p99 latency |
 |---|---:|---:|---:|---:|
-| **Churust** | **699,200** | — | 8.59 | 1.12 ms |
-| actix-web 4.14 | 675,053 | 0.97× | **7.34** | 412 µs |
-| axum 0.8 | 457,647 | 0.65× | 8.74 | **342 µs** |
-| Ktor 3.5 (Netty, JDK 21) | 307,924 | 0.44× | 19.79 | 1.95 ms |
-| Go 1.26 `net/http` | 306,546 | 0.44× | 13.19 | 2.55 ms |
+| **Churust** | **699,786** | — | 8.37 | 603 µs |
+| actix-web 4.14 | 628,973 | 0.90× | **7.44** | 1.10 ms |
+| axum 0.8 | 463,230 | 0.66× | 8.70 | **333 µs** |
+| Go 1.26 `net/http` | 302,970 | 0.43× | 13.04 | 2.46 ms |
+| Ktor 3.5 (Netty, JDK 21) | 299,109 | 0.43× | 19.95 | 1.88 ms |
 
 Linux 6.12, server pinned to eight CPUs and the load generator to four, 64
 keep-alive connections, one server running at a time, order rotated each round,
@@ -20,12 +20,15 @@ median of five. Three routes returning constants. Full method:
 
 ## Read this before quoting the table
 
-**Churust is first on throughput and third on latency.** For most services the
-second of those matters more. axum answers its slowest one-in-a-hundred request
-in 342 µs and actix-web in 412 µs, where Churust takes 1.12 ms; actix-web also
-spends 15% less CPU per request.
+**Churust is first on throughput, second on CPU per request, second on tail
+latency.** actix-web spends 11% less CPU per request; axum answers its slowest
+one-in-a-hundred request in 333 µs against Churust's 603 µs.
 
-![99th-percentile latency: axum 0.342ms, actix-web 0.412ms, Churust 1.12ms, Ktor 1.95ms, Go 2.55ms](https://raw.githubusercontent.com/davthecoder/Churust/main/docs/assets/benchmark-p99-latency.svg)
+Read the p99 column as approximate. It is much the noisiest measure here —
+actix-web produced 412 µs in one run and 1.10 ms in the next from identical
+code — while throughput and CPU per request repeat to within a few percent.
+
+![99th-percentile latency: axum 0.333ms, Churust 0.603ms, actix-web 1.10ms, Ktor 1.88ms, Go 2.46ms](https://raw.githubusercontent.com/davthecoder/Churust/main/docs/assets/benchmark-p99-latency.svg)
 
 **That tail is the price of `run_sharded`, and it is a choice you make.** The
 same code on the same cores, with and without connection pinning:
@@ -33,20 +36,20 @@ same code on the same cores, with and without connection pinning:
 | build | req/s | server CPU µs/req | p99 latency |
 |---|---:|---:|---:|
 | shared runtime (`App::start`, the default) | 390,772 | 12.94 | **444 µs** |
-| one runtime per core (`App::run_sharded`) | **699,200** | 8.59 | 1.12 ms |
+| one runtime per core (`App::run_sharded`) | **699,786** | 8.37 | 603 µs |
 
-1.79× the throughput for 2.5× the tail. Pinning a connection to one runtime for
+1.79× the throughput, for some tail latency. Pinning a connection to one runtime for
 its life means a request waits for *that* worker rather than being picked up by
 whichever is idle.
 
-**With pipelining the order changes.** actix-web reaches 5.80M requests a second
-against Churust's 4.16M — 1.40× — and does it on 1.14 µs of CPU per request
-against 1.76. That gap is not in Churust's own code: profiled in isolation, its
-whole dispatch layer costs 398 ns, so the other 1.36 µs is hyper and the kernel —
+**With pipelining the order changes.** actix-web reaches 5.34M requests a second
+against Churust's 3.84M — 1.39× — and does it on 1.14 µs of CPU per request
+against 1.79. That gap is not in Churust's own code: profiled in isolation, its
+whole dispatch layer costs 393 ns, so the other 1.40 µs is hyper and the kernel —
 already more than actix-web's entire per-request budget. Pipelining is not the shape most traffic has, which is why it is
 not the headline, but it is where Churust's dispatch path is furthest behind.
 
-![Pipelined throughput: actix-web 5.80M, Churust 4.16M, Ktor 1.19M, Go 377k, axum 25k](https://raw.githubusercontent.com/davthecoder/Churust/main/docs/assets/benchmark-pipelined.svg)
+![Pipelined throughput: actix-web 5.34M, Churust 3.84M, Ktor 1.15M, Go 356k, axum 25k](https://raw.githubusercontent.com/davthecoder/Churust/main/docs/assets/benchmark-pipelined.svg)
 
 axum's last place there is not about its routing — the keep-alive table shows
 that is fine. hyper answers each request in a pipelined batch with its own
@@ -87,8 +90,8 @@ Note there is no `#[churust::main]`: `run_sharded` builds and owns its runtimes,
 and wrapping it in another one leaves a multi-threaded runtime idling underneath
 the single-threaded ones doing the work.
 
-The trade is measured, not hypothetical: **1.79× the throughput, 2.5× the
-99th-percentile latency** (444 µs → 1.12 ms on the comparison harness). With
+The trade is measured, not hypothetical: **1.79× the throughput** for some tail
+latency (444 µs → 603 µs on the comparison harness). With
 per-connection affinity a worker whose connections are busy cannot borrow an
 idle worker's core, so a request that lands on a busy worker waits.
 
@@ -121,7 +124,7 @@ coalescing without giving up the latency guarantee.
 
 ## Where the speed-up came from
 
-![Churust before and after: 391k to 699k requests per second](https://raw.githubusercontent.com/davthecoder/Churust/main/docs/assets/benchmark-before-after.svg)
+![Churust before and after: 391k to 700k requests per second](https://raw.githubusercontent.com/davthecoder/Churust/main/docs/assets/benchmark-before-after.svg)
 
 None of it was in routing or extraction, which is where a profiler points first:
 

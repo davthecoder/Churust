@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 378" width="900" height="378" role="img" aria-labelledby="pl-t pl-d">
 <title id="pl-t">Requests per second with HTTP/1.1 pipelining at depth 16</title>
-<desc id="pl-d">actix-web 5.80M, Churust 4.16M, Ktor 1.19M, Go net/http 377k, axum 25k requests per second. actix-web leads this mode.</desc>
+<desc id="pl-d">actix-web 5.34M, Churust 3.84M, Ktor 1.15M, Go net/http 356k, axum 25k requests per second. actix-web leads this mode.</desc>
 <style>
 text{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;}
 .s{fill:#fcfcfb}.ink{fill:#0b0b0b}.ink2{fill:#52514e}.mut{fill:#898781}.acc{fill:#2a78d6}.peer{fill:#898781}.s2{fill:#eb6834}.grid{stroke:#e1e0d9}.axis{stroke:#c3c2b7}.acc-s{stroke:#2a78d6}.s2-s{stroke:#eb6834}.ring{stroke:#fcfcfb}
@@ -8,25 +8,25 @@ text{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;}
 </style>
 <rect class="s" width="900" height="378" rx="10"/>
 <text class="ink" x="28" y="34" font-size="17" font-weight="600">With pipelining, actix-web leads — Churust is second</text><text class="mut" x="28" y="55" font-size="12.5">Requests per second at pipeline depth 16 · a client shape most traffic is not</text>
-<line class="grid" x1="351.3" y1="84" x2="351.3" y2="296" stroke-width="1"/>
-<text class="mut" x="351.3" y="78" font-size="10.5" text-anchor="middle">2M</text>
-<line class="grid" x1="534.7" y1="84" x2="534.7" y2="296" stroke-width="1"/>
-<text class="mut" x="534.7" y="78" font-size="10.5" text-anchor="middle">4M</text>
+<line class="grid" x1="367.2" y1="84" x2="367.2" y2="296" stroke-width="1"/>
+<text class="mut" x="367.2" y="78" font-size="10.5" text-anchor="middle">2M</text>
+<line class="grid" x1="566.4" y1="84" x2="566.4" y2="296" stroke-width="1"/>
+<text class="mut" x="566.4" y="78" font-size="10.5" text-anchor="middle">4M</text>
 <text class="ink2" x="154" y="108.5" font-size="13" font-weight="400" text-anchor="end">actix-web</text>
 <path class="peer" d="M168,92 H696.0 A4,4 0 0 1 700.0,96 V112 A4,4 0 0 1 696.0,116 H168 Z"/>
-<text class="ink2" x="710.0" y="108.5" font-size="13" font-weight="400">5.80M</text>
+<text class="ink2" x="710.0" y="108.5" font-size="13" font-weight="400">5.34M</text>
 <text class="ink" x="154" y="152.5" font-size="13" font-weight="600" text-anchor="end">Churust</text>
-<path class="acc" d="M168,136 H545.0438627871439 A4,4 0 0 1 549.0438627871439,140 V156 A4,4 0 0 1 545.0438627871439,160 H168 Z"/>
-<text class="ink" x="559.0" y="152.5" font-size="13" font-weight="600">4.16M</text>
+<path class="acc" d="M168,136 H546.5004960789174 A4,4 0 0 1 550.5004960789174,140 V156 A4,4 0 0 1 546.5004960789174,160 H168 Z"/>
+<text class="ink" x="560.5" y="152.5" font-size="13" font-weight="600">3.84M</text>
 <text class="ink2" x="154" y="196.5" font-size="13" font-weight="400" text-anchor="end">Ktor (Netty)</text>
-<path class="peer" d="M168,180 H273.0645341836246 A4,4 0 0 1 277.0645341836246,184 V200 A4,4 0 0 1 273.0645341836246,204 H168 Z"/>
-<text class="ink2" x="287.1" y="196.5" font-size="13" font-weight="400">1.19M</text>
+<path class="peer" d="M168,180 H278.5326936598494 A4,4 0 0 1 282.5326936598494,184 V200 A4,4 0 0 1 278.5326936598494,204 H168 Z"/>
+<text class="ink2" x="292.5" y="196.5" font-size="13" font-weight="400">1.15M</text>
 <text class="ink2" x="154" y="240.5" font-size="13" font-weight="400" text-anchor="end">Go net/http</text>
-<path class="peer" d="M168,224 H198.5182833987112 A4,4 0 0 1 202.5182833987112,228 V244 A4,4 0 0 1 198.5182833987112,248 H168 Z"/>
-<text class="ink2" x="212.5" y="240.5" font-size="13" font-weight="400">377k</text>
+<path class="peer" d="M168,224 H199.49483740966684 A4,4 0 0 1 203.49483740966684,228 V244 A4,4 0 0 1 199.49483740966684,248 H168 Z"/>
+<text class="ink2" x="213.5" y="240.5" font-size="13" font-weight="400">356k</text>
 <text class="ink2" x="154" y="284.5" font-size="13" font-weight="400" text-anchor="end">axum</text>
-<path class="peer" d="M168,268 h2.261316366107735 v24 h-2.261316366107735 Z"/>
-<text class="ink2" x="180.3" y="284.5" font-size="13" font-weight="400">25k</text>
+<path class="peer" d="M168,268 h2.444640213617191 v24 h-2.444640213617191 Z"/>
+<text class="ink2" x="180.4" y="284.5" font-size="13" font-weight="400">25k</text>
 <line class="axis" x1="168" y1="84" x2="168" y2="296" stroke-width="1"/>
 <text class="mut" x="28" y="342" font-size="11">axum is last because it cannot aggregate pipelined writes — axum::serve exposes no way</text>
 <text class="mut" x="28" y="358" font-size="11">to ask for it — so a batch of 16 costs it 16 write syscalls.</text>

@@ -191,29 +191,31 @@ refuses to measure at all unless every app returns the same bytes.
 
 | framework | req/s | vs. Churust | server CPU µs/req | p99 latency |
 |---|---:|---:|---:|---:|
-| **Churust** | **699,200** | — | 8.59 | 1.12 ms |
-| actix-web 4.14 | 675,053 | 0.97× | **7.34** | 412 µs |
-| axum 0.8 | 457,647 | 0.65× | 8.74 | **342 µs** |
-| Ktor 3.5 (Netty) | 307,924 | 0.44× | 19.79 | 1.95 ms |
-| Go 1.26 `net/http` | 306,546 | 0.44× | 13.19 | 2.55 ms |
+| **Churust** | **699,786** | — | 8.37 | 603 µs |
+| actix-web 4.14 | 628,973 | 0.90× | **7.44** | 1.10 ms |
+| axum 0.8 | 463,230 | 0.66× | 8.70 | **333 µs** |
+| Go 1.26 `net/http` | 302,970 | 0.43× | 13.04 | 2.46 ms |
+| Ktor 3.5 (Netty) | 299,109 | 0.43× | 19.95 | 1.88 ms |
 
-**Churust is first on throughput** for this shape of load — 1.04× actix-web,
-1.53× axum, 2.27× Ktor, 2.28× Go — and **third on tail latency**, which for most
-services is the number that matters more. Four things a reader deserves before
-quoting any of it:
+**Churust is first on throughput** for this shape of load — 1.11× actix-web,
+1.51× axum, 2.31× Go, 2.34× Ktor — and second on both CPU per request and tail
+latency. Four things a reader deserves before quoting any of it:
 
-- **axum and actix-web answer their slowest one-in-a-hundred request in 342 µs
-  and 412 µs where Churust takes 1.12 ms**, and actix-web does it on 15% less CPU
-  per request. If the 99th percentile is a user-visible number for you, that
-  column is the one to read.
-- **The tail is the price of `App::run_sharded`,** not an accident. Pinning a
-  connection to one runtime for its life is worth 1.79× the throughput and costs
-  2.5× the p99 — measured, [both rows](benchmarks/results/2026-08-01-linux-docker.md).
+- **actix-web spends 11% less CPU per request**, and axum answers its slowest
+  one-in-a-hundred request in 333 µs against Churust's 603 µs. Churust does not
+  lead either column.
+- **Treat the p99 column as approximate.** It is the noisiest measure here:
+  actix-web measured 412 µs in one run and 1.10 ms in the next, on identical
+  code. Throughput and CPU per request repeat to within a few percent; tail
+  latency does not.
+- **`App::run_sharded` is what buys the throughput.** Pinning a connection to one
+  runtime for its life is worth 1.79× against the shared runtime, and costs some
+  tail latency for it — 444 µs against 603 µs — measured, [both rows](benchmarks/results/2026-08-01-linux-docker.md).
   That is exactly why it is opt-in and the shared work-stealing runtime is still
   the default.
-- **With HTTP/1.1 pipelining the order changes:** actix-web 5.80M against
-  Churust's 4.16M. That gap is not in Churust's own code — its whole dispatch
-  layer costs 398 ns of the 1.76 µs a pipelined request spends — it is in the
+- **With HTTP/1.1 pipelining the order changes:** actix-web 5.34M against
+  Churust's 3.84M. That gap is not in Churust's own code — its whole dispatch
+  layer costs 393 ns of the 1.79 µs a pipelined request spends — it is in the
   HTTP/1 implementation underneath, and closing it would mean not using hyper.
 - **Every route returns a constant.** This is dispatch overhead. It says nothing
   about an application that talks to a database.

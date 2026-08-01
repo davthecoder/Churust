@@ -20,20 +20,27 @@ there reports **691k** here. Nothing about Churust changed; the kernel did.
 
 | framework | req/s | vs. Churust | server CPU µs/req | p99 latency | spread across 5 rounds |
 |---|---:|---:|---:|---:|---|
-| **churust** | **699,200** | — | 8.59 | 1.12 ms | 398,596–727,948 |
-| actix-web | 675,053 | 0.97× | **7.34** | 412 µs | 380,122–680,507 |
-| axum | 457,647 | 0.65× | 8.74 | **342 µs** | 339,400–466,992 |
-| ktor | 307,924 | 0.44× | 19.79 | 1.95 ms | 270,857–314,216 |
-| go | 306,546 | 0.44× | 13.19 | 2.55 ms | 300,400–312,912 |
+| **churust** | **699,786** | — | 8.37 | 603 µs | 683,174–736,435 |
+| actix-web | 628,973 | 0.90× | **7.44** | 1.10 ms | 619,916–653,841 |
+| axum | 463,230 | 0.66× | 8.70 | **333 µs** | 423,582–467,198 |
+| go | 302,970 | 0.43× | 13.04 | 2.46 ms | 295,862–309,241 |
+| ktor | 299,109 | 0.43× | 19.95 | 1.88 ms | 288,247–301,596 |
 
-**Churust is first on throughput**: 1.04× actix-web, 1.53× axum, 2.27× Ktor,
-2.28× Go's `net/http`. No round was flagged bad; each framework's low round is
-its first of the run, a cold start, which is what taking a median is for.
+**Churust is first on throughput**: 1.11× actix-web, 1.51× axum, 2.31× Go's
+`net/http`, 2.34× Ktor. No round was flagged bad.
 
-**And it is third on latency, which matters more for most services.** axum
-answers its 99th-percentile request in 342 µs and actix-web in 412 µs, where
-Churust takes 1.12 ms. A service that cares about the slowest one request in a
-hundred should read the latency column first and the throughput column second.
+**It is second on CPU per request and second on tail latency.** actix-web spends
+7.44 µs against Churust's 8.37; axum answers its 99th-percentile request in
+333 µs against Churust's 603 µs.
+
+**The p99 column is the least repeatable thing in this file, and should be read
+as approximate.** actix-web measured 412 µs in the previous run of this same
+harness and 1.10 ms in this one, from identical code on an idle machine.
+Throughput and CPU per request repeat to within a few percent across runs; tail
+latency does not, and a ranking built on it would flip between runs. The
+ordering above is reported because hiding a noisy measure is worse than
+labelling it, not because the gap between second and third place in it means
+anything.
 
 ## Pipelined, depth 16 — dispatch headroom
 
@@ -41,13 +48,13 @@ hundred should read the latency column first and the throughput column second.
 
 | framework | req/s | vs. best | server CPU µs/req |
 |---|---:|---:|---:|
-| actix-web | 5,803,188 | 1.00× | 1.14 |
-| churust | 4,156,521 | 0.72× | 1.76 |
-| ktor | 1,189,703 | 0.21× | 6.17 |
-| go | 376,534 | 0.06× | 9.65 |
-| axum | 24,667 | 0.004× | 6.70 |
+| actix-web | 5,341,892 | 1.00× | 1.14 |
+| churust | 3,840,745 | 0.72× | 1.79 |
+| ktor | 1,150,040 | 0.22× | 6.14 |
+| go | 356,409 | 0.07× | 9.93 |
+| axum | 24,547 | 0.005× | 6.22 |
 
-actix-web wins this mode by 1.40×, and its spread across rounds was under 4%.
+actix-web wins this mode by 1.39×.
 Pipelining is not what most traffic looks like; it is included because it
 removes the network from the measurement almost entirely and shows what the
 dispatch path can do.
@@ -61,14 +68,14 @@ serving API, not of axum's routing, which the keep-alive table shows is fine.
 
 ![Server CPU per request](../../docs/assets/benchmark-cpu-per-request.svg)
 
-Churust buys its throughput lead with more CPU than actix-web spends: 8.59 µs
-against 7.34, 17% more per request. Against the JVM and Go the gap runs the
-other way — Ktor spends 19.79 µs and Go 13.19.
+Churust buys its throughput lead with more CPU than actix-web spends: 8.37 µs
+against 7.44, 12% more per request. Against the JVM and Go the gap runs the
+other way — Ktor spends 19.95 µs and Go 13.04.
 
 **Where that CPU goes, measured rather than guessed.** Churust's own dispatch
 path — routing, extraction, the pipeline, response building, with the wire
-app's configuration — costs **398 ns per request** when driven in isolation with
-no socket and no hyper underneath it. The wire figure is 8.59 µs. So the
+app's configuration — costs a few hundred nanoseconds when driven in isolation with
+no socket and no hyper underneath it — **393 ns**. The wire figure is 8.37 µs. So the
 framework Churust actually is accounts for **4.6%** of what a request costs, and
 the other 95% is hyper and the kernel. Deleting Churust's layer entirely would
 close under a third of the gap to actix-web.
@@ -95,9 +102,9 @@ for Linux and substituted into the benchmark image.
 | build | req/s | server CPU µs/req | p99 latency |
 |---|---:|---:|---:|
 | before (`3daaddf`, shared runtime) | 390,772 | 12.94 | **444 µs** |
-| after (`App::run_sharded`) | **699,200** | 8.59 | 1.12 ms |
+| after (`App::run_sharded`) | **699,786** | 8.37 | 603 µs |
 
-**1.79× the throughput for 2.5× the tail latency.** That is the trade
+**1.79× the throughput, for some tail latency.** That is the trade
 `run_sharded` makes, stated as a measurement rather than as a caveat: pinning a
 connection to one runtime for its life means a request waits for *that* worker
 instead of being picked up by whichever is idle. It is why `run_sharded` is
@@ -111,6 +118,17 @@ Anything where the slowest percentile is a user-visible number: `start`.
 The earlier macOS file quoted 8.8×. That figure was for *pipelined* load, where
 `pipeline_flush` alone is worth 4.1×; it was never the keep-alive number and
 should not be read as one.
+
+## What changed after the first Linux run
+
+The sharded engine originally accepted on one thread and handed each socket to a
+worker over a channel, because `SO_REUSEPORT` does not distribute on macOS. On
+Linux it does, and the handoff was pure overhead — a channel per connection, a
+socket re-registered with a second runtime, and an acceptor thread competing for
+the workers' cores. Each worker now owns a `SO_REUSEPORT` listener and runs the
+same accept loop the shared engine uses. Server CPU went 8.59 µs → 8.37 µs and
+p99 1.12 ms → 603 µs; throughput was unchanged within noise, which is the
+expected shape for a per-connection cost measured over long-lived connections.
 
 ## What was tried and did not work
 
