@@ -57,8 +57,15 @@ LOAD_PID=$!
 # kernel frames here, and a flat profile alone cannot say *who* called the
 # expensive function. Use fp to find the cost, dwarf to find the caller.
 CALLGRAPH=${CALLGRAPH:-fp}
+# `cycles:u` counts only user-space cycles. It is what makes the call graph
+# resolvable: with kernel samples included, most stacks begin in kernel frames
+# that frame-pointer unwinding cannot walk, and every user-space caller behind
+# them is lost. Restricting the event keeps each sample inside the frames the
+# binary actually has pointers for. Use the default `cycles` for the flat
+# profile, where the kernel share is itself the interesting part.
+EVENT=${EVENT:-cycles}
 [ "$CALLGRAPH" = dwarf ] && CG=dwarf,16384 || CG=fp
-perf record -F "$FREQ" -g --call-graph "$CG" -p "$SERVER_PID" -o /tmp/perf.data \
+perf record -F "$FREQ" -e "$EVENT" -g --call-graph "$CG" -p "$SERVER_PID" -o /tmp/perf.data \
   -- sleep "$((DURATION - 2))" >/dev/null 2>&1 || true
 wait "$LOAD_PID" 2>/dev/null || true
 

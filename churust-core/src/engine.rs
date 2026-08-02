@@ -2397,6 +2397,20 @@ async fn respond(
     let res = if timeout_ms == 0 {
         process.await
     } else {
+        // Pinned in place before the timeout wraps it, so what gets moved into
+        // `Timeout` is a `Pin<&mut _>` rather than the future itself.
+        //
+        // `process` is the whole request: the pipeline, the handler, and the
+        // `Call` threaded through both. It measures **2,616 bytes** for the
+        // benchmark app, and `tokio::time::timeout` takes its future by value —
+        // so every request memcpy'd 2.6KB to put it inside the wrapper. That
+        // showed up as `__memcpy_generic` at 20% of user-space cycles under
+        // `benchmarks/profile.sh`, the largest single cost in the server, with
+        // the biggest share attributed to this function.
+        //
+        // `Pin<&mut F>` is a `Future` when `F` is, so the wrapper is handed
+        // sixteen bytes and the future stays where it was already built.
+        let process = std::pin::pin!(process);
         match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), process).await {
             Ok(res) => res,
             Err(_) => crate::response::Response::text("Request Timeout")

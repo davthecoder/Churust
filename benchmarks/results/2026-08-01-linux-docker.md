@@ -120,14 +120,39 @@ nothing here had ever tested the assumption:
 
 | keep-alive, 4 workers, 9 rounds | req/s | server CPU µs/req | p99 | spread |
 |---|---:|---:|---:|---|
-| actix-web | 915,006 | 4.20 | 103 µs | 892,190–918,238 |
-| **bare hyper (the floor)** | 904,655 | **4.06** | 106 µs | 881,492–927,754 |
-| Churust | 781,872 | 5.10 | 139 µs | 680,850–791,152 |
+| actix-web | 902,907 | 4.20 | 111 µs | 888,549–923,627 |
+| **bare hyper (the floor)** | 902,481 | **4.07** | 110 µs | 887,031–920,204 |
+| Churust | 814,690 | 4.87 | 131 µs | 798,035–845,139 |
 
 hyper serves a request for *less* CPU than actix-http does. It was never the
-thing costing Churust the gap. Churust's layer costs **1.04 µs per request** over
+thing costing Churust the gap. Churust's layer costs **0.80 µs per request** over
 the hyper it runs on, and that accounts for essentially all of the distance to
 actix-web.
+
+**What the profile bought, in one line of code.** With `perf` restricted to
+user-space cycles — `cycles:u`, without which every stack begins in a kernel
+frame that frame-pointer unwinding cannot walk, and the call graph comes back
+empty — `__memcpy_generic` was 20.4% of Churust's user cycles, over half of it
+attributed to the engine's own service closure. The cause was
+`tokio::time::timeout`, which takes its future **by value**: that future is the
+whole request, and it measures **2,616 bytes**. Every request copied all of it
+into the wrapper. `std::pin::pin!` before the call hands over a `Pin<&mut _>`
+instead:
+
+| | before | after |
+|---|---:|---:|
+| `__memcpy_generic`, share of user cycles | 20.37% | 14.07% |
+| server CPU µs/req | 5.10 | 4.87 |
+| p99 | 139 µs | 131 µs |
+| req/s (median of 9) | 781,872 | 814,690 |
+| spread | 680,850–791,152 | 798,035–845,139 |
+
+The two spreads do not overlap — the confirming run's worst round beat the old
+best one — and a second nine-round run reproduced the median to within 0.3%.
+
+The same fix applied one layer down, to the `catch_unwind` in
+`App::process_call`, which also takes its future by value. It measured 14.07%
+against 14.15%: nothing. The compiler already elides that move. Reverted.
 
 The 393 ns measurement was not wrong; it was answering a narrower question than
 it was quoted for. It drives the router and pipeline directly, so it never runs

@@ -72,13 +72,22 @@ same one-runtime-per-core shape — and hyper is not the bottleneck:
 
 | keep-alive, 4 workers | req/s | server CPU µs/req | p99 |
 |---|---:|---:|---:|
-| actix-web | 915,006 | 4.20 | 103 µs |
-| **bare hyper (the floor)** | 904,655 | **4.06** | 106 µs |
-| Churust | 781,872 | 5.10 | 139 µs |
+| actix-web | 902,907 | 4.20 | 111 µs |
+| **bare hyper (the floor)** | 902,481 | **4.07** | 110 µs |
+| Churust | 814,690 | 4.87 | 131 µs |
 
-hyper answers a request for *less* CPU than actix-web does. Churust's own layer
-costs **1.04 µs per request** on top of the hyper it runs on, and that is the
-whole of the distance to actix-web.
+hyper answers a request for *less* CPU than actix-web does, so it was never what
+the gap was made of. Churust's own layer costs **0.80 µs per request** on top of
+the hyper it runs on, and that is the whole of the distance to actix-web.
+
+**The first 0.22 µs of that came back from one line.** `tokio::time::timeout`
+takes its future by value, and the future it was being handed is the entire
+request — the pipeline, the handler, and the `Call` threaded through both, 2,616
+bytes of it. Every request memcpy'd all of that into the timeout wrapper.
+Pinning it first (`std::pin::pin!`) hands over a `Pin<&mut _>` instead, and the
+future stays where it was already built. Churust went from 5.10 to 4.87 µs per
+request and 781,872 to 814,690 req/s, with the confirming run's slowest round
+faster than the old best one.
 
 The 393 ns figure is not wrong, it is just not the whole layer: it measures
 routing, extraction and the pipeline driven directly, which skips everything the
