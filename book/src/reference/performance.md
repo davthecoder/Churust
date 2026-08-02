@@ -59,10 +59,35 @@ whichever is idle.
 
 **With pipelining the order changes.** actix-web reaches 5.96M requests a second
 against Churust's 4.45M — 1.34× — and does it on 1.14 µs of CPU per request
-against 1.70. That gap is not in Churust's own code: profiled in isolation, its
-whole dispatch layer costs 393 ns, so the other 1.31 µs is hyper and the kernel —
-already more than actix-web's entire per-request budget. Pipelining is not the shape most traffic has, which is why it is
+against 1.70. Pipelining is not the shape most traffic has, which is why it is
 not the headline, but it is where Churust's dispatch path is furthest behind.
+
+**That gap is Churust's own, and it took a floor to find out.** This page used
+to say the difference was hyper's HTTP/1 implementation against actix-http's,
+reasoning that Churust's dispatch layer measures 393 ns in isolation so the
+remainder had to belong to the stack underneath. That was arithmetic, not a
+measurement, and it was wrong. `benchmarks/bench-hyper` now runs the comparison
+against hyper and tokio with no framework on top — same routes, same responses,
+same one-runtime-per-core shape — and hyper is not the bottleneck:
+
+| keep-alive, 4 workers | req/s | server CPU µs/req | p99 |
+|---|---:|---:|---:|
+| actix-web | 915,006 | 4.20 | 103 µs |
+| **bare hyper (the floor)** | 904,655 | **4.06** | 106 µs |
+| Churust | 781,872 | 5.10 | 139 µs |
+
+hyper answers a request for *less* CPU than actix-web does. Churust's own layer
+costs **1.04 µs per request** on top of the hyper it runs on, and that is the
+whole of the distance to actix-web.
+
+The 393 ns figure is not wrong, it is just not the whole layer: it measures
+routing, extraction and the pipeline driven directly, which skips everything the
+engine does per request — moving a 320-byte `Call` into a boxed future, the
+per-request allocations around it, and the connection loop. Profiling the real
+server (`benchmarks/profile.sh`) puts `__memcpy_generic` at 7.4% of samples and
+the malloc/free family at another 2.7%, neither of which appears in the floor's
+profile at all. That is the cost of dynamic dispatch, and it is the honest place
+to look for the next win — not the codec.
 
 ![Pipelined throughput: actix-web 5.96M, Churust 4.45M, Ktor 1.23M, Go 352k, axum 24k](https://raw.githubusercontent.com/davthecoder/Churust/main/docs/assets/benchmark-pipelined.svg)
 

@@ -1,0 +1,59 @@
+# Where does Churust's time actually go?
+#
+# The comparison image answers "how fast", one number per framework. It cannot
+# answer "why", and the difference matters: every previous attempt to explain a
+# gap here was made by subtraction — measure two things, attribute the residue
+# to whatever was left over — and the bare-hyper floor showed that reasoning had
+# been wrong for months. hyper was blamed for a cost that turned out to be
+# Churust's own.
+#
+# This image samples the running server instead of arguing about it. Same apps,
+# same load, built with debug info so the symbols have names.
+#
+#   docker build -f benchmarks/Dockerfile.perf -t churust-perf .
+#   docker run --rm --privileged -e APP=churust churust-perf
+#
+# `--privileged` is not optional: `perf_event_open` is blocked in a default
+# container. Nothing here is a measurement of throughput — profiling changes the
+# thing being profiled — so read it for shape, and confirm anything it suggests
+# with the real harness.
+
+FROM rust:1-bookworm AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
+COPY churust-core churust-core
+COPY churust churust
+COPY churust-macros churust-macros
+COPY churust-json churust-json
+COPY churust-logging churust-logging
+COPY churust-cors churust-cors
+COPY churust-auth churust-auth
+COPY churust-ratelimit churust-ratelimit
+COPY churust-compression churust-compression
+COPY churust-templates churust-templates
+COPY churust-redis churust-redis
+COPY churust-client churust-client
+COPY churust-openapi churust-openapi
+COPY churust-lab churust-lab
+COPY examples examples
+COPY benchmarks/bench-churust benchmarks/bench-churust
+COPY benchmarks/bench-hyper benchmarks/bench-hyper
+# `-g` adds line tables and leaves codegen alone, so the profiled binary is the
+# optimised one. `force-frame-pointers` is what makes the call graph resolvable:
+# without it `perf -g` on an LTO release build unwinds into noise, and a profile
+# whose stacks are wrong is worse than no profile because it still looks like an
+# answer.
+ENV RUSTFLAGS="-g -C force-frame-pointers=yes"
+RUN cargo build --release --manifest-path benchmarks/bench-churust/Cargo.toml \
+ && cargo build --release --manifest-path benchmarks/bench-hyper/Cargo.toml
+
+FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl python3 procps linux-perf libc6-dbg \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=build /src/benchmarks/bench-churust/target/release/bench-churust /apps/
+COPY --from=build /src/benchmarks/bench-hyper/target/release/bench-hyper /apps/
+COPY --from=churust-bench /usr/local/bin/wrk /usr/local/bin/wrk
+COPY benchmarks/profile.sh /bench/
+WORKDIR /bench
+ENTRYPOINT ["/bin/bash", "/bench/profile.sh"]

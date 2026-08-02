@@ -105,18 +105,54 @@ Churust buys its throughput lead with more CPU than actix-web spends: 8.39 µs
 against 7.91, 6% more per request. Against the JVM and Go the gap runs the
 other way — Ktor spends 20.03 µs and Go 12.88.
 
-**Where that CPU goes, measured rather than guessed.** Churust's own dispatch
-path — routing, extraction, the pipeline, response building, with the wire
-app's configuration — costs a few hundred nanoseconds when driven in isolation with
-no socket and no hyper underneath it — **393 ns**. The wire figure is 8.39 µs. So the
-framework Churust actually is accounts for **4.6%** of what a request costs, and
-the other 95% is hyper and the kernel. Deleting Churust's layer entirely would
-close under a third of the gap to actix-web.
+**Where that CPU goes — corrected by a later measurement.** Churust's own
+dispatch path — routing, extraction, the pipeline, response building, with the
+wire app's configuration — costs **393 ns** when driven in isolation with no
+socket and no hyper underneath it, against a wire figure of 8.39 µs. This
+section used to conclude from that pair that Churust's layer was 4.6% of a
+request and "the other 95% is hyper and the kernel", and that the residue was
+userspace work inside the two HTTP/1 implementations.
 
-Syscalls are not the difference either. Under identical load, `strace -c`
-counted 174,147 syscalls for Churust against 172,871 for actix-web, with the
-same shape — both batch about twelve requests per write. The gap is userspace
-work inside the two HTTP/1 implementations.
+That conclusion was reached by subtraction and it does not survive being
+measured. `benchmarks/bench-hyper` — hyper and tokio with no framework on top,
+same routes, same responses, same shape — was added afterwards precisely because
+nothing here had ever tested the assumption:
+
+| keep-alive, 4 workers, 9 rounds | req/s | server CPU µs/req | p99 | spread |
+|---|---:|---:|---:|---|
+| actix-web | 915,006 | 4.20 | 103 µs | 892,190–918,238 |
+| **bare hyper (the floor)** | 904,655 | **4.06** | 106 µs | 881,492–927,754 |
+| Churust | 781,872 | 5.10 | 139 µs | 680,850–791,152 |
+
+hyper serves a request for *less* CPU than actix-http does. It was never the
+thing costing Churust the gap. Churust's layer costs **1.04 µs per request** over
+the hyper it runs on, and that accounts for essentially all of the distance to
+actix-web.
+
+The 393 ns measurement was not wrong; it was answering a narrower question than
+it was quoted for. It drives the router and pipeline directly, so it never runs
+the engine path: a 320-byte `Call` moved into a boxed future per request, the
+allocations around it, and the connection loop. `benchmarks/profile.sh` on the
+real server puts `__memcpy_generic` at 7.4% of samples and malloc/free at
+another 2.7%, and neither appears in the floor's profile. That is what dynamic
+dispatch costs.
+
+Syscalls are not the difference. Under identical load, `strace -c` counted
+174,147 syscalls for Churust against 172,871 for actix-web, with the same shape
+— both batch about twelve requests per write.
+
+**A negative result worth recording:** the engine calls
+`http1().max_headers(cfg.max_headers)` with a default of 100, which is also
+hyper's own `DEFAULT_MAX_HEADERS`. Setting it routes hyper's per-request header
+scratch space through `smallvec!` instead of `smallvec_inline!`, which looked
+like it should cost ~6.4KB of writes per request. Skipping the call when the
+values agree measured **no change at all** (781,872 vs 775,771 req/s — inside the
+spread), because at exactly the inline capacity `SmallVec::from_elem` stays
+inline and the `MaybeUninit::uninit()` stores compile away. The change was
+reverted rather than kept as a coupling to a dependency's private constant for a
+gain that does not exist. The wire-level tests it prompted were kept:
+`churust-core/tests/header_limit.rs` asserts the enforced limit over a socket,
+which nothing did before.
 
 ## Tail latency
 
