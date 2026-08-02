@@ -103,14 +103,14 @@ Half of it is Churust's dispatch layer and half is the engine around it:
 | | ns/req |
 |---|---:|
 | Churust's overhead above the floor | ~790 |
-| dispatch — routing, extraction, pipeline | ~400 |
-| the engine — `respond`, `Call` construction, timeout, `EngineBody`, guards | ~390 |
+| dispatch — routing, extraction, pipeline (`wire_200`) | 385 |
+| the engine — `respond`, `Call` construction, timeout, `EngineBody`, guards | ~405 |
 
 (Two figures have been published for dispatch, 393 ns and 672 ns, and both are
-right about different applications. `benches/dispatch.rs` builds the *default*
-server, which installs the security-headers middleware — a layer measuring
-268–301 ns that `bench-churust` turns off. Measured in the wire configuration,
-dispatch is ~400 ns.)
+right about different applications. `benches/dispatch.rs` now measures both:
+`bare_200` builds the *default* server, which installs the security-headers
+middleware, and reads 688 ns; `wire_200` builds the shape `bench-churust`
+serves and reads **385 ns**, which is what the original 393 ns described.)
 
 **First place is not reachable by making dispatch faster.** Matching actix-web
 means shedding 790 − 120 = 670 ns, and the entire dispatch layer is ~400. A
