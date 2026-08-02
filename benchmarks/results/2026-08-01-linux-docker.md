@@ -150,9 +150,24 @@ instead:
 The two spreads do not overlap — the confirming run's worst round beat the old
 best one — and a second nine-round run reproduced the median to within 0.3%.
 
+A follow-up removed the *other* copy of the same future. `std::pin::pin!(x)`
+takes `x` by value, so pinning a future that already exists in a local still
+moves it once — the first fix removed the copy into `Timeout` and left the copy
+into the pin. Building the future directly in the pinned slot removes both.
+`__memcpy_generic` fell again, 14.07% to 12.55%, but **the end-to-end numbers
+did not move**: 816,986 req/s at 4.87 µs, against 814,690 at 4.87 before it.
+1.5% of user-space cycles is roughly 30 ns, which this harness cannot resolve.
+It is kept because it deletes a local and a line rather than adding either, not
+as a measured win, and it is not counted in any figure above.
+
 The same fix applied one layer down, to the `catch_unwind` in
 `App::process_call`, which also takes its future by value. It measured 14.07%
 against 14.15%: nothing. The compiler already elides that move. Reverted.
+
+**Three of the five things tried in this round measured nothing.** They are all
+written down — the `max_headers` skip, the `catch_unwind` pin, and the in-place
+pin's absent throughput effect — because a page that records only what worked
+makes the next person repeat the rest.
 
 The 393 ns measurement was not wrong; it was answering a narrower question than
 it was quoted for. It drives the router and pipeline directly, so it never runs

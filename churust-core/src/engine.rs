@@ -2383,7 +2383,7 @@ async fn respond(
                 max_message_bytes: ws_max_message_bytes,
             });
         }
-        app.process_call(build_call(), extensions)
+        std::pin::pin!(app.process_call(build_call(), extensions))
     };
     #[cfg(not(feature = "ws"))]
     let process = {
@@ -2391,26 +2391,26 @@ async fn respond(
         // nothing. The peer address rides on the `Call` itself; see
         // `Call::set_peer`.
         let extensions = http::Extensions::new();
-        app.process_call(build_call(), extensions)
+        std::pin::pin!(app.process_call(build_call(), extensions))
     };
 
+    // `process` is a `Pin<&mut _>`, not the future — and the future was built
+    // straight into the pinned slot above rather than moved into it.
+    //
+    // It is the whole request: the pipeline, the handler, and the `Call`
+    // threaded through both, awaited inline the whole way down because the
+    // pipeline deliberately does not box its terminal. That comes to **2,616
+    // bytes** for the benchmark app, and `tokio::time::timeout` takes its
+    // future *by value* — so every request used to memcpy all of it into the
+    // wrapper. `__memcpy_generic` was 20% of user-space cycles under
+    // `benchmarks/profile.sh`, most of it charged to this function.
+    //
+    // Pinning first fixed the copy into `Timeout`; building in place fixes the
+    // copy into the pin. `Pin<&mut F>` is a `Future` when `F` is, so both the
+    // timeout branch and the one below hand over sixteen bytes.
     let res = if timeout_ms == 0 {
         process.await
     } else {
-        // Pinned in place before the timeout wraps it, so what gets moved into
-        // `Timeout` is a `Pin<&mut _>` rather than the future itself.
-        //
-        // `process` is the whole request: the pipeline, the handler, and the
-        // `Call` threaded through both. It measures **2,616 bytes** for the
-        // benchmark app, and `tokio::time::timeout` takes its future by value —
-        // so every request memcpy'd 2.6KB to put it inside the wrapper. That
-        // showed up as `__memcpy_generic` at 20% of user-space cycles under
-        // `benchmarks/profile.sh`, the largest single cost in the server, with
-        // the biggest share attributed to this function.
-        //
-        // `Pin<&mut F>` is a `Future` when `F` is, so the wrapper is handed
-        // sixteen bytes and the future stays where it was already built.
-        let process = std::pin::pin!(process);
         match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), process).await {
             Ok(res) => res,
             Err(_) => crate::response::Response::text("Request Timeout")
