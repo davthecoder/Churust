@@ -3,51 +3,54 @@
 Churust is fast, and this page is about being precise rather than loud: what was
 measured, against what, on what, and what the number does not cover.
 
-![Requests per second under keep-alive: Churust 758k, actix-web 644k, axum 464k, Ktor 316k, Go net/http 315k](https://raw.githubusercontent.com/davthecoder/Churust/main/docs/assets/benchmark-throughput.svg)
-
-| framework | req/s | vs. Churust | server CPU µs/req | p99 latency |
+| keep-alive, 4 workers, median of 9 | req/s | vs. Churust | server CPU µs/req | p99 |
 |---|---:|---:|---:|---:|
-| **Churust** | **757,930** | — | 8.39 | 246 µs |
-| actix-web 4.14 | 644,067 | 0.85× | **7.91** | **240 µs** |
-| axum 0.8 | 464,042 | 0.61× | 8.82 | 292 µs |
-| Ktor 3.5 (Netty, JDK 21) | 315,978 | 0.42× | 20.03 | 1.72 ms |
-| Go 1.26 `net/http` | 315,160 | 0.42× | 12.88 | 2.49 ms |
+| actix-web 4.14 | **916,364** | 1.12× | **4.20** | **105 µs** |
+| *bare hyper — the floor, not a framework* | *895,073* | *1.10×* | *4.08* | *113 µs* |
+| **Churust** | 816,986 | — | 4.87 | 137 µs |
 
-Linux 6.12, server pinned to eight CPUs and the load generator to four, 64
-keep-alive connections, one server running at a time, order rotated each round,
-median of five. Three routes returning constants. Full method:
+Linux 6.12, server pinned to CPUs 0–7 and the load generator to 8–11, 64
+keep-alive connections, one server running at a time, order rotated each round.
+Three routes returning constants. Full method:
 [`benchmarks/README.md`](https://github.com/davthecoder/Churust/blob/main/benchmarks/README.md).
+
+**actix-web leads on all three columns.** Churust is not the fastest Rust web
+framework on this workload and this page will say so until it is.
+
+axum, Ktor and Go were measured on an earlier eight-worker configuration and
+have not been re-run against this harness; their figures live in
+`benchmarks/results/` rather than in this table, because quoting a number
+measured under one configuration beneath a table built under another is exactly
+how the corrections further down this page became necessary.
 
 ## Read this before quoting the table
 
-**That table compares two defaults, not two frameworks.** Both servers default
-to one worker per core, and on this machine that setting is near Churust's
-optimum and well away from actix-web's. Swept properly:
-
-| each at its own best (9 rounds) | req/s | CPU µs/req | p99 |
-|---|---:|---:|---:|
-| **actix-web**, 4 workers | **914,498** | **4.21** | **107 µs** |
-| Churust, 6 workers | 880,352 | 6.49 | 183 µs |
-
-**Tuned against tuned, actix-web leads throughput, CPU and tail latency.**
-Churust is within 4% on throughput and spends about half again as much CPU to
-get there. It remains comfortably ahead of axum, Ktor and Go on all three.
-
-Worker count is the largest single lever in this whole page — larger than any
-change made to Churust itself — and `run_sharded(0)`'s one-per-core default is a
-starting point rather than an answer.
+**Worker count moves these numbers more than most code changes do.** Both
+servers default to one worker per core; on this machine that default sits at
+different distances from each framework's optimum, so a default-vs-default table
+measures the defaults. Everything above is at four workers for every server.
+`run_sharded(0)` picks one per core, which is a starting point rather than an
+answer — sweep it for your hardware.
 
 Nine rounds because fewer is not enough. Three consecutive five-round runs of
 identical code put Churust 3.6% ahead, then 11% ahead, then 5.9% behind; the
-between-run spread on this machine is wider than most of what is being
-measured.
+between-run spread on this machine is wider than most of what is being measured.
+Read the ranges in `benchmarks/results/`, not just the medians.
 
-![99th-percentile latency: actix-web 0.240ms, Churust 0.246ms, axum 0.292ms, Ktor 1.72ms, Go 2.49ms](https://raw.githubusercontent.com/davthecoder/Churust/main/docs/assets/benchmark-p99-latency.svg)
+**A caveat on the throughput column specifically.** CPU/req × req/s gives cores
+consumed: bare hyper 3.65, actix-web 3.85, Churust 3.98, all on four workers.
+Churust's workers are saturated while the other two have headroom, which raises
+the possibility that their throughput is bounded by the four-thread load
+generator rather than by the server. The CPU-per-request figures are measured
+directly and do not depend on saturation, so they are the ones to trust; the
+throughput ordering may be partly an artifact of the harness.
 
-**That tail is the price of `run_sharded`, and it is a choice you make.** The
-same code on the same cores, with and without connection pinning:
+**Sharding is a choice you make, and it is a large one.** The same code on the
+same cores, with and without connection pinning — both figures from the earlier
+eight-worker run, kept because the *comparison* is the point and both sides were
+measured together:
 
-| build | req/s | server CPU µs/req | p99 latency |
+| build (8 workers, superseded run) | req/s | server CPU µs/req | p99 latency |
 |---|---:|---:|---:|
 | shared runtime (`App::start`, the default) | 390,772 | 12.94 | 444 µs |
 | one runtime per core (`App::run_sharded`) | **757,930** | 8.39 | **246 µs** |
@@ -89,36 +92,46 @@ future stays where it was already built. Churust went from 5.10 to 4.87 µs per
 request and 781,872 to 814,690 req/s, with the confirming run's slowest round
 faster than the old best one.
 
-**And the layer is bigger than this page used to say.** The 393 ns quoted here
-for Churust's isolated dispatch does not reproduce. Measured on the same Linux
-host as the wire figures above, pinned to the same CPUs, built with the same
-`lto = true, codegen-units = 1` the server ships with, `dispatch/bare_200` is
-**672 ns**. (It reads 817 ns under cargo's default bench profile, which is what
-the workspace used to use — benches now inherit the shipped build settings so
-the two numbers can be compared at all.)
+**Where the 0.79 µs goes, and what it would take to close it.**
 
-That closes the accounting almost exactly:
+Half of it is Churust's dispatch layer and half is the engine around it:
 
-| | µs/req |
+| | ns/req |
 |---|---:|
-| Churust, on the wire | 4.87 |
-| bare hyper, the floor | 4.08 |
-| **the difference** | **0.79** |
-| Churust's dispatch, in isolation | **0.67** |
+| Churust's overhead above the floor | ~790 |
+| dispatch — routing, extraction, pipeline | ~400 |
+| the engine — `respond`, `Call` construction, timeout, `EngineBody`, guards | ~390 |
 
-**85% of what Churust costs above bare hyper is its own dispatch layer** —
-routing, extraction and the pipeline, with no socket and no hyper anywhere near
-it. The remaining ~0.12 µs is the engine around it, and that is the part
-`__memcpy_generic` and the malloc/free family live in.
+(Two figures have been published for dispatch, 393 ns and 672 ns, and both are
+right about different applications. `benches/dispatch.rs` builds the *default*
+server, which installs the security-headers middleware — a layer measuring
+268–301 ns that `bench-churust` turns off. Measured in the wire configuration,
+dispatch is ~400 ns.)
 
-Which sets the price of first place honestly. actix-web's *entire* framework
-layer costs 4.20 − 4.08 = **0.12 µs** over a comparable floor. For Churust to
-match it, dispatch would have to fall from 672 ns to about 120 ns — 5.6× — and
-nothing in the profile is a 5.6× win. Getting there means changing how dispatch
-works, not tuning it: monomorphised routing instead of `Arc<dyn Handler>`,
-handlers borrowing the request instead of taking a 320-byte `Call` by value, and
-no boxed future per layer. That is a different framework's API, and Churust's
-is the one borrowed from Ktor on purpose.
+**First place is not reachable by making dispatch faster.** Matching actix-web
+means shedding 790 − 120 = 670 ns, and the entire dispatch layer is ~400. A
+dispatch layer that cost *nothing* would leave Churust at 4.47 µs against
+actix's 4.20.
+
+That is worth stating plainly because the obvious redesign was prototyped rather
+than assumed. Replacing `Arc<dyn Handler>` and the per-layer
+`Pin<Box<dyn Future>>` with monomorphised static dispatch measures **20 ns** —
+and it inlines every handler's state machine into the request future, working
+against the only change this session that measurably helped. actix-web pays more
+vtable dispatches and more allocations per request than Churust does and is
+still faster. Erasure is not where the money is.
+
+What is reachable without touching the public API is **60–110 ns** (~1.7%):
+dropping `#[async_trait]` from the extractor traits, and router work — FxHash,
+inline path segments, fusing the three separate scans over the path.
+
+And the largest single win does not show up on this page's charts at all,
+because it is disabled in the benchmark: the **default** configuration pays
+268–301 ns for security headers, and on the plaintext path applies them twice —
+once in the middleware, once in the transport — where the second pass reserves
+six header slots on a map that already holds them, forcing a grow and a rehash
+to discover there is nothing to do. Every real deployment pays that; no
+benchmark here measures it.
 
 ![Pipelined throughput: actix-web 5.96M, Churust 4.45M, Ktor 1.23M, Go 352k, axum 24k](https://raw.githubusercontent.com/davthecoder/Churust/main/docs/assets/benchmark-pipelined.svg)
 
