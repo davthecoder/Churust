@@ -48,12 +48,24 @@ async fn main() -> std::io::Result<()> {
         .parse()
         .expect("PORT must be a number");
 
+    // actix defaults to one worker per core, and so does Churust's
+    // `run_sharded(0)`. Both turn out to be off the optimum on this machine, so
+    // both are sweepable from the same environment variable — tuning one side
+    // and not the other would be the same unequal-work confound the harness
+    // exists to prevent.
+    let workers: usize = std::env::var("WORKERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
+
     HttpServer::new(|| {
         App::new()
             .route("/plaintext", web::get().to(plaintext))
             .route("/json", web::get().to(json))
             .route("/user/{id}", web::get().to(user))
     })
+    .workers(workers)
     .bind(("127.0.0.1", port))?
     .run()
     .await

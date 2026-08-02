@@ -24,6 +24,30 @@ use std::convert::Infallible;
 use std::future::Future;
 use std::net::SocketAddr;
 
+/// Refuse to serve a TLS-configured application that was built without the
+/// `tls` feature.
+///
+/// Before this check, that combination started successfully and served
+/// plaintext on the port the operator had configured a certificate for. Nothing
+/// said so: the build succeeded, the server came up, and requests were answered
+/// — in clear text, on a port every client and every runbook treated as HTTPS.
+///
+/// An error at startup is the only safe answer. A warning would be missed in
+/// exactly the deployments that most need it, and serving unencrypted traffic
+/// the configuration says is encrypted is worse than not serving at all.
+fn refuse_tls_without_the_feature(app: &App) -> std::io::Result<()> {
+    if cfg!(not(feature = "tls")) && app.config().tls.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "TLS is configured but this binary was built without the `tls` feature, \
+             so the listener would serve plaintext on a port configured for HTTPS. \
+             Enable the feature (`churust = { version = \"0.3\", features = [\"tls\"] }`) \
+             or remove the TLS configuration.",
+        ));
+    }
+    Ok(())
+}
+
 /// Serve `app` on `addr` until `shutdown` resolves (graceful drain).
 ///
 /// Uses HTTP/1.1 (`hyper::server::conn::http1::Builder`).  The plan
@@ -55,6 +79,7 @@ pub async fn serve<F>(app: App, addr: SocketAddr, shutdown: F) -> std::io::Resul
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    refuse_tls_without_the_feature(&app)?;
     let listener = bind_tcp(addr, app.config().backlog)?;
     let limits = std::sync::Arc::new(AcceptLimits::from(app.config()));
     serve_listener(app, listener, limits, shutdown).await
@@ -91,6 +116,7 @@ pub async fn serve_on<F>(
 where
     F: Future<Output = ()> + Send + 'static,
 {
+    refuse_tls_without_the_feature(&app)?;
     let limits = std::sync::Arc::new(AcceptLimits::from(app.config()));
     serve_listener(app, listener, limits, shutdown).await
 }
@@ -505,6 +531,21 @@ struct AcceptLimits {
 }
 
 impl AcceptLimits {
+    /// Like [`AcceptLimits::from`], but with the connection budget replaced.
+    ///
+    /// The sharded engine's `SO_REUSEPORT` path needs a *per-worker* budget:
+    /// every worker acquires a permit before it accepts, so several workers
+    /// drawing on one shared budget deadlock the moment the budget is smaller
+    /// than the number of workers — one worker holds the only permit while the
+    /// kernel hands the connection to another that is still waiting for one.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn with_connections(cfg: &crate::app::ServerConfig, connections: usize) -> Self {
+        let mut limits = Self::from(cfg);
+        limits.connections = (connections > 0)
+            .then(|| std::sync::Arc::new(tokio::sync::Semaphore::new(connections)));
+        limits
+    }
+
     fn from(cfg: &crate::app::ServerConfig) -> Self {
         // `0` means unlimited for every one of these, so a caller who does not
         // want a bound is not forced to invent a large number.
@@ -584,6 +625,12 @@ struct ConnActivity {
     /// Fixed reference point, so activity is a cheap integer rather than a
     /// mutex around an `Instant`.
     origin: tokio::time::Instant,
+    /// Whether anything ever waits on `request_finished`.
+    ///
+    /// Only the `keep_alive_ms == 0` branch of the connection loop does, and
+    /// that is off by default. Without this flag every completed request paid
+    /// an atomic read-modify-write to store a permit no one would ever consume.
+    notify_on_finish: bool,
     /// Signalled when a request finishes, for the `keep_alive_ms == 0` close.
     ///
     /// `notify_one` rather than `notify_waiters`, because the two are not
@@ -625,8 +672,12 @@ impl Drop for InFlight {
             .in_flight
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
         // After the decrement, so a loop woken by this observes the count it is
-        // about to act on rather than the one that was still standing.
-        self.0.request_finished.notify_one();
+        // about to act on rather than the one that was still standing. Skipped
+        // entirely when no branch of the connection loop is listening — see
+        // `notify_on_finish`.
+        if self.0.notify_on_finish {
+            self.0.request_finished.notify_one();
+        }
     }
 }
 
@@ -731,8 +782,9 @@ impl hyper::body::Body for EngineBody {
 }
 
 impl ConnActivity {
-    fn new() -> Self {
+    fn new(notify_on_finish: bool) -> Self {
         Self {
+            notify_on_finish,
             in_flight: std::sync::atomic::AtomicUsize::new(0),
             last_ms: std::sync::atomic::AtomicU64::new(0),
             served: std::sync::atomic::AtomicBool::new(false),
@@ -1007,20 +1059,150 @@ where
             "no addresses to bind",
         ));
     }
+    refuse_tls_without_the_feature(&app)?;
     let workers = workers.max(1);
 
+    let backlog = app.config().backlog;
+    // One budget for the process however the connections are distributed.
+    let limits = std::sync::Arc::new(AcceptLimits::from(app.config()));
+
+    // On Linux the kernel can do the distribution, so the workers each own a
+    // listener and run the ordinary accept loop — the same `serve_listener`
+    // the shared engine uses, with its TLS branch, its backoff and its drain,
+    // rather than a second implementation of all three.
+
+    // Linux distributes accepted connections across SO_REUSEPORT listeners in
+    // the kernel; nothing else here does. See `reuseport_listeners`.
+    //
+    // Except when the connection cap is too small to divide. Each worker
+    // acquires a permit before accepting, so a budget shared across listeners
+    // starves: one worker holds the permit, the kernel delivers the connection
+    // to another, and nobody serves it. Splitting the budget per worker fixes
+    // that and keeps the total bounded — but only while there is at least one
+    // permit each to split. Below that the central acceptor is the only shape
+    // that honours the number the operator configured, and honouring a
+    // denial-of-service bound outranks the throughput of a configuration
+    // nobody runs in production.
+    #[cfg(target_os = "linux")]
+    {
+        let cap = app.config().max_connections;
+        if cap == 0 || cap >= workers {
+            let per_worker = if cap == 0 { 0 } else { cap / workers };
+            let limits =
+                std::sync::Arc::new(AcceptLimits::with_connections(app.config(), per_worker));
+            serve_sharded_reuseport(app, addrs, workers, backlog, limits, shutdown)
+        } else {
+            serve_sharded_central(app, addrs, workers, backlog, limits, shutdown)
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(target_os = "linux"))]
+    {
+        serve_sharded_central(app, addrs, workers, backlog, limits, shutdown)
+    }
+}
+
+/// The Linux implementation: one `SO_REUSEPORT` listener per worker, each
+/// running the ordinary accept loop.
+#[cfg(target_os = "linux")]
+fn serve_sharded_reuseport<F>(
+    app: App,
+    addrs: Vec<SocketAddr>,
+    workers: usize,
+    backlog: u32,
+    limits: std::sync::Arc<AcceptLimits>,
+    shutdown: F,
+) -> std::io::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let (stop, _) = tokio::sync::broadcast::channel::<()>(1);
+    let mut handles = Vec::with_capacity(workers * addrs.len());
+
+    for addr in &addrs {
+        for listener in reuseport_listeners(*addr, backlog, workers)? {
+            let app = app.replica();
+            let limits = limits.clone();
+            let mut rx = stop.subscribe();
+            handles.push(
+                std::thread::Builder::new()
+                    .name(format!("churust-worker-{}", handles.len()))
+                    .spawn(move || {
+                        let rt = match tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                        {
+                            Ok(rt) => rt,
+                            Err(e) => {
+                                tracing::error!(error = %e, "worker runtime could not be built");
+                                return;
+                            }
+                        };
+                        rt.block_on(async move {
+                            let listener = match tokio::net::TcpListener::from_std(listener) {
+                                Ok(l) => l,
+                                Err(e) => {
+                                    tracing::error!(error = %e, "worker listener not adopted");
+                                    return;
+                                }
+                            };
+                            let _ = serve_listener(app, listener, limits, async move {
+                                let _ = rx.recv().await;
+                            })
+                            .await;
+                        });
+                    })?,
+            );
+        }
+    }
+
+    // A runtime just to await the caller's shutdown future and fan it out.
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(shutdown);
+    let _ = stop.send(());
+    for h in handles {
+        let _ = h.join();
+    }
+    Ok(())
+}
+
+/// Accept centrally and hand each socket to a worker.
+///
+/// The only shape off Linux, where `SO_REUSEPORT` does not distribute, and the
+/// shape on Linux too when the connection cap is smaller than the worker count
+/// — see `serve_sharded`.
+fn serve_sharded_central<F>(
+    app: App,
+    addrs: Vec<SocketAddr>,
+    workers: usize,
+    backlog: u32,
+    limits: std::sync::Arc<AcceptLimits>,
+    shutdown: F,
+) -> std::io::Result<()>
+where
+    F: Future<Output = ()> + Send + 'static,
+{
     // Bound before a single worker starts, for the reason `serve_many`
     // documents: a server that came up on half its addresses and said nothing
     // is worse than one that refused to start.
-    let backlog = app.config().backlog;
     let listeners = addrs
         .iter()
         .map(|addr| bind_tcp_std(*addr, backlog))
         .collect::<std::io::Result<Vec<_>>>()?;
-
     let conn_cfg = ConnSettings::from(app.config());
     let nodelay = app.config().tcp_nodelay;
     let shutdown_timeout_ms = app.config().shutdown_timeout_ms;
+
+    // A certificate that cannot be loaded must stop the server rather than be
+    // discovered per connection. Cloning a `TlsAcceptor` is an `Arc` clone, so
+    // each worker holding one costs nothing.
+    #[cfg(feature = "tls")]
+    let tls_acceptor = match &app.config().tls {
+        Some(t) => Some(acceptor_from_pem(&t.cert, &t.key)?),
+        None => None,
+    };
 
     // One handoff queue per worker. Unbounded because the thing that bounds
     // admission is the connection semaphore below, which is taken *before* the
@@ -1037,10 +1219,23 @@ where
         // allocation so the per-request refcount it touches is its own. See
         // `App::replica` for the measurement that made this worth doing.
         let app = app.replica();
+        #[cfg(feature = "tls")]
+        let acceptor = tls_acceptor.clone();
+        let limits = limits.clone();
         handles.push(
             std::thread::Builder::new()
                 .name(format!("churust-worker-{i}"))
-                .spawn(move || worker_loop(app, rx, conn_cfg, shutdown_timeout_ms))?,
+                .spawn(move || {
+                    worker_loop(
+                        app,
+                        rx,
+                        conn_cfg,
+                        shutdown_timeout_ms,
+                        limits,
+                        #[cfg(feature = "tls")]
+                        acceptor,
+                    )
+                })?,
         );
     }
 
@@ -1052,7 +1247,6 @@ where
         .build()?;
 
     accept_rt.block_on(async move {
-        let limits = std::sync::Arc::new(AcceptLimits::from(app.config()));
         let (stop, _) = tokio::sync::broadcast::channel::<()>(1);
         let mut loops = Vec::with_capacity(listeners.len());
         let senders = std::sync::Arc::new(senders);
@@ -1093,6 +1287,43 @@ where
         let _ = h.join();
     }
     Ok(())
+}
+
+/// One listener per worker, all bound to the same address with `SO_REUSEPORT`.
+///
+/// Linux distributes accepted connections across such listeners in the kernel,
+/// hashing by connection so each socket gets a share. That is strictly better
+/// than accepting centrally and handing sockets to workers: no channel, no
+/// re-registering the socket with a second runtime, and no acceptor thread
+/// competing with the workers for the cores they were pinned to.
+///
+/// Deliberately Linux-only. On macOS and the BSDs `SO_REUSEPORT` means only
+/// "several sockets may bind here" — the last bind takes essentially
+/// everything, and a twelve-worker build measured exactly what a one-worker
+/// build measured because eleven never received a connection. Those platforms
+/// keep the central acceptor, which behaves the same everywhere at the cost of
+/// the handoff.
+#[cfg(target_os = "linux")]
+fn reuseport_listeners(
+    addr: SocketAddr,
+    backlog: u32,
+    n: usize,
+) -> std::io::Result<Vec<std::net::TcpListener>> {
+    (0..n)
+        .map(|_| {
+            let domain = match addr {
+                SocketAddr::V4(_) => socket2::Domain::IPV4,
+                SocketAddr::V6(_) => socket2::Domain::IPV6,
+            };
+            let socket = socket2::Socket::new(domain, socket2::Type::STREAM, None)?;
+            socket.set_reuse_address(true)?;
+            socket.set_reuse_port(true)?;
+            socket.bind(&addr.into())?;
+            socket.listen(backlog.min(i32::MAX as u32) as i32)?;
+            socket.set_nonblocking(true)?;
+            Ok(socket.into())
+        })
+        .collect()
 }
 
 /// One accepted connection on its way to a worker.
@@ -1192,6 +1423,10 @@ fn worker_loop(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<Handoff>,
     cfg: ConnSettings,
     shutdown_timeout_ms: u64,
+    // Only the TLS build reads this: it carries the handshake budget, and
+    // without `tls` there are no handshakes to bound.
+    #[cfg_attr(not(feature = "tls"), allow(unused_variables))] limits: std::sync::Arc<AcceptLimits>,
+    #[cfg(feature = "tls")] tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
 ) {
     let rt = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1213,6 +1448,53 @@ fn worker_loop(
             }
             match tokio::net::TcpStream::from_std(std_stream) {
                 Ok(stream) => {
+                    // TLS terminates here, on the worker, rather than on the
+                    // acceptor: a handshake is expensive to answer and cheap to
+                    // ask for, so doing it on the single accept loop would let
+                    // one peer's slow ClientHello stall every other connection's
+                    // admission. The budget and the deadline are the shared
+                    // engine's, applied the same way — the deadline covers the
+                    // wait for the budget as well as the handshake, because what
+                    // is being bounded is how long an unproven peer may hold a
+                    // connection permit.
+                    #[cfg(feature = "tls")]
+                    if let Some(acceptor) = tls_acceptor.clone() {
+                        let app = app.clone();
+                        let token = drain.token();
+                        let handshakes = limits.handshakes.clone();
+                        let deadline = limits.tls_handshake_timeout;
+                        tokio::spawn(async move {
+                            let queue_and_shake = async {
+                                let permit = match &handshakes {
+                                    Some(sem) => sem.clone().acquire_owned().await.ok(),
+                                    None => None,
+                                };
+                                (acceptor.accept(stream).await, permit)
+                            };
+                            let (accepted, permit) = match deadline {
+                                Some(limit) => {
+                                    match tokio::time::timeout(limit, queue_and_shake).await {
+                                        Ok(pair) => pair,
+                                        Err(_) => {
+                                            tracing::debug!(%peer, "TLS handshake timed out");
+                                            return;
+                                        }
+                                    }
+                                }
+                                None => queue_and_shake.await,
+                            };
+                            match accepted {
+                                Ok(tls) => {
+                                    drop(permit);
+                                    serve_stream(app, tls, cfg, peer, token, slot).await;
+                                }
+                                Err(e) => {
+                                    tracing::debug!(%peer, error = %e, "TLS handshake failed")
+                                }
+                            }
+                        });
+                        continue;
+                    }
                     serve_stream(app.clone(), stream, cfg, peer, drain.token(), slot).await;
                 }
                 Err(e) => tracing::debug!(%peer, error = %e, "could not adopt handed-over socket"),
@@ -1239,6 +1521,7 @@ where
             "no addresses to bind",
         ));
     }
+    refuse_tls_without_the_feature(&app)?;
 
     // Bind everything first, so a failure is reported *before* any address
     // starts serving. Binding inside the spawned tasks meant a failure was not
@@ -1497,7 +1780,7 @@ async fn serve_stream<S>(
     // The idle watchdog needs to know when this connection last did anything.
     // hyper exposes no per-request hook, but the service *is* the per-request
     // hook: every request on this connection passes through the closure below.
-    let activity = std::sync::Arc::new(ConnActivity::new());
+    let activity = std::sync::Arc::new(ConnActivity::new(cfg.keep_alive_ms == 0));
     // Subscribe before the token is moved into the guard: the connection loop
     // watches the shutdown signal, the guard owns the drain's release side.
     let mut signal = token.signal.clone();
@@ -1630,6 +1913,18 @@ async fn serve_stream<S>(
         }));
         let mut idle = std::pin::pin!(idle);
 
+        // Built once, not once per iteration. `select!` re-evaluates its branch
+        // expressions every pass, and `wait_for` registers a waiter on the
+        // watch's notify list when polled and removes it when dropped — two
+        // mutex round-trips, paid on every connection wake, which at these
+        // request rates means paid per request. The signal fires at most once
+        // and the branch disables itself afterwards, so one future covers the
+        // connection's whole life.
+        let shutdown_signal = async move {
+            let _ = signal.wait_for(|fired| *fired).await;
+        };
+        let mut shutdown_signal = std::pin::pin!(shutdown_signal);
+
         // Parked until a shutdown signal arms it; see the signal branch below.
         let linger = tokio::time::sleep(std::time::Duration::from_secs(3_600));
         let mut linger = std::pin::pin!(linger);
@@ -1660,6 +1955,18 @@ async fn serve_stream<S>(
         let mut negotiation = std::pin::pin!(negotiation);
 
         loop {
+            // The negotiation deadline bounds how long a peer may take to
+            // *choose* a protocol. Once one is chosen the question is settled,
+            // but the branch below only disarmed itself when the timer fired —
+            // so for the remainder of `header_read_timeout_ms`, every wake on
+            // an already-negotiated connection polled a timer that could no
+            // longer do anything. At these request rates that is a poll per
+            // request. Reading the flag here settles it on the first wake after
+            // negotiation instead.
+            if negotiation_armed && negotiated.get() {
+                negotiation_armed = false;
+            }
+
             tokio::select! {
                 // Bias the connection: with both branches ready, finishing the
                 // request in hand beats re-checking a signal we have already
@@ -1667,8 +1974,9 @@ async fn serve_stream<S>(
                 biased;
                 _ = conn.as_mut() => break,
                 // `wait_for` rather than `changed` so a signal that fired
-                // before this task got scheduled is still seen.
-                _ = signal.wait_for(|fired| *fired), if !winding_down => {
+                // before this task got scheduled is still seen. Never polled
+                // again once it has fired: `winding_down` disables the branch.
+                _ = shutdown_signal.as_mut(), if !winding_down => {
                     winding_down = true;
                     // Finish the in-flight request, refuse further ones on this
                     // connection, then let the loop poll it to completion.
@@ -2075,7 +2383,7 @@ async fn respond(
                 max_message_bytes: ws_max_message_bytes,
             });
         }
-        app.process_call(build_call(), extensions)
+        std::pin::pin!(app.process_call(build_call(), extensions))
     };
     #[cfg(not(feature = "ws"))]
     let process = {
@@ -2083,9 +2391,23 @@ async fn respond(
         // nothing. The peer address rides on the `Call` itself; see
         // `Call::set_peer`.
         let extensions = http::Extensions::new();
-        app.process_call(build_call(), extensions)
+        std::pin::pin!(app.process_call(build_call(), extensions))
     };
 
+    // `process` is a `Pin<&mut _>`, not the future — and the future was built
+    // straight into the pinned slot above rather than moved into it.
+    //
+    // It is the whole request: the pipeline, the handler, and the `Call`
+    // threaded through both, awaited inline the whole way down because the
+    // pipeline deliberately does not box its terminal. That comes to **2,616
+    // bytes** for the benchmark app, and `tokio::time::timeout` takes its
+    // future *by value* — so every request used to memcpy all of it into the
+    // wrapper. `__memcpy_generic` was 20% of user-space cycles under
+    // `benchmarks/profile.sh`, most of it charged to this function.
+    //
+    // Pinning first fixed the copy into `Timeout`; building in place fixes the
+    // copy into the pin. `Pin<&mut F>` is a `Future` when `F` is, so both the
+    // timeout branch and the one below hand over sixteen bytes.
     let res = if timeout_ms == 0 {
         process.await
     } else {

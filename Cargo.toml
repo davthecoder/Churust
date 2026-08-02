@@ -6,6 +6,19 @@ members = ["churust-core", "churust-macros", "churust", "examples/hello", "churu
 # --workspace`, or any CI job that builds the library.
 exclude = ["benchmarks"]
 
+# Benchmarks measure the build that ships, not a weaker one.
+#
+# Without this, `cargo bench` used the default bench profile — `lto = false`,
+# `codegen-units = 16` — while every binary anyone runs is built `lto = true,
+# codegen-units = 1`. The dispatch benchmark read 817 ns under the default and
+# 672 ns under these settings on the same machine: a 22% difference that had
+# nothing to do with the code and everything to do with how it was compiled.
+# Quoting one against a figure measured from the other is how a number ends up
+# meaning something it does not.
+[profile.bench]
+lto = true
+codegen-units = 1
+
 [workspace.package]
 # Every Churust crate releases in lockstep on this single version.
 # Bump via `cargo release <level>` — never edit the crate manifests by hand.

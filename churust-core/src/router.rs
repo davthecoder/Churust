@@ -357,7 +357,6 @@ impl Router {
             Some(d) => d,
             None => return Match::BadPath,
         };
-        let segments: Vec<&str> = decoded.iter().map(std::convert::AsRef::as_ref).collect();
         let mut params = crate::call::Params::new();
 
         // 1. Exact search. Static beats param, and a leaf that cannot serve
@@ -370,7 +369,7 @@ impl Router {
         // accepted branch's captures and nothing else. Cloning them was one
         // `Vec` plus two `String`s per captured parameter, discarded a line
         // later.
-        let found = Self::walk_matching(&self.root, &segments, 0, &mut params, &mut |node, _| {
+        let found = Self::walk_matching(&self.root, &decoded, 0, &mut params, &mut |node, _| {
             node.handlers.pick(method, call).cloned()
         });
         if let Some(handler) = found {
@@ -382,19 +381,21 @@ impl Router {
         //    resource as far as the client is concerned.
         let mut exact_allow: Vec<Method> = Vec::new();
         params.clear();
-        Self::walk_matching(&self.root, &segments, 0, &mut params, &mut |node,
-                                                                         _|
-         -> Option<
-            (),
-        > {
-            for m in node.handlers.methods_matching(call) {
-                if !exact_allow.contains(&m) {
-                    exact_allow.push(m);
+        Self::walk_matching(
+            &self.root,
+            &decoded,
+            0,
+            &mut params,
+            &mut |node, _| -> Option<()> {
+                for m in node.handlers.methods_matching(call) {
+                    if !exact_allow.contains(&m) {
+                        exact_allow.push(m);
+                    }
                 }
-            }
-            // Never accept: visiting every matching leaf is the point.
-            None
-        });
+                // Never accept: visiting every matching leaf is the point.
+                None
+            },
+        );
 
         // 2. Wildcard fallback. Reaching a node that has no handler for this
         //    method is not the end of the search — a trailing `{name...}` at a
@@ -405,7 +406,7 @@ impl Router {
         //    belong to the branch just abandoned and must not reach the
         //    wildcard handler.
         params.clear();
-        match Self::walk_wildcard(&self.root, &segments, 0, method, call, &mut params) {
+        match Self::walk_wildcard(&self.root, &decoded, 0, method, call, &mut params) {
             Some(found @ Match::Found { .. }) => found,
             Some(Match::MethodNotAllowed { allow: wild_allow }) => {
                 let mut allow = exact_allow;
@@ -443,10 +444,9 @@ impl Router {
             Some(d) => d,
             None => return BorrowedMatch::Other(Match::BadPath),
         };
-        let segments: Vec<&str> = decoded.iter().map(std::convert::AsRef::as_ref).collect();
         let mut params = crate::call::Params::new();
 
-        let found = Self::walk_matching(&self.root, &segments, 0, &mut params, &mut |node, _| {
+        let found = Self::walk_matching(&self.root, &decoded, 0, &mut params, &mut |node, _| {
             node.handlers.pick(method, call)
         });
         if let Some(handler) = found {
@@ -569,24 +569,25 @@ impl Router {
             Some(d) => d,
             None => return Vec::new(),
         };
-        let segments: Vec<&str> = decoded.iter().map(std::convert::AsRef::as_ref).collect();
         let mut params = crate::call::Params::new();
         // Every structurally-matching leaf, not just the first: `OPTIONS`
         // describes the resource, and two routes of different shapes matching
         // one path are one resource to the client.
         let mut out: Vec<Method> = Vec::new();
-        Self::walk_matching(&self.root, &segments, 0, &mut params, &mut |node,
-                                                                         _|
-         -> Option<
-            (),
-        > {
-            for m in node.handlers.methods() {
-                if !out.contains(&m) {
-                    out.push(m);
+        Self::walk_matching(
+            &self.root,
+            &decoded,
+            0,
+            &mut params,
+            &mut |node, _| -> Option<()> {
+                for m in node.handlers.methods() {
+                    if !out.contains(&m) {
+                        out.push(m);
+                    }
                 }
-            }
-            None
-        });
+                None
+            },
+        );
 
         // The wildcard branch is enumerated directly, the same guard-free way
         // the exact branch above is. It used to be driven by `walk_wildcard`
@@ -602,7 +603,7 @@ impl Router {
         // while refusing the `OPTIONS` it had just named. It also assumed no
         // application registers `TRACE`; one that does turned the probe into a
         // `Found`, which the `if let` discarded, losing the list entirely.
-        Self::collect_wildcard_methods(&self.root, &segments, 0, &mut out);
+        Self::collect_wildcard_methods(&self.root, &decoded, 0, &mut out);
         out
     }
 
@@ -615,9 +616,15 @@ impl Router {
     /// wildcard reachable along the path is part of what this URL supports, and
     /// that is exactly what `walk_wildcard` already unions into `Allow` when
     /// none of them can serve.
-    fn collect_wildcard_methods(node: &Node, segs: &[&str], i: usize, out: &mut Vec<Method>) {
+    fn collect_wildcard_methods(
+        node: &Node,
+        segs: &[std::borrow::Cow<'_, str>],
+        i: usize,
+        out: &mut Vec<Method>,
+    ) {
         if i < segs.len() {
-            if let Some(child) = node.statics.get(segs[i]) {
+            let seg: &str = &segs[i];
+            if let Some(child) = node.statics.get(seg) {
                 Self::collect_wildcard_methods(child, segs, i + 1, out);
             }
             if let Some((_, child)) = &node.param {
@@ -722,7 +729,7 @@ impl Router {
     /// route that did not serve into one that did.
     fn walk_matching<'a, T>(
         node: &'a Node,
-        segs: &[&str],
+        segs: &[std::borrow::Cow<'_, str>],
         i: usize,
         params: &mut crate::call::Params,
         accept: &mut impl FnMut(&'a Node, &crate::call::Params) -> Option<T>,
@@ -730,7 +737,7 @@ impl Router {
         if i == segs.len() {
             return accept(node, params);
         }
-        let seg = segs[i];
+        let seg: &str = segs[i].as_ref();
         if let Some(child) = node.statics.get(seg) {
             if let Some(found) = Self::walk_matching(child, segs, i + 1, params, accept) {
                 return Some(found);
@@ -755,7 +762,7 @@ impl Router {
     #[allow(clippy::too_many_arguments)]
     fn walk_wildcard(
         node: &Node,
-        segs: &[&str],
+        segs: &[std::borrow::Cow<'_, str>],
         i: usize,
         method: &Method,
         call: &crate::call::Call,
@@ -772,7 +779,8 @@ impl Router {
         // and a `405` must not pre-empt a `200`.
         let mut method_mismatch: Option<Match> = None;
         if i < segs.len() {
-            if let Some(child) = node.statics.get(segs[i]) {
+            let seg: &str = &segs[i];
+            if let Some(child) = node.statics.get(seg) {
                 match Self::walk_wildcard(child, segs, i + 1, method, call, params) {
                     Some(found @ Match::Found { .. }) => return Some(found),
                     Some(other) => method_mismatch = Some(other),

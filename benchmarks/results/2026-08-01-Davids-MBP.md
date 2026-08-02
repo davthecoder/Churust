@@ -1,4 +1,19 @@
-# Churust vs actix-web, axum, Ktor and Go — 2026-08-01
+# Churust vs actix-web, axum, Ktor and Go — macOS, 2026-08-01
+
+> **Superseded by [`2026-08-01-linux-docker.md`](2026-08-01-linux-docker.md).**
+> Kept because it documents a mistake worth not repeating, not because its
+> ranking should be quoted.
+>
+> The keep-alive table below is a measurement of macOS. Its loopback path
+> saturates around 45–50k round-trips a second — below what any of these
+> servers can answer — so all five report the same number and the table ranks
+> nothing. The same Churust binary that reports 47k here reports 691k on Linux.
+>
+> The pipelined tables are real measurements, but they were the workaround for
+> the ceiling above rather than a workload anyone runs, and the depth at which
+> Churust leads actix-web here does not survive the move to Linux. The 8.8×
+> improvement figure is pipelined-only; on keep-alive load the honest figure is
+> 1.76×.
 
 - host: `Davids-MBP`, Apple M2 Max, 12 cores, 96 GB — `Darwin 25.5.0 arm64`
 - rustc: `1.97.1 (8bab26f4f 2026-07-14)` · churust: `0.3.3` (this branch)
@@ -12,8 +27,6 @@ frameworks in general, they do not transfer to other hardware, and every route
 here returns a constant. Read `benchmarks/README.md` before quoting any of it.
 
 ## Pipelined (depth 64, median of 3 rounds)
-
-![Requests per second by framework](../../docs/assets/benchmark-throughput.svg)
 
 | framework | req/s | vs. best | server CPU µs/req |
 |---|---:|---:|---:|
@@ -31,8 +44,6 @@ expected to sit. It now answers 3.10M.
 hold at every depth.** Repeating just those two for five rounds, alternating
 which went first, Churust won all five: 3.08-3.12M against 2.99-3.09M. But
 sweeping the pipeline depth shows the ranking changing hands:
-
-![Churust and actix-web across pipeline depths](../../docs/assets/benchmark-depth-sweep.svg)
 
 | pipeline depth | churust | actix-web | winner |
 |---:|---:|---:|---|
@@ -54,8 +65,6 @@ numbers existed, and the sweep above is published so it cannot be mistaken for a
 depth picked to flatter.
 
 ### Where the 8.8x came from
-
-![Churust before and after: 353k to 3.10M requests per second](../../docs/assets/benchmark-before-after.svg)
 
 None of it was in the routing or the extractors a profiler points at first.
 In order of size:
@@ -117,7 +126,7 @@ per request where Go and Ktor spend 53-55. Under the pipelined load, where the
 wire is not the constraint, the same measure separates the five cleanly — and
 puts actix-web first:
 
-![Server CPU per request: actix-web 1.03, Churust 1.87, Ktor 7.23, Go 32.67, axum 40.51 microseconds](../../docs/assets/benchmark-cpu-per-request.svg)
+
 
 ## Fairness notes
 

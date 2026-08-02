@@ -1,7 +1,48 @@
 # Comparison harness
 
-Churust against actix-web, axum, Ktor and Go on identical work. Run by hand, on
-a machine that is otherwise idle.
+Churust against actix-web, axum, Ktor and Go on identical work.
+
+There are two ways to run it, and **the Docker one is the one to trust**:
+
+```sh
+docker build -f benchmarks/Dockerfile -t churust-bench .   # from the repo root
+docker run --rm churust-bench
+```
+
+Knobs: `ROUNDS` (default `9`), `DURATION` (`10s`), `CONNECTIONS` (`64`),
+`THREADS` (`4`), `DEPTH` (`16`), `APPS` (the five frameworks), `WORKERS`,
+`WARMUP`, `JVM_WARMUP`, `SERVER_CPUS` (`0-7`), `CLIENT_CPUS` (`8-11`) — pass
+them with `docker run -e ROUNDS=5 …`. `run.sh` on the host has its own
+defaults, listed in its own section below; they are not the same numbers.
+
+## Why the container is the real harness
+
+Two reasons, and they are the two things that decide whether a benchmark is
+about the software or about the room it was run in.
+
+**It runs on a Linux kernel.** macOS's loopback path saturates around 45–50k
+small round-trips a second, which is *below* what any of these servers can
+answer. Measured there, an ordinary keep-alive load reports the same number for
+all five and the benchmark is a measurement of the host. The evidence for that
+is in [Why the load is pipelined](#why-the-load-is-pipelined) below; the short
+version is that two *different* servers measured simultaneously get half each,
+which is not a fact about either of them. Linux's ceiling is roughly an order of
+magnitude higher, so the realistic workload — a client that does not pipeline —
+is bounded by the server and can be the headline instead of a workaround.
+
+**It runs one server at a time.** Four idle servers are not free: a JVM runs GC
+and JIT threads with no traffic at all, and five resident processes share caches
+and memory bandwidth with whichever one is being measured. `run-linux.sh` starts
+a server, warms it, measures it, stops it, and only then starts the next.
+
+Running sequentially gives up the protection that interleaving bought — a
+machine that slows down mid-run would otherwise dump all of that on whoever went
+last — so it is replaced: **the order rotates every round**, so each framework is
+measured first in one round and last in another, and the reported figure is the
+median across rounds. Each row also reports its spread, so a framework whose
+number moved between rounds says so instead of hiding behind a median.
+
+## The other way: run.sh, on the host
 
 ```sh
 cargo install oha --locked
@@ -12,6 +53,11 @@ brew install wrk gradle          # or your platform's equivalent
 Knobs: `DURATION` (default `10s`), `WRK_DURATION` (`8s`), `CONNECTIONS` (`64`),
 `DEPTH` (`64`), `ROUNDS` (`3`), `APPS` (all five), `BENCH_JAVA_HOME`, and one
 `*_PORT` per app.
+
+This keeps all five servers up and interleaves the measurements. It is still
+useful — it needs no container, and interleaving is the better answer to a
+machine that drifts — but on macOS its keep-alive numbers are the host's and not
+the frameworks', and it is the one that had to pipeline to say anything at all.
 
 `APPS` is how you cope with a missing toolchain: `APPS="churust axum" ./run.sh`
 runs the two that need nothing but cargo.
@@ -27,10 +73,38 @@ actix-web and axum in Rust, Ktor because Churust's whole shape is borrowed from
 it, and Go's `net/http` because that is what "a Go backend" means to almost
 everyone writing one.
 
+## The sixth app: bare hyper, the floor
+
+`bench-hyper` is not a framework and is not in the default `APPS`. It is hyper
+and tokio with nothing on top — no router, no middleware, no extractors, a
+`match` on the path — wired up exactly the way Churust wires them: the same
+`auto::Builder`, one current-thread runtime per worker behind `SO_REUSEPORT`,
+the same responses byte for byte. Run it with
+`-e APPS="churust hyper actix"`.
+
+It exists because a two-framework gap does not say *which* layer the difference
+is in, and for a long time this harness could only answer that by subtraction —
+measure Churust, measure actix, attribute the residue to hyper because nothing
+else was left. That is an argument, not a measurement, and it is exactly the
+kind of argument that turns out to be wrong.
+
+Bare hyper measures it directly. Whatever it costs is a floor that nothing
+built on hyper can beat, so the distance from it to Churust is Churust's own
+overhead — the only part of the gap Churust's code can do anything about — and
+the distance from it to actix is the cost of the HTTP implementation itself.
+Two numbers that were previously one guess.
+
+The floor is deliberately not a fair server: no timeouts, no connection cap, no
+graceful shutdown, no TLS, no security headers. It is not a suggestion that a
+framework should cost nothing. It is the line below which the difference stops
+being anybody's fault.
+
 ## The gate: same work, or no measurement
 
-`run.sh` refuses to measure unless all five apps return equivalent status,
-headers and body on every route. Two apps doing different work produce a number
+Both harnesses refuse to measure unless all five apps return equivalent status,
+headers and body on every route. `run-linux.sh` captures each app's responses
+while it is the one running and compares them once every app has been seen;
+`run.sh` compares them live. Two apps doing different work produce a number
 that means nothing, and that is the usual reason framework benchmarks cannot be
 trusted.
 
@@ -90,6 +164,28 @@ changes is a chart nobody can date.
 ```sh
 python3 charts.py
 ```
+
+## How many rounds is enough
+
+Nine, by default, and the reason is worth stating because fewer looked like
+plenty.
+
+The between-run spread on this class of machine is wider than most of the
+differences being measured. Three consecutive five-round runs of *identical
+code* put Churust 3.6% ahead of actix-web, then 11% ahead, then 5.9% behind.
+Any one of those, published on its own, would have been a result. Together they
+are a coin flip.
+
+Nine rounds separated the same pair cleanly: every Churust round beat every
+actix-web round, ranges not overlapping. That is what a real difference looks
+like, and it is the bar a claim in `results/` has to clear.
+
+So: **compare the spreads before believing a median.** If the ranges overlap,
+the harness has not answered the question yet — run more rounds rather than
+reporting the ordering. `ROUNDS=15 docker run …` costs minutes and is cheaper
+than publishing a number that reverses on the next run. Tail latency needs this
+most; it is the noisiest column here by a wide margin and moves with the state
+of the machine as much as with the code.
 
 ## Server CPU per request
 

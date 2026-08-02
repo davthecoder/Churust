@@ -13,6 +13,38 @@ whole set.
 
 ## [Unreleased]
 
+### Security
+
+- **`run_sharded` served TLS ports in plaintext.** The sharded engine added in
+  this cycle is a second accept path, and it was written without the TLS branch
+  the shared one has. An application that configured `.tls(cert, key)` and then
+  chose `run_sharded` for throughput got a server answering ordinary HTTP on the
+  port it had a certificate for — no error, no warning, every request and
+  response in clear text. Nothing in the application's own tests would notice,
+  because a plaintext client talking to a plaintext server works perfectly.
+
+  TLS now terminates on the worker rather than on the acceptor: a handshake is
+  cheap to ask for and expensive to answer, so doing it on the single accept
+  loop would let one slow `ClientHello` stall every other connection's
+  admission. It uses the same `max_tls_handshakes` budget and
+  `tls_handshake_timeout_ms` deadline as the shared engine, with the deadline
+  covering the wait for the budget as well as the handshake itself.
+
+- **Configuring TLS without the `tls` feature now refuses to start.** The same
+  hazard one layer up, and older than the sharded engine: `.tls(...)` recorded
+  the paths, the feature gate meant nothing read them, and the server came up
+  serving plaintext on a port every client and runbook treated as HTTPS. The
+  only signal was a sentence in the rustdoc saying the feature is "required to
+  have any effect at serve time".
+
+  Every network entry point — `serve`, `serve_on`, `serve_many`,
+  `serve_sharded` — now returns `InvalidInput` naming the problem. This is a
+  behaviour change for a build that was already misconfigured: it previously
+  started and served unencrypted traffic, and now it does not start. Refusing is
+  the safer failure, and a warning would be missed in exactly the deployments
+  that most need it.
+
+
 ### Added
 
 - **`App::run_sharded` — one runtime per core, with connections pinned.** The

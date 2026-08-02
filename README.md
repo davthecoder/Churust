@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Churro + Rust</strong> — a backend web framework inspired by Kotlin's <a href="https://ktor.io">Ktor</a>.<br />
-  Simple, secure, robust, easy to learn.
+  Ktor's ergonomics, held to Rust's standards: secure by default, fast, and honest about both.
 </p>
 
 <p align="center">
@@ -24,6 +24,11 @@ Churust gives you Ktor's developer experience in Rust: an application engine, a
 routing DSL, an `install(plugin)` system, and a phased interceptor pipeline —
 built on a battle-tested async stack (**tokio + hyper + rustls**). Churust owns
 the ergonomic layer; it does not reinvent HTTP parsing or TLS.
+
+The aim is a framework that is pleasant *and* fast *and* safe, with no leg of
+that quietly dropped — and where it is not yet the fastest, the
+[Performance](#performance) section says so with the measurement attached
+rather than a claim.
 
 ```rust
 use churust::prelude::*;
@@ -180,49 +185,57 @@ Every Churust crate is released in lockstep on one version number, so
 
 ## Performance
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/davthecoder/Churust/main/docs/assets/benchmark-throughput.svg" alt="Requests per second, HTTP/1.1 pipelined at depth 64: Churust 3.10M, actix-web 3.04M, Ktor 1.37M, axum 251k, Go net/http 98k" width="900" />
-</p>
+Six servers, three routes, byte-identical responses, on a Linux kernel. One
+server runs at a time, the order rotates each round, the server is pinned to
+eight CPUs and the load generator to four, and [the harness](benchmarks/)
+refuses to measure at all unless every app returns the same bytes. Median of
+nine rounds at four workers each — fewer rounds is not enough to tell a real
+difference from this machine's run-to-run spread, which is a lesson the harness
+README records the hard way.
 
-Five servers, three routes, byte-identical responses, one machine, interleaved
-rounds. `run.sh` refuses to measure at all unless every app returns the same
-bytes — the [harness](benchmarks/) is built around that check, because two apps
-doing different work produce a number that means nothing.
+| keep-alive, 4 workers | req/s | vs. Churust | server CPU µs/req | p99 |
+|---|---:|---:|---:|---:|
+| actix-web 4.14 | **916,364** | 1.12× | **4.20** | **105 µs** |
+| *bare hyper — the floor, not a framework* | *895,073* | *1.10×* | *4.08* | *113 µs* |
+| **Churust** | 816,986 | — | 4.87 | 137 µs |
 
-| framework | req/s | vs. Churust | server CPU µs/req |
-|---|---:|---:|---:|
-| **Churust** | **3,101,706** | — | 1.87 |
-| actix-web | 3,038,968 | 0.98× | **1.03** |
-| Ktor 3.5 (Netty) | 1,366,326 | 0.44× | 7.23 |
-| axum 0.8 | 251,405 | 0.08× | 40.51 |
-| Go 1.26 `net/http` | 97,619 | 0.03× | 32.67 |
+**actix-web is ahead, and Churust is not yet the fastest Rust framework.** The
+`bare hyper` row is the reason that sentence can be trusted: it is hyper and
+tokio with no framework at all, serving the same bytes the same way, and it is
+what any hyper-based framework is measured against. Churust costs **0.79 µs per
+request above it**.
 
-**What this does and does not say.** Four things a reader deserves up front:
+An earlier version of this section said the gap belonged to hyper's HTTP/1
+implementation and that closing it "would mean not using hyper". That was
+arrived at by subtracting two numbers that had never both been measured, and the
+floor disproves it: **hyper serves a request for less CPU than actix-http
+does.** The gap is Churust's own — about half in dispatch, about half in the
+engine around it — which also means it is Churust's to close.
 
-- **Churust is in actix-web's class, not ahead of it.** The margin changes
-  hands with pipeline depth — Churust leads by 2% at depth 64, and trails by 3%
-  at 16 and by 13% at 128 and 256. actix-web also reaches its number on *half*
-  the CPU per request, which is headroom Churust does not have. The
-  [full sweep](docs/assets/benchmark-depth-sweep.svg) is published rather than
-  the one depth Churust wins.
-- **Most of the gap to axum is one switch, not a routing difference.** hyper
-  answers each request in a pipelined batch with its own flush; Churust now
-  aggregates them and `axum::serve` exposes no way to. On an unpipelined load
-  the two are indistinguishable.
-- **Under load a browser would actually generate, all five are identical.**
-  Plain keep-alive on this machine puts every server between 45k and 52k req/s,
-  because macOS's loopback path saturates there — two *different* servers
-  measured simultaneously get 22.4k each. That table ranks nothing, and it is
-  printed next to the other one saying so.
-- **Every route returns a constant.** This measures dispatch overhead. It says
-  nothing about an application that talks to a database.
+axum, Ktor and Go were measured on an earlier eight-worker configuration
+(464k / 316k / 315k) and have not been re-run on this harness; those figures are
+in [`benchmarks/results/`](benchmarks/results/) rather than quoted here, because
+a number measured under one configuration and printed under another is how the
+three corrections above happened.
 
-Churust served **353,000 req/s** on this same benchmark before the 0.3.4 work —
-level with axum, which is where a framework sharing hyper and tokio with axum
-belongs. The 8.8× since then came from aggregating pipelined flushes, removing
-per-request atomics from shared cache lines, pinning connections to one runtime
-per core (`App::run_sharded`), and deleting a per-request allocation. None of it
-was in routing or extraction.
+Three more things worth knowing before quoting any of it:
+
+- **Worker count is a large deployment knob.** `run_sharded(0)` picks one per
+  core, which is a starting point rather than an answer — sweep it. Both
+  Churust and actix-web peak away from that default on this machine.
+- **The benchmark turns Churust's security headers off** so all six apps do
+  equal work. Your deployment will not, and that layer costs real time. It is
+  the next thing being fixed, and it is worth more to actual users than anything
+  in the table above.
+- **Every route returns a constant.** This is dispatch overhead. It says nothing
+  about an application that talks to a database — where all six of these
+  frameworks are dominated by the database.
+
+Run it yourself — it needs nothing but Docker:
+
+```sh
+docker build -f benchmarks/Dockerfile -t churust-bench . && docker run --rm churust-bench
+```
 
 Full method, every caveat, and the numbers behind the charts:
 [`benchmarks/README.md`](benchmarks/README.md) ·

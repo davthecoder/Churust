@@ -1109,12 +1109,36 @@ impl App {
     /// Pins each connection to one runtime for its whole life. Where the
     /// default [`start`](App::start) lets a connection's wakeups, handler and
     /// writes land on whichever worker thread is free — paying an atomic, a
-    /// cache miss and often a syscall at each hop — this pays none of them, at
-    /// the cost of not being able to lend a busy worker an idle worker's core.
-    /// Reach for it when requests are many, short and uniform; keep
-    /// [`start`](App::start) when they are not. See
-    /// [`engine::serve_sharded`](crate::engine::serve_sharded) for the
-    /// measurements behind that trade.
+    /// cache miss and often a syscall at each hop — this pays none of them.
+    ///
+    /// # The trade, measured
+    ///
+    /// On this project's comparison harness, the same application on the same
+    /// pinned cores:
+    ///
+    /// | | requests/second | p99 latency |
+    /// |---|---:|---:|
+    /// | [`start`](App::start) (shared runtime) | 390,772 | 444 µs |
+    /// | `run_sharded`, one worker per core | 757,930 | 246 µs |
+    /// | `run_sharded`, six workers on eight cores | **880,352** | **183 µs** |
+    ///
+    /// # Tune `workers`; the default is a starting point
+    ///
+    /// `0` picks one worker per core, which is the conventional default and is
+    /// **not** the best setting on the machine those numbers come from. Six
+    /// workers on an eight-core allocation was worth 14% more throughput and a
+    /// quarter off the tail than eight was. actix-web, swept the same way on the
+    /// same box, peaked at *four*. The optimum depends on the machine, the
+    /// kernel's share of the work, and what else is resident — so it is worth
+    /// measuring for a deployment rather than inheriting.
+    ///
+    /// The affinity trade is still real: a request that lands on a busy worker
+    /// waits for that worker rather than being picked up by an idle one, so
+    /// uneven or long-running handlers are the case where [`start`](App::start)
+    /// still wins. Reach for `run_sharded` when requests are many, short and
+    /// uniform. See
+    /// [`engine::serve_sharded`](crate::engine::serve_sharded) for why the
+    /// acceptor is centralised rather than using `SO_REUSEPORT`.
     ///
     /// `workers` of `0` means one per available core.
     ///
