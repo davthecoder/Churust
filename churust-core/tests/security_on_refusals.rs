@@ -170,6 +170,9 @@ fn an_ordinary_response_is_secured_exactly_once() {
     // why this counts rather than trusting absence of breakage.
     for header in EXPECTED {
         let seen = ok.matches(&format!("{header}:")).count();
-        assert_eq!(seen, 1, "{header} appears {seen} times, expected once:\n{ok}");
+        assert_eq!(
+            seen, 1,
+            "{header} appears {seen} times, expected once:\n{ok}"
+        );
     }
 }
