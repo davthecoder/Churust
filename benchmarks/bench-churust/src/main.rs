@@ -22,25 +22,31 @@ fn main() -> std::io::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(0);
 
-    let app = Churust::server()
-        .host("127.0.0.1")
-        .port(port)
-        // This comparison measures dispatch overhead between frameworks.
-        // Churust's default builder sends five security headers
-        // (`X-Content-Type-Options`, `X-Frame-Options`, `Referrer-Policy`,
-        // `Permissions-Policy`, `Cross-Origin-Resource-Policy`) that none of
-        // the other four apps send; left in place, the apps would be doing
-        // different work, and any throughput gap would partly be measuring
-        // that difference rather than the frameworks' dispatch paths. Of the
-        // two honest ways to equalise — add the headers to all four others, or
-        // remove them here (one line, no new dependency) — this is the cheaper
-        // one. Nothing is
-        // hidden by dropping them: their cost is already measured directly in
-        // `churust-core/benches/headers.rs`, as the `security_headers_on` vs.
-        // `security_headers_off` pair. That bench measures the headers; this
-        // comparison measures dispatch. Do not add this back "to be safe" —
-        // doing so reintroduces the exact confound this comment describes.
-        .without_security_headers()
+    let mut builder = Churust::server().host("127.0.0.1").port(port);
+
+    // This comparison measures dispatch overhead between frameworks. Churust's
+    // default builder sends five security headers (`X-Content-Type-Options`,
+    // `X-Frame-Options`, `Referrer-Policy`, `Permissions-Policy`,
+    // `Cross-Origin-Resource-Policy`) that none of the other five apps send;
+    // left in place, the apps would be doing different work, and any throughput
+    // gap would partly be measuring that difference rather than the frameworks'
+    // dispatch paths. Of the two honest ways to equalise — add the headers to
+    // every other app, or drop them here — this is the cheaper one. Their cost
+    // is measured directly in `churust-core/benches/headers.rs`, as the
+    // `security_headers_on` vs. `security_headers_off` pair.
+    //
+    // Do not make this unconditional "to be safe": that reintroduces the exact
+    // confound described above. Do not delete the toggle either — with the
+    // headers always off, nothing here could measure the configuration real
+    // deployments actually run, which is how a per-request `HeaderMap` grow and
+    // rehash on the default path went unnoticed until it was found by profiling
+    // rather than by any number this harness prints. `APPS=churust SECURITY=1`
+    // benchmarks the shape users actually get.
+    if std::env::var("SECURITY").as_deref() != Ok("1") {
+        builder = builder.without_security_headers();
+    }
+
+    let app = builder
         // The load generator pipelines (see benchmarks/pipeline.lua and the
         // note in README.md about why). Answering a batch of 64 requests with
         // 64 flushes rather than one is 64 write syscalls where one would do,
