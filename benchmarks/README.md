@@ -9,9 +9,11 @@ docker build -f benchmarks/Dockerfile -t churust-bench .   # from the repo root
 docker run --rm churust-bench
 ```
 
-Knobs: `ROUNDS` (default `3`), `DURATION` (`10s`), `CONNECTIONS` (`256`),
-`THREADS` (`4`), `DEPTH` (`16`), `APPS` (all five), `WARMUP`, `JVM_WARMUP` —
-pass them with `docker run -e ROUNDS=5 …`.
+Knobs: `ROUNDS` (default `9`), `DURATION` (`10s`), `CONNECTIONS` (`64`),
+`THREADS` (`4`), `DEPTH` (`16`), `APPS` (the five frameworks), `WORKERS`,
+`WARMUP`, `JVM_WARMUP`, `SERVER_CPUS` (`0-7`), `CLIENT_CPUS` (`8-11`) — pass
+them with `docker run -e ROUNDS=5 …`. `run.sh` on the host has its own
+defaults, listed in its own section below; they are not the same numbers.
 
 ## Why the container is the real harness
 
@@ -70,6 +72,32 @@ The frameworks are the ones a Churust user would otherwise have picked:
 actix-web and axum in Rust, Ktor because Churust's whole shape is borrowed from
 it, and Go's `net/http` because that is what "a Go backend" means to almost
 everyone writing one.
+
+## The sixth app: bare hyper, the floor
+
+`bench-hyper` is not a framework and is not in the default `APPS`. It is hyper
+and tokio with nothing on top — no router, no middleware, no extractors, a
+`match` on the path — wired up exactly the way Churust wires them: the same
+`auto::Builder`, one current-thread runtime per worker behind `SO_REUSEPORT`,
+the same responses byte for byte. Run it with
+`-e APPS="churust hyper actix"`.
+
+It exists because a two-framework gap does not say *which* layer the difference
+is in, and for a long time this harness could only answer that by subtraction —
+measure Churust, measure actix, attribute the residue to hyper because nothing
+else was left. That is an argument, not a measurement, and it is exactly the
+kind of argument that turns out to be wrong.
+
+Bare hyper measures it directly. Whatever it costs is a floor that nothing
+built on hyper can beat, so the distance from it to Churust is Churust's own
+overhead — the only part of the gap Churust's code can do anything about — and
+the distance from it to actix is the cost of the HTTP implementation itself.
+Two numbers that were previously one guess.
+
+The floor is deliberately not a fair server: no timeouts, no connection cap, no
+graceful shutdown, no TLS, no security headers. It is not a suggestion that a
+framework should cost nothing. It is the line below which the difference stops
+being anybody's fault.
 
 ## The gate: same work, or no measurement
 

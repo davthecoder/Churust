@@ -96,6 +96,7 @@ start_server() { # name [extra-env...]
     churust) "${pin[@]}" env PORT="$PORT" "$@" "$APP_DIR/bench-churust" >/dev/null 2>&1 & ;;
     axum)    "${pin[@]}" env PORT="$PORT" "$@" "$APP_DIR/bench-axum"    >/dev/null 2>&1 & ;;
     actix)   "${pin[@]}" env PORT="$PORT" "$@" "$APP_DIR/bench-actix"   >/dev/null 2>&1 & ;;
+    hyper)   "${pin[@]}" env PORT="$PORT" "$@" "$APP_DIR/bench-hyper"   >/dev/null 2>&1 & ;;
     go)      "${pin[@]}" env PORT="$PORT" "$@" "$APP_DIR/bench-go"      >/dev/null 2>&1 & ;;
     ktor)    "${pin[@]}" env PORT="$PORT" "$@" java -jar "$APP_DIR/bench-ktor.jar" >/dev/null 2>&1 & ;;
     *) echo "unknown app: $name" >&2; exit 1 ;;
@@ -278,17 +279,28 @@ for mode in ${MODES:-keepalive pipelined}; do
   for round in $(seq 1 "$ROUNDS"); do
     echo "== $mode · round $round/$ROUNDS · order:$(rotated "$((round - 1))") =="
     for app in $(rotated "$((round - 1))"); do
-      # Churust is the only app here whose pipelining behaviour is a choice, so
-      # it is started the way each mode deserves: aggregating flushes for a
-      # client that pipelines, and not for one that does not. Measuring one
+      # Churust and the bare-hyper floor both expose hyper's flush aggregation,
+      # so both are started the way each mode deserves: aggregating flushes for
+      # a client that pipelines, and not for one that does not. Measuring one
       # setting in both modes would flatter one and libel the other.
-      if [ "$app" = churust ] && [ "$mode" = pipelined ]; then
-        start_server churust PIPELINE_FLUSH=1
-      elif [ "$app" = churust ]; then
-        start_server churust PIPELINE_FLUSH=0
-      else
-        start_server "$app"
-      fi
+      #
+      # The floor has to get the same treatment as Churust and not merely a
+      # default. It did not, at first: Churust was handed `PIPELINE_FLUSH=0` for
+      # the keep-alive rounds while hyper kept its own default of on — the
+      # setting Churust had already measured as the worse of the two here. That
+      # is a thumb on the scale pointing the one direction a floor must never
+      # point, since a handicapped floor makes the framework above it look
+      # cheaper than it is.
+      case "$app" in
+        churust | hyper)
+          if [ "$mode" = pipelined ]; then
+            start_server "$app" PIPELINE_FLUSH=1
+          else
+            start_server "$app" PIPELINE_FLUSH=0
+          fi
+          ;;
+        *) start_server "$app" ;;
+      esac
       measure "$app" "$mode"
       stop_server
     done

@@ -15,7 +15,7 @@
 # toolchain never have to coexist in the image that runs the measurement — the
 # thing being measured should share its machine with as little as possible.
 
-# --- the three Rust apps -----------------------------------------------------
+# --- the four Rust apps ------------------------------------------------------
 FROM rust:1-bookworm AS rust-build
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
@@ -37,9 +37,11 @@ COPY examples examples
 COPY benchmarks/bench-churust benchmarks/bench-churust
 COPY benchmarks/bench-axum benchmarks/bench-axum
 COPY benchmarks/bench-actix benchmarks/bench-actix
+COPY benchmarks/bench-hyper benchmarks/bench-hyper
 RUN cargo build --release --manifest-path benchmarks/bench-churust/Cargo.toml \
  && cargo build --release --manifest-path benchmarks/bench-axum/Cargo.toml \
- && cargo build --release --manifest-path benchmarks/bench-actix/Cargo.toml
+ && cargo build --release --manifest-path benchmarks/bench-actix/Cargo.toml \
+ && cargo build --release --manifest-path benchmarks/bench-hyper/Cargo.toml
 
 # --- the Go app --------------------------------------------------------------
 # Its own stage because Debian's packaged Go is too old for the 1.22+ pattern
@@ -80,6 +82,7 @@ COPY --from=wrk-build /wrk/wrk /usr/local/bin/wrk
 COPY --from=rust-build /src/benchmarks/bench-churust/target/release/bench-churust /apps/
 COPY --from=rust-build /src/benchmarks/bench-axum/target/release/bench-axum /apps/
 COPY --from=rust-build /src/benchmarks/bench-actix/target/release/bench-actix /apps/
+COPY --from=rust-build /src/benchmarks/bench-hyper/target/release/bench-hyper /apps/
 COPY --from=go-build /src/bench-go /apps/
 COPY --from=ktor-build /src/build/libs/bench-ktor.jar /apps/
 

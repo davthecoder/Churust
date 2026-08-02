@@ -1,0 +1,17 @@
+[package]
+name = "bench-hyper"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+hyper = { version = "1", features = ["http1", "http2", "server"] }
+hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio"] }
+http-body-util = "0.1"
+bytes = "1"
+socket2 = "0.6"
+tokio = { version = "1", features = ["rt", "net", "macros", "time"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
