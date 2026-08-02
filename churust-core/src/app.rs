@@ -1119,19 +1119,24 @@ impl App {
     /// | | requests/second | p99 latency |
     /// |---|---:|---:|
     /// | [`start`](App::start) (shared runtime) | 390,772 | 444 µs |
-    /// | `run_sharded` | **757,930** | **246 µs** |
+    /// | `run_sharded`, one worker per core | 757,930 | 246 µs |
+    /// | `run_sharded`, six workers on eight cores | **880,352** | **183 µs** |
     ///
-    /// **1.94× the throughput, and better tail latency with it.** An earlier
-    /// version of this engine did trade tail for throughput — it accepted
-    /// centrally and handed each socket to a worker — and the per-connection
-    /// handoff was what cost the latency, not the affinity. On Linux the
-    /// workers now take their own connections via `SO_REUSEPORT`.
+    /// # Tune `workers`; the default is a starting point
     ///
-    /// The affinity trade is still real in principle: a request that lands on a
-    /// busy worker waits for that worker rather than being picked up by an idle
-    /// one, so uneven or long-running handlers are the case where
-    /// [`start`](App::start) still wins. Reach for `run_sharded` when requests
-    /// are many, short and uniform. See
+    /// `0` picks one worker per core, which is the conventional default and is
+    /// **not** the best setting on the machine those numbers come from. Six
+    /// workers on an eight-core allocation was worth 14% more throughput and a
+    /// quarter off the tail than eight was. actix-web, swept the same way on the
+    /// same box, peaked at *four*. The optimum depends on the machine, the
+    /// kernel's share of the work, and what else is resident — so it is worth
+    /// measuring for a deployment rather than inheriting.
+    ///
+    /// The affinity trade is still real: a request that lands on a busy worker
+    /// waits for that worker rather than being picked up by an idle one, so
+    /// uneven or long-running handlers are the case where [`start`](App::start)
+    /// still wins. Reach for `run_sharded` when requests are many, short and
+    /// uniform. See
     /// [`engine::serve_sharded`](crate::engine::serve_sharded) for why the
     /// acceptor is centralised rather than using `SO_REUSEPORT`.
     ///

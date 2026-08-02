@@ -188,36 +188,48 @@ Five servers, three routes, byte-identical responses, on a Linux kernel. One
 server runs at a time, the order rotates each round, the server is pinned to
 eight CPUs and the load generator to four, and [the harness](benchmarks/)
 refuses to measure at all unless every app returns the same bytes. Median of
-nine rounds — fewer is not enough to tell a real difference from this machine's
-run-to-run spread, which is a lesson the harness README records the hard way.
+nine rounds, **both servers at their default of one worker per core** — fewer
+rounds is not enough to tell a real difference from this machine's run-to-run
+spread, which is a lesson the harness README records the hard way.
 
 | framework | req/s | vs. Churust | server CPU µs/req | p99 latency |
 |---|---:|---:|---:|---:|
-| **Churust** | **757,930** | — | 8.39 | 246 µs |
+| Churust | 757,930 | — | 8.39 | 246 µs |
 | actix-web 4.14 | 644,067 | 0.85× | **7.91** | **240 µs** |
 | axum 0.8 | 464,042 | 0.61× | 8.82 | 292 µs |
 | Ktor 3.5 (Netty) | 315,978 | 0.42× | 20.03 | 1.72 ms |
 | Go 1.26 `net/http` | 315,160 | 0.42× | 12.88 | 2.49 ms |
 
-**Churust is first on throughput** for this shape of load — 1.18× actix-web,
-1.63× axum, 2.40× Ktor and Go — and that one is solid: across nine rounds its
-slowest (711k) still beat actix-web's fastest (659k). Four things a reader
-deserves before quoting any of it:
+Both frameworks default to one worker per core, which is what the table above
+uses. **That is a comparison of two defaults, not of two frameworks**, and the
+distinction matters here: swept against worker count, actix-web peaks at four
+workers on this eight-core allocation and Churust at six.
 
-- **actix-web spends 6% less CPU per request** — 7.91 µs against 8.39. Churust
-  does not lead that column, and buys its throughput with the difference.
-- **Tail latency is a tie, not a win.** 246 µs against actix-web's 240 µs, with
-  the two overlapping round for round. Both clear axum's 292 µs and both are an
-  order of magnitude ahead of Ktor and Go. Do not read the ordering of the first
-  two as a result.
-- **`App::run_sharded` is what buys the throughput.** Pinning a connection to one
-  runtime for its life is worth 1.94× against the shared runtime — 391k to 758k — measured, [both rows](benchmarks/results/2026-08-01-linux-docker.md).
-  That is exactly why it is opt-in and the shared work-stealing runtime is still
-  the default.
-- **With HTTP/1.1 pipelining the order changes:** actix-web 5.96M against
-  Churust's 4.45M. That gap is not in Churust's own code — its whole dispatch
-  layer costs 393 ns of the 1.70 µs a pipelined request spends — it is in the
-  HTTP/1 implementation underneath, and closing it would mean not using hyper.
+| each at its own best (9 rounds) | req/s | CPU µs/req | p99 |
+|---|---:|---:|---:|
+| **actix-web**, 4 workers | **914,498** | **4.21** | **107 µs** |
+| Churust, 6 workers | 880,352 | 6.49 | 183 µs |
+
+**Tuned against tuned, actix-web is ahead on all three.** Churust leads the
+default-configured table because eight workers is near its optimum and far from
+actix-web's — not because it is the faster server. Both numbers are published
+because both are true and they answer different questions: what you get out of
+the box, and what the software can do.
+
+What Churust can honestly claim on this workload: comfortably ahead of axum
+(1.63×), Ktor and Go (2.4×), and within a few percent of actix-web on throughput
+while spending noticeably more CPU to get there.
+
+Three more things worth knowing before quoting any of it:
+
+- **Worker count is the single biggest knob**, worth more than everything else
+  in this section combined — Churust moves 772k → 880k between eight workers and
+  six. `run_sharded(0)` picks one per core, which is a starting point, not an
+  answer. Sweep it.
+- **With HTTP/1.1 pipelining actix-web leads by more:** 5.96M against Churust's
+  4.45M. That gap is not in Churust's own code — its whole dispatch layer costs
+  393 ns of the 1.70 µs a pipelined request spends — it is in the HTTP/1
+  implementation underneath, and closing it would mean not using hyper.
 - **Every route returns a constant.** This is dispatch overhead. It says nothing
   about an application that talks to a database.
 

@@ -1,26 +1,26 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 392" width="900" height="392" role="img" aria-labelledby="ba-t ba-d">
 <title id="ba-t">Churust throughput before and after this work</title>
-<desc id="ba-d">Churust went from 391 thousand to 699 thousand requests per second on keep-alive load, a 1.94 times change, with 99th-percentile latency improving from 444 microseconds to 246 microseconds as well.</desc>
+<desc id="ba-d">Churust went from 391 thousand to 699 thousand requests per second on keep-alive load, a 2.25 times change, with 99th-percentile latency improving from 444 microseconds to 183 microseconds as well.</desc>
 <style>
 text{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;}
 .s{fill:#fcfcfb}.ink{fill:#0b0b0b}.ink2{fill:#52514e}.mut{fill:#898781}.acc{fill:#2a78d6}.peer{fill:#898781}.s2{fill:#eb6834}.grid{stroke:#e1e0d9}.axis{stroke:#c3c2b7}.acc-s{stroke:#2a78d6}.s2-s{stroke:#eb6834}.ring{stroke:#fcfcfb}
 @media (prefers-color-scheme:dark){.s{fill:#1a1a19}.ink{fill:#ffffff}.ink2{fill:#c3c2b7}.mut{fill:#898781}.acc{fill:#3987e5}.peer{fill:#898781}.s2{fill:#d95926}.grid{stroke:#2c2c2a}.axis{stroke:#383835}.acc-s{stroke:#3987e5}.s2-s{stroke:#d95926}.ring{stroke:#1a1a19}}
 </style>
 <rect class="s" width="900" height="392" rx="10"/>
-<text class="ink" x="28" y="34" font-size="17" font-weight="600">Churust, before and after this work — 1.94× on keep-alive</text><text class="mut" x="28" y="55" font-size="12.5">Same kernel, same harness, same pinned cores · only the binary differs</text>
+<text class="ink" x="28" y="34" font-size="17" font-weight="600">Churust, before and after this work — 2.25× on keep-alive</text><text class="mut" x="28" y="55" font-size="12.5">Same kernel, same harness, same pinned cores · only the binary differs</text>
 <text class="ink2" x="154" y="114.5" font-size="13" text-anchor="end">Before</text>
-<path class="peer" d="M168,96 H438.2874724578787 A4,4 0 0 1 442.2874724578787,100 V120 A4,4 0 0 1 438.2874724578787,124 H168 Z"/>
-<text class="ink" x="452.3" y="114.5" font-size="14" font-weight="600">391k</text>
+<path class="peer" d="M168,96 H400.1449783722875 A4,4 0 0 1 404.1449783722875,100 V120 A4,4 0 0 1 400.1449783722875,124 H168 Z"/>
+<text class="ink" x="414.1" y="114.5" font-size="14" font-weight="600">391k</text>
 <text class="ink2" x="154" y="164.5" font-size="13" text-anchor="end">After</text>
 <path class="acc" d="M168,146 H696.0 A4,4 0 0 1 700.0,150 V170 A4,4 0 0 1 696.0,174 H168 Z"/>
-<text class="ink" x="710.0" y="164.5" font-size="14" font-weight="600">758k</text>
+<text class="ink" x="710.0" y="164.5" font-size="14" font-weight="600">880k</text>
 <text class="ink2" x="154" y="214" font-size="12" font-weight="600" text-anchor="end">What did it</text>
 <text class="mut" x="168" y="214" font-size="11.5">Removing per-request atomics from shared cache lines</text>
 <text class="mut" x="168" y="231" font-size="11.5">One runtime per core (App::run_sharded), SO_REUSEPORT on Linux</text>
 <text class="mut" x="168" y="248" font-size="11.5">Dropping per-request allocations, and the connection loop's bookkeeping</text>
 <text class="mut" x="168" y="265" font-size="11.5">TCP_NODELAY on by default</text>
 <text class="mut" x="168" y="282" font-size="11.5"></text>
-<text class="mut" x="168" y="299" font-size="11.5">Tail latency improved too: p99 444us before, 246us after, once the</text>
+<text class="mut" x="168" y="299" font-size="11.5">Tail latency improved too: p99 444us before, 183us after, once the</text>
 <text class="mut" x="168" y="316" font-size="11.5">per-connection handoff and the loop bookkeeping were removed.</text>
 <text class="mut" x="28" y="372" font-size="11">None of it in routing or extraction. Pipelined workloads gain far more; see the results.</text>
 </svg>

@@ -20,23 +20,50 @@ there reports **691k** here. Nothing about Churust changed; the kernel did.
 
 | framework | req/s | vs. Churust | server CPU µs/req | p99 latency | spread across 5 rounds |
 |---|---:|---:|---:|---:|---|
-| **churust** | **757,930** | — | 8.39 | 246 µs | 711,304–771,400 |
+| churust | 757,930 | — | 8.39 | 246 µs | 711,304–771,400 |
 | actix-web | 644,067 | 0.85× | **7.91** | **240 µs** | 616,886–658,537 |
 | axum | 464,042 | 0.61× | 8.82 | 292 µs | 457,051–480,883 |
 | ktor | 315,978 | 0.42× | 20.03 | 1.72 ms | 297,110–325,366 |
 | go | 315,160 | 0.42× | 12.88 | 2.49 ms | 298,633–319,477 |
 
-**Churust is first on throughput, and this one is solid**: 1.18× actix-web,
-1.63× axum, 2.40× Ktor and Go. Across nine rounds Churust's slowest (711,304)
-beat actix-web's fastest (658,537) — the ranges do not overlap at all.
+**That table compares two defaults, not two frameworks — and reading it as the
+latter was the biggest error in this file's history.**
 
-**Tail latency is a tie, not a win.** 246 µs against actix-web's 240 µs, and the
-two overlap round for round. Both clear axum's 292 µs; both are an order of
-magnitude ahead of Ktor and Go. The ordering of the first two rows in that
-column should not be read as a result.
+Both servers default to one worker per core, so running both at eight looked
+like the definition of a fair comparison. It is not. Swept against worker count,
+the two peak in different places:
 
-**actix-web leads CPU per request**, 7.91 µs against 8.39 — Churust buys its
-throughput with 6% more CPU.
+| workers | Churust | actix-web |
+|---:|---|---|
+| 4 | 778,814 · 5.11 µs · 138 µs | **914,498 · 4.21 µs · 107 µs** |
+| 6 | **880,352 · 6.49 µs · 183 µs** | 793,302 · 6.02 µs · 210 µs |
+| 8 (both defaults) | 757,930 · 8.39 µs · 246 µs | 644,067 · 7.91 µs · 240 µs |
+
+Nine rounds each, ranges disjoint within a row.
+
+**Tuned against tuned — actix-web at four workers, Churust at six — actix-web
+leads all three: throughput 914,498 against 880,352, CPU 4.21 µs against 6.49,
+and p99 107 µs against 183.** Churust's apparent throughput lead in the default
+table exists because eight workers is near its optimum and far from actix-web's,
+not because it is the faster server.
+
+What Churust can claim on this workload: within 4% of actix-web on throughput,
+1.9× axum, 2.8× Ktor and Go — while spending about half again as much CPU per
+request as actix-web does.
+
+**Worker count is the largest lever measured anywhere in this file** — larger
+than every change made to Churust's own code put together. Churust moves 757,930
+to 880,352 between eight workers and six. Any comparison that does not sweep it
+is reporting the distance between two defaults.
+
+### Why the worker sweep was added late
+
+Every other confound in this comparison was found by asking "is each app doing
+the same work" — the security headers, the h2c sniffing, the JVM warm-up, the
+`pipeline_flush` setting. Worker count is the same class of variable and it went
+unswept until the end, because "both at their default" reads as fair and is not
+when the two defaults sit at different distances from their optima. The
+resulting error ran in Churust's favour for most of this file's life.
 
 ### Why nine rounds
 

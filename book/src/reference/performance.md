@@ -20,14 +20,22 @@ median of five. Three routes returning constants. Full method:
 
 ## Read this before quoting the table
 
-**Churust is first on throughput, tied on tail latency, second on CPU per
-request.**
+**That table compares two defaults, not two frameworks.** Both servers default
+to one worker per core, and on this machine that setting is near Churust's
+optimum and well away from actix-web's. Swept properly:
 
-The throughput lead is the solid one: across nine rounds Churust's slowest
-(711k) beat actix-web's fastest (659k), so the ranges do not overlap at all.
-The tail-latency ordering is *not* a result — 246 µs against 240 µs, overlapping
-round for round — and actix-web genuinely leads CPU per request, 7.91 µs against
-8.39.
+| each at its own best (9 rounds) | req/s | CPU µs/req | p99 |
+|---|---:|---:|---:|
+| **actix-web**, 4 workers | **914,498** | **4.21** | **107 µs** |
+| Churust, 6 workers | 880,352 | 6.49 | 183 µs |
+
+**Tuned against tuned, actix-web leads throughput, CPU and tail latency.**
+Churust is within 4% on throughput and spends about half again as much CPU to
+get there. It remains comfortably ahead of axum, Ktor and Go on all three.
+
+Worker count is the largest single lever in this whole page — larger than any
+change made to Churust itself — and `run_sharded(0)`'s one-per-core default is a
+starting point rather than an answer.
 
 Nine rounds because fewer is not enough. Three consecutive five-round runs of
 identical code put Churust 3.6% ahead, then 11% ahead, then 5.9% behind; the

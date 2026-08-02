@@ -183,14 +183,14 @@ def chart_throughput() -> str:
         header(
             w,
             h,
-            "Requests per second by framework, ordinary keep-alive HTTP/1.1",
-            "Churust 758k, actix-web 644k, axum 464k, Ktor 316k, Go net/http 315k "
+            "Requests per second by framework, keep-alive, each at its best worker count",
+            "actix-web 914k, Churust 880k, axum 464k, Ktor 316k, Go net/http 315k "
             "requests per second. Higher is better.",
             "tp",
         ),
         titles(
-            "Requests per second — ordinary keep-alive, no pipelining",
-            "Linux 6.12, 8 pinned cores · 64 connections · median of 5 rounds · higher is better",
+            "Requests per second — keep-alive, each server at its best worker count",
+            "Linux 6.12, 8 pinned cores · 64 connections · median of 9 rounds · higher is better",
         ),
     ]
 
@@ -231,8 +231,8 @@ def chart_throughput() -> str:
         footnote(
             w,
             h - 22,
-            "Every route returns a constant, so this is dispatch overhead. One machine, one moment. "
-            "Method and caveats in benchmarks/results/.",
+            "Each server at the worker count that suits it: actix-web 4, Churust 6, the rest their default. "
+            "Every route returns a constant.",
         )
     )
     out.append("</svg>")
@@ -326,8 +326,8 @@ def chart_pipelined() -> str:
 
 # Milliseconds at the 99th percentile, keep-alive.
 P99 = [
-    ("actix-web", 0.240, False),
-    ("Churust", 0.246, True),
+    ("actix-web", 0.107, False),
+    ("Churust", 0.183, True),
     ("axum", 0.292, False),
     ("Ktor (Netty)", 1.72, False),
     ("Go net/http", 2.49, False),
@@ -346,12 +346,12 @@ def chart_p99() -> str:
             w,
             h,
             "Tail latency at the 99th percentile, keep-alive",
-            "actix-web 0.240ms, Churust 0.246ms, axum 0.292ms, Ktor 1.72ms, Go net/http 2.49ms. "
-            "Lower is better. Churust and actix-web are tied within run-to-run noise.",
+            "actix-web 0.107ms, Churust 0.183ms, axum 0.292ms, Ktor 1.72ms, Go net/http 2.49ms. "
+            "Lower is better; actix-web leads once each server is tuned.",
             "p99",
         ),
         titles(
-            "Tail latency — Churust and actix-web are tied",
+            "Tail latency — actix-web leads at equal tuning",
             "99th-percentile response time, median of 9 rounds · lower is better",
         ),
     ]
@@ -392,14 +392,14 @@ def chart_p99() -> str:
         footnote(
             w,
             h - 36,
-            "240us against 246us is a tie: the two overlap round for round. Both clear axum, and",
+            "Each server at its best worker count. At the shared one-per-core default the two are",
         )
     )
     out.append(
         footnote(
             w,
             h - 20,
-            "both are an order of magnitude ahead of the JVM and Go on this workload.",
+            "level at ~245us — worker count moves this more than anything in either framework.",
         )
     )
     out.append("</svg>")
@@ -411,8 +411,8 @@ def chart_p99() -> str:
 # -----------------------------------------------------------------------------
 
 CPU = [
-    ("actix-web", 7.91, False),
-    ("Churust", 8.39, True),
+    ("actix-web", 4.21, False),
+    ("Churust", 6.49, True),
     ("axum", 8.82, False),
     ("Go net/http", 12.88, False),
     ("Ktor (Netty)", 20.03, False),
@@ -431,7 +431,7 @@ def chart_cpu() -> str:
             w,
             h,
             "Server CPU microseconds per request by framework",
-            "actix-web 7.91, Churust 8.39, axum 8.82, Go net/http 12.88, Ktor 20.03 "
+            "actix-web 4.21, Churust 6.49, axum 8.82, Go net/http 12.88, Ktor 20.03 "
             "microseconds of CPU per request. Lower is better; actix-web is best.",
             "cpu",
         ),
@@ -477,8 +477,8 @@ def chart_cpu() -> str:
         footnote(
             w,
             h - 22,
-            "Churust buys its throughput with more CPU than actix-web spends. "
-            "The figure does not depend on how fast the wire is."
+            "Each server at its best worker count. actix-web does the same work for a third less CPU, "
+            "which is the clearest gap in this comparison."
         )
     )
     out.append("</svg>")
@@ -494,8 +494,8 @@ def chart_before_after() -> str:
     w, h = 900, 392
     x0, x1 = 168, 700
     row, gap, top = 28, 22, 96
-    data = [("Before", 390_772, False), ("After", 757_930, True)]
-    peak = 757_930
+    data = [("Before", 390_772, False), ("After", 880_352, True)]
+    peak = 880_352
 
     out = [
         header(
@@ -503,12 +503,12 @@ def chart_before_after() -> str:
             h,
             "Churust throughput before and after this work",
             "Churust went from 391 thousand to 699 thousand requests per second on "
-            "keep-alive load, a 1.94 times change, with 99th-percentile latency improving "
-            "from 444 microseconds to 246 microseconds as well.",
+            "keep-alive load, a 2.25 times change, with 99th-percentile latency improving "
+            "from 444 microseconds to 183 microseconds as well.",
             "ba",
         ),
         titles(
-            "Churust, before and after this work — 1.94× on keep-alive",
+            "Churust, before and after this work — 2.25× on keep-alive",
             "Same kernel, same harness, same pinned cores · only the binary differs",
         ),
     ]
@@ -534,7 +534,7 @@ def chart_before_after() -> str:
         "Dropping per-request allocations, and the connection loop's bookkeeping",
         "TCP_NODELAY on by default",
         "",
-        "Tail latency improved too: p99 444us before, 246us after, once the",
+        "Tail latency improved too: p99 444us before, 183us after, once the",
         "per-connection handoff and the loop bookkeeping were removed.",
     ]
     ny = y + 18
