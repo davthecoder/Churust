@@ -182,7 +182,40 @@ the runtime's own I/O driver, not the request timeout, and the change was never
 written: it would have complicated the semantics of a security control, and
 helped only handlers that complete without awaiting anything.
 
-**Four of the six things tried in this round measured nothing.** They are all
+**Dropping `#[async_trait]` from the extractor traits measured nothing either,
+and it was the last item on the reachable list.**
+
+The prediction was 25–47 ns from a microbenchmark, on solid-looking reasoning:
+`impl FromCall for Call` is literally `Ok(call)` behind a `Pin<Box<dyn Future>>`,
+so every request heap-allocated to hand back a value it already held. The
+conversion was done properly — the three trait methods redeclared as
+`-> impl Future<Output = ..> + Send` (RPITIT, since `async fn` in a trait cannot
+promise `Send`), 22 attributes removed across `extract.rs` and implementors in
+six crates, `async-trait` dropped from the extractor path entirely. DX was
+checked first and is unchanged: an impl may satisfy an RPITIT method with a
+plain `async fn`, so implementors delete an attribute and an import and write
+the same code.
+
+Measured at four workers over nine rounds, normalised to the bare-hyper floor
+because the whole run drifted:
+
+| | Churust | above the floor |
+|---|---:|---:|
+| before | 816,986 req/s · 4.87 µs | +0.81 µs |
+| after  | 801,915 req/s · 4.95 µs | +0.85 µs |
+
+Unchanged, marginally worse. **Reverted** — the change was justified by
+performance, the performance is not there, and it breaks every downstream
+`#[async_trait] impl`. The work is real and the dependency removal is a genuine
+good on its own; that is a deliberate decision about dependency hygiene and
+modern Rust, not something to ship as the residue of a failed optimisation.
+
+This matters for how the remaining estimates should be read. The reachable set
+was put at 60–110 ns, and its highest-confidence item — the one with a
+mechanism you could point at in the source — delivered zero at the wire. Treat
+the rest of that list as unproven until each is measured the same way.
+
+**Five of the seven things tried in this round measured nothing.** They are all
 written down — the `max_headers` skip, the `catch_unwind` pin, the in-place
 pin's absent throughput effect, and the timer ceiling above — because a page
 that records only what worked makes the next person repeat the rest.
