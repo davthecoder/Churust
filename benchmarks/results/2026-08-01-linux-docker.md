@@ -164,10 +164,26 @@ The same fix applied one layer down, to the `catch_unwind` in
 `App::process_call`, which also takes its future by value. It measured 14.07%
 against 14.15%: nothing. The compiler already elides that move. Reverted.
 
-**Three of the five things tried in this round measured nothing.** They are all
-written down — the `max_headers` skip, the `catch_unwind` pin, and the in-place
-pin's absent throughput effect — because a page that records only what worked
-makes the next person repeat the rest.
+**The per-request timer is not worth removing, and that was measured before
+anything was built.** `__kernel_clock_gettime` sits at 7.3% of user-space cycles
+against roughly 1% for the floor, and the obvious suspect was
+`tokio::time::timeout`: it reads `Instant::now()` for a deadline and puts an
+entry in the timer wheel on every request. The tempting fix is to poll the
+request future once and only arm a timer if it is still pending, since a handler
+that finishes without yielding never needs one.
+
+Running the benchmark app with `request_timeout_ms(0)` — the timeout branch
+skipped entirely, which is the ceiling for any such optimisation — gives 824,582
+req/s at 4.81 µs against 816,986 at 4.87. About 1%, with a spread
+(664,319–836,802) wide enough to doubt even that. So the clock reads are mostly
+the runtime's own I/O driver, not the request timeout, and the change was never
+written: it would have complicated the semantics of a security control, and
+helped only handlers that complete without awaiting anything.
+
+**Four of the six things tried in this round measured nothing.** They are all
+written down — the `max_headers` skip, the `catch_unwind` pin, the in-place
+pin's absent throughput effect, and the timer ceiling above — because a page
+that records only what worked makes the next person repeat the rest.
 
 The 393 ns measurement was not wrong; it was answering a narrower question than
 it was quoted for. It drives the router and pipeline directly, so it never runs
