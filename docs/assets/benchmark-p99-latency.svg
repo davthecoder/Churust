@@ -1,39 +1,42 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 378" width="900" height="378" role="img" aria-labelledby="p99-t p99-d">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 422" width="900" height="422" role="img" aria-labelledby="p99-t p99-d">
 <title id="p99-t">Tail latency at the 99th percentile, keep-alive</title>
-<desc id="p99-d">actix-web 0.107ms, Churust 0.183ms, axum 0.292ms, Ktor 1.72ms, Go net/http 2.49ms. Lower is better; actix-web leads once each server is tuned.</desc>
+<desc id="p99-d">actix-web 0.171ms, bare hyper 0.175ms, Churust 0.211ms, axum 0.326ms, Ktor 1.84ms, Go net/http 2.46ms. Lower is better; actix-web leads.</desc>
 <style>
 text{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;}
 .s{fill:#fcfcfb}.ink{fill:#0b0b0b}.ink2{fill:#52514e}.mut{fill:#898781}.acc{fill:#2a78d6}.peer{fill:#898781}.s2{fill:#eb6834}.grid{stroke:#e1e0d9}.axis{stroke:#c3c2b7}.acc-s{stroke:#2a78d6}.s2-s{stroke:#eb6834}.ring{stroke:#fcfcfb}
 @media (prefers-color-scheme:dark){.s{fill:#1a1a19}.ink{fill:#ffffff}.ink2{fill:#c3c2b7}.mut{fill:#898781}.acc{fill:#3987e5}.peer{fill:#898781}.s2{fill:#d95926}.grid{stroke:#2c2c2a}.axis{stroke:#383835}.acc-s{stroke:#3987e5}.s2-s{stroke:#d95926}.ring{stroke:#1a1a19}}
 </style>
-<rect class="s" width="900" height="378" rx="10"/>
+<rect class="s" width="900" height="422" rx="10"/>
 <text class="ink" x="28" y="34" font-size="17" font-weight="600">Tail latency — actix-web leads at equal tuning</text><text class="mut" x="28" y="55" font-size="12.5">99th-percentile response time, median of 9 rounds · lower is better</text>
-<line class="grid" x1="274.8" y1="84" x2="274.8" y2="296" stroke-width="1"/>
-<text class="mut" x="274.8" y="78" font-size="10.5" text-anchor="middle">0.5ms</text>
-<line class="grid" x1="381.7" y1="84" x2="381.7" y2="296" stroke-width="1"/>
-<text class="mut" x="381.7" y="78" font-size="10.5" text-anchor="middle">1ms</text>
-<line class="grid" x1="488.5" y1="84" x2="488.5" y2="296" stroke-width="1"/>
-<text class="mut" x="488.5" y="78" font-size="10.5" text-anchor="middle">1.5ms</text>
-<line class="grid" x1="595.3" y1="84" x2="595.3" y2="296" stroke-width="1"/>
-<text class="mut" x="595.3" y="78" font-size="10.5" text-anchor="middle">2ms</text>
-<line class="grid" x1="702.1" y1="84" x2="702.1" y2="296" stroke-width="1"/>
-<text class="mut" x="702.1" y="78" font-size="10.5" text-anchor="middle">2.5ms</text>
+<line class="grid" x1="276.1" y1="84" x2="276.1" y2="340" stroke-width="1"/>
+<text class="mut" x="276.1" y="78" font-size="10.5" text-anchor="middle">0.5ms</text>
+<line class="grid" x1="384.3" y1="84" x2="384.3" y2="340" stroke-width="1"/>
+<text class="mut" x="384.3" y="78" font-size="10.5" text-anchor="middle">1ms</text>
+<line class="grid" x1="492.4" y1="84" x2="492.4" y2="340" stroke-width="1"/>
+<text class="mut" x="492.4" y="78" font-size="10.5" text-anchor="middle">1.5ms</text>
+<line class="grid" x1="600.5" y1="84" x2="600.5" y2="340" stroke-width="1"/>
+<text class="mut" x="600.5" y="78" font-size="10.5" text-anchor="middle">2ms</text>
+<line class="grid" x1="708.7" y1="84" x2="708.7" y2="340" stroke-width="1"/>
+<text class="mut" x="708.7" y="78" font-size="10.5" text-anchor="middle">2.5ms</text>
 <text class="ink2" x="154" y="108.5" font-size="13" font-weight="400" text-anchor="end">actix-web</text>
-<path class="peer" d="M168,92 H186.86104417670683 A4,4 0 0 1 190.86104417670683,96 V112 A4,4 0 0 1 186.86104417670683,116 H168 Z"/>
-<text class="ink2" x="200.9" y="108.5" font-size="13" font-weight="400">0.107 ms</text>
-<text class="ink" x="154" y="152.5" font-size="13" font-weight="600" text-anchor="end">Churust</text>
-<path class="acc" d="M168,136 H203.0987951807229 A4,4 0 0 1 207.0987951807229,140 V156 A4,4 0 0 1 203.0987951807229,160 H168 Z"/>
-<text class="ink" x="217.1" y="152.5" font-size="13" font-weight="600">0.183 ms</text>
-<text class="ink2" x="154" y="196.5" font-size="13" font-weight="400" text-anchor="end">axum</text>
-<path class="peer" d="M168,180 H226.3871485943775 A4,4 0 0 1 230.3871485943775,184 V200 A4,4 0 0 1 226.3871485943775,204 H168 Z"/>
-<text class="ink2" x="240.4" y="196.5" font-size="13" font-weight="400">0.292 ms</text>
-<text class="ink2" x="154" y="240.5" font-size="13" font-weight="400" text-anchor="end">Ktor (Netty)</text>
-<path class="peer" d="M168,224 H531.4859437751004 A4,4 0 0 1 535.4859437751004,228 V244 A4,4 0 0 1 531.4859437751004,248 H168 Z"/>
-<text class="ink2" x="545.5" y="240.5" font-size="13" font-weight="400">1.72 ms</text>
-<text class="ink2" x="154" y="284.5" font-size="13" font-weight="400" text-anchor="end">Go net/http</text>
-<path class="peer" d="M168,268 H696.0 A4,4 0 0 1 700.0,272 V288 A4,4 0 0 1 696.0,292 H168 Z"/>
-<text class="ink2" x="710.0" y="284.5" font-size="13" font-weight="400">2.49 ms</text>
-<line class="axis" x1="168" y1="84" x2="168" y2="296" stroke-width="1"/>
-<text class="mut" x="28" y="342" font-size="11">Each server at its best worker count. At the shared one-per-core default the two are</text>
-<text class="mut" x="28" y="358" font-size="11">level at ~245us — worker count moves this more than anything in either framework.</text>
+<path class="peer" d="M168,92 H200.98048780487807 A4,4 0 0 1 204.98048780487807,96 V112 A4,4 0 0 1 200.98048780487807,116 H168 Z"/>
+<text class="ink2" x="215.0" y="108.5" font-size="13" font-weight="400">0.171 ms</text>
+<text class="ink2" x="154" y="152.5" font-size="13" font-weight="400" text-anchor="end">bare hyper (floor)</text>
+<path class="peer" d="M168,136 H201.84552845528455 A4,4 0 0 1 205.84552845528455,140 V156 A4,4 0 0 1 201.84552845528455,160 H168 Z"/>
+<text class="ink2" x="215.8" y="152.5" font-size="13" font-weight="400">0.175 ms</text>
+<text class="ink" x="154" y="196.5" font-size="13" font-weight="600" text-anchor="end">Churust</text>
+<path class="acc" d="M168,180 H209.63089430894308 A4,4 0 0 1 213.63089430894308,184 V200 A4,4 0 0 1 209.63089430894308,204 H168 Z"/>
+<text class="ink" x="223.6" y="196.5" font-size="13" font-weight="600">0.211 ms</text>
+<text class="ink2" x="154" y="240.5" font-size="13" font-weight="400" text-anchor="end">axum</text>
+<path class="peer" d="M168,224 H234.50081300813008 A4,4 0 0 1 238.50081300813008,228 V244 A4,4 0 0 1 234.50081300813008,248 H168 Z"/>
+<text class="ink2" x="248.5" y="240.5" font-size="13" font-weight="400">0.326 ms</text>
+<text class="ink2" x="154" y="284.5" font-size="13" font-weight="400" text-anchor="end">Ktor (Netty)</text>
+<path class="peer" d="M168,268 H561.918699186992 A4,4 0 0 1 565.918699186992,272 V288 A4,4 0 0 1 561.918699186992,292 H168 Z"/>
+<text class="ink2" x="575.9" y="284.5" font-size="13" font-weight="400">1.84 ms</text>
+<text class="ink2" x="154" y="328.5" font-size="13" font-weight="400" text-anchor="end">Go net/http</text>
+<path class="peer" d="M168,312 H696.0 A4,4 0 0 1 700.0,316 V332 A4,4 0 0 1 696.0,336 H168 Z"/>
+<text class="ink2" x="710.0" y="328.5" font-size="13" font-weight="400">2.46 ms</text>
+<line class="axis" x1="168" y1="84" x2="168" y2="340" stroke-width="1"/>
+<text class="mut" x="28" y="386" font-size="11">Each server at its best worker count. At the shared one-per-core default the two are</text>
+<text class="mut" x="28" y="402" font-size="11">level at ~245us — worker count moves this more than anything in either framework.</text>
 </svg>

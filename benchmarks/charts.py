@@ -4,7 +4,11 @@
 Run: python3 charts.py   (writes ../docs/assets/*.svg)
 
 The figures below are transcribed from
-`results/2026-08-01-linux-docker.md` and nowhere else. Keeping them here rather
+`results/2026-08-01-linux-docker.md` and nowhere else — the six-app run at four
+workers, median of nine rounds. Before this they had drifted badly: the
+throughput series said 699k/675k while its own alt text said 914k/880k, and
+neither matched any run. A chart and its description disagreeing is worse than
+either being stale, because a reader has no way to tell which one lied. Keeping them here rather
 than parsing that file is deliberate — a chart that silently redraws itself when
 a results file changes is a chart nobody can date. Change a number here only by
 copying it from a results file, and say which one.
@@ -163,12 +167,17 @@ def fmt(n: float) -> str:
 # 1. Throughput
 # -----------------------------------------------------------------------------
 
+# `bare hyper` is not a framework and is not a competitor: it is hyper and tokio
+# with nothing on top, serving the same bytes, and it is the floor any
+# hyper-based framework is measured against. It is drawn in the peer colour and
+# named as the floor so nobody reads it as a sixth contender.
 THROUGHPUT = [
-    ("Churust", 699_200, True),
-    ("actix-web", 675_053, False),
-    ("axum", 457_647, False),
-    ("Ktor (Netty)", 307_924, False),
-    ("Go net/http", 306_546, False),
+    ("actix-web", 890_387, False),
+    ("bare hyper (floor)", 873_574, False),
+    ("Churust", 798_184, True),
+    ("axum", 455_360, False),
+    ("Go net/http", 310_501, False),
+    ("Ktor (Netty)", 297_274, False),
 ]
 
 
@@ -183,13 +192,14 @@ def chart_throughput() -> str:
         header(
             w,
             h,
-            "Requests per second by framework, keep-alive, each at its best worker count",
-            "actix-web 914k, Churust 880k, axum 464k, Ktor 316k, Go net/http 315k "
-            "requests per second. Higher is better.",
+            "Requests per second by framework, keep-alive, four workers each",
+            "actix-web 890k, bare hyper 874k, Churust 798k, axum 455k, "
+            "Go net/http 311k, Ktor 297k requests per second. Higher is better; "
+            "actix-web leads and Churust is second of the frameworks.",
             "tp",
         ),
         titles(
-            "Requests per second — keep-alive, each server at its best worker count",
+            "Requests per second — keep-alive, four workers each",
             "Linux 6.12, 8 pinned cores · 64 connections · median of 9 rounds · higher is better",
         ),
     ]
@@ -326,11 +336,12 @@ def chart_pipelined() -> str:
 
 # Milliseconds at the 99th percentile, keep-alive.
 P99 = [
-    ("actix-web", 0.107, False),
-    ("Churust", 0.183, True),
-    ("axum", 0.292, False),
-    ("Ktor (Netty)", 1.72, False),
-    ("Go net/http", 2.49, False),
+    ("actix-web", 0.171, False),
+    ("bare hyper (floor)", 0.175, False),
+    ("Churust", 0.211, True),
+    ("axum", 0.326, False),
+    ("Ktor (Netty)", 1.84, False),
+    ("Go net/http", 2.46, False),
 ]
 
 
@@ -346,8 +357,8 @@ def chart_p99() -> str:
             w,
             h,
             "Tail latency at the 99th percentile, keep-alive",
-            "actix-web 0.107ms, Churust 0.183ms, axum 0.292ms, Ktor 1.72ms, Go net/http 2.49ms. "
-            "Lower is better; actix-web leads once each server is tuned.",
+            "actix-web 0.171ms, bare hyper 0.175ms, Churust 0.211ms, axum 0.326ms, "
+            "Ktor 1.84ms, Go net/http 2.46ms. Lower is better; actix-web leads.",
             "p99",
         ),
         titles(
@@ -411,11 +422,12 @@ def chart_p99() -> str:
 # -----------------------------------------------------------------------------
 
 CPU = [
-    ("actix-web", 4.21, False),
-    ("Churust", 6.49, True),
-    ("axum", 8.82, False),
-    ("Go net/http", 12.88, False),
-    ("Ktor (Netty)", 20.03, False),
+    ("bare hyper (floor)", 4.17, False),
+    ("actix-web", 4.24, False),
+    ("Churust", 4.92, True),
+    ("axum", 8.83, False),
+    ("Go net/http", 13.12, False),
+    ("Ktor (Netty)", 20.47, False),
 ]
 
 
@@ -431,8 +443,10 @@ def chart_cpu() -> str:
             w,
             h,
             "Server CPU microseconds per request by framework",
-            "actix-web 4.21, Churust 6.49, axum 8.82, Go net/http 12.88, Ktor 20.03 "
-            "microseconds of CPU per request. Lower is better; actix-web is best.",
+            "bare hyper 4.17, actix-web 4.24, Churust 4.92, axum 8.83, "
+            "Go net/http 13.12, Ktor 20.47 microseconds of CPU per request. "
+            "Lower is better. The gap from Churust to the bare-hyper floor, "
+            "0.75, is what the framework layer itself costs.",
             "cpu",
         ),
         titles(
@@ -494,6 +508,9 @@ def chart_before_after() -> str:
     w, h = 900, 392
     x0, x1 = 168, 700
     row, gap, top = 28, 22, 96
+    # Both sides from the superseded eight-worker run. Kept as a pair because
+    # the *comparison* is the claim and both halves were measured together;
+    # neither number is current, and the chart's title says so.
     data = [("Before", 390_772, False), ("After", 880_352, True)]
     peak = 880_352
 
