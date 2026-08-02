@@ -89,14 +89,36 @@ future stays where it was already built. Churust went from 5.10 to 4.87 µs per
 request and 781,872 to 814,690 req/s, with the confirming run's slowest round
 faster than the old best one.
 
-The 393 ns figure is not wrong, it is just not the whole layer: it measures
-routing, extraction and the pipeline driven directly, which skips everything the
-engine does per request — moving a 320-byte `Call` into a boxed future, the
-per-request allocations around it, and the connection loop. Profiling the real
-server (`benchmarks/profile.sh`) puts `__memcpy_generic` at 7.4% of samples and
-the malloc/free family at another 2.7%, neither of which appears in the floor's
-profile at all. That is the cost of dynamic dispatch, and it is the honest place
-to look for the next win — not the codec.
+**And the layer is bigger than this page used to say.** The 393 ns quoted here
+for Churust's isolated dispatch does not reproduce. Measured on the same Linux
+host as the wire figures above, pinned to the same CPUs, built with the same
+`lto = true, codegen-units = 1` the server ships with, `dispatch/bare_200` is
+**672 ns**. (It reads 817 ns under cargo's default bench profile, which is what
+the workspace used to use — benches now inherit the shipped build settings so
+the two numbers can be compared at all.)
+
+That closes the accounting almost exactly:
+
+| | µs/req |
+|---|---:|
+| Churust, on the wire | 4.87 |
+| bare hyper, the floor | 4.08 |
+| **the difference** | **0.79** |
+| Churust's dispatch, in isolation | **0.67** |
+
+**85% of what Churust costs above bare hyper is its own dispatch layer** —
+routing, extraction and the pipeline, with no socket and no hyper anywhere near
+it. The remaining ~0.12 µs is the engine around it, and that is the part
+`__memcpy_generic` and the malloc/free family live in.
+
+Which sets the price of first place honestly. actix-web's *entire* framework
+layer costs 4.20 − 4.08 = **0.12 µs** over a comparable floor. For Churust to
+match it, dispatch would have to fall from 672 ns to about 120 ns — 5.6× — and
+nothing in the profile is a 5.6× win. Getting there means changing how dispatch
+works, not tuning it: monomorphised routing instead of `Arc<dyn Handler>`,
+handlers borrowing the request instead of taking a 320-byte `Call` by value, and
+no boxed future per layer. That is a different framework's API, and Churust's
+is the one borrowed from Ktor on purpose.
 
 ![Pipelined throughput: actix-web 5.96M, Churust 4.45M, Ktor 1.23M, Go 352k, axum 24k](https://raw.githubusercontent.com/davthecoder/Churust/main/docs/assets/benchmark-pipelined.svg)
 

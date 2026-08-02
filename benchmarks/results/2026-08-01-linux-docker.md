@@ -107,8 +107,10 @@ other way — Ktor spends 20.03 µs and Go 12.88.
 
 **Where that CPU goes — corrected by a later measurement.** Churust's own
 dispatch path — routing, extraction, the pipeline, response building, with the
-wire app's configuration — costs **393 ns** when driven in isolation with no
-socket and no hyper underneath it, against a wire figure of 8.39 µs. This
+wire app's configuration — was published as **393 ns** when driven in isolation
+with no socket and no hyper underneath it, against a wire figure of 8.39 µs.
+(That 393 ns does not reproduce; see below. The correct figure for this hardware
+and build is 672 ns.) This
 section used to conclude from that pair that Churust's layer was 4.6% of a
 request and "the other 95% is hyper and the kernel", and that the residue was
 userspace work inside the two HTTP/1 implementations.
@@ -185,13 +187,37 @@ written down — the `max_headers` skip, the `catch_unwind` pin, the in-place
 pin's absent throughput effect, and the timer ceiling above — because a page
 that records only what worked makes the next person repeat the rest.
 
-The 393 ns measurement was not wrong; it was answering a narrower question than
-it was quoted for. It drives the router and pipeline directly, so it never runs
-the engine path: a 320-byte `Call` moved into a boxed future per request, the
-allocations around it, and the connection loop. `benchmarks/profile.sh` on the
-real server puts `__memcpy_generic` at 7.4% of samples and malloc/free at
-another 2.7%, and neither appears in the floor's profile. That is what dynamic
-dispatch costs.
+**The 393 ns does not reproduce either.** Measured on this same Linux host,
+pinned to the same CPUs, and built the way the server is built — `lto = true,
+codegen-units = 1` — `dispatch/bare_200` is **672 ns**. Under cargo's default
+bench profile, which is what this workspace used to leave benches on, it reads
+817 ns; on macOS, 680 ns. None of them is 393 ns, and the figure had been quoted
+against Linux wire numbers without recording where it was taken.
+`[profile.bench]` now matches the release profile, so the isolated figure and
+the wire figure finally describe the same compiled code.
+
+With a number that can legitimately be subtracted, the accounting closes:
+
+| | µs/req |
+|---|---:|
+| Churust, on the wire | 4.87 |
+| bare hyper, the floor | 4.08 |
+| **the difference** | **0.79** |
+| Churust's dispatch, in isolation | **0.67** |
+
+85% of what Churust costs above bare hyper is its own dispatch layer, measured
+with no socket and no hyper. The engine around it — where `__memcpy_generic` and
+the malloc/free family live, and where every optimisation in this round landed —
+is the other ~0.12 µs.
+
+**What first place would cost.** actix-web's entire framework layer is
+4.20 − 4.08 = 0.12 µs over a comparable floor. Churust's dispatch alone is 672
+ns: 5.6× that, before a byte reaches a socket. Nothing in the profile is a 5.6×
+win — the largest single cost found and fixed this round was worth 0.23 µs.
+Matching actix means monomorphised routing rather than `Arc<dyn Handler>`,
+handlers borrowing the request rather than taking a 320-byte `Call` by value,
+and no boxed future per pipeline layer. That is a different public API, not a
+faster implementation of this one.
 
 Syscalls are not the difference. Under identical load, `strace -c` counted
 174,147 syscalls for Churust against 172,871 for actix-web, with the same shape
