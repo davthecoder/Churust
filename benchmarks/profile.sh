@@ -81,6 +81,18 @@ perf report -i /tmp/perf.data --stdio --no-children -g none --percent-limit 0.3 
 # A flat profile names the cost but not the reason. `SYMBOL=__memcpy_generic`
 # asks who called it — which is the difference between "Churust memcpys more
 # than hyper" and knowing which line to change.
+# `ANNOTATE=<symbol>` shows which *source lines* inside one function cost, not
+# just which function does. The flat profile can say the engine's service
+# closure is 4.8% of user cycles; only this can say which of the header checks,
+# the `Call` construction or the response building that 4.8% actually is.
+# Needs the `-g` build this image already does.
+if [ -n "${ANNOTATE:-}" ]; then
+  echo
+  echo "=== $APP · source lines inside $ANNOTATE ==="
+  perf annotate -i /tmp/perf.data --stdio -l -s "$ANNOTATE" --percent-limit 0.8 \
+    2>/dev/null | grep -vE "^\s*$" | head -70 || true
+fi
+
 if [ -n "${SYMBOL:-}" ]; then
   echo
   echo "=== $APP · callers of $SYMBOL ==="

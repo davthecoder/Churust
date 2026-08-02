@@ -203,8 +203,17 @@ because the whole run drifted:
 |---|---:|---:|
 | before | 816,986 req/s · 4.87 µs | +0.81 µs |
 | after  | 801,915 req/s · 4.95 µs | +0.85 µs |
+| after, re-measured on a verified-fresh image | 806,768 req/s · 4.93 µs | +0.83 µs |
 
-Unchanged, marginally worse. **Reverted** — the change was justified by
+Unchanged. The third row exists because the second could not be trusted: the
+image was built with `docker build -q … >/dev/null 2>&1`, Docker's disk had
+filled, and the command still reported success — so that run may have measured
+the binary it was meant to be compared against. The re-measurement was taken
+after pruning, against an image whose build output was read rather than
+discarded, and it agrees. **Never build the benchmark image with its output
+suppressed; a benchmark that silently measures the wrong binary is worse than
+no benchmark, and this one nearly retired a change on a number that had not
+tested it.** **Reverted** — the change was justified by
 performance, the performance is not there, and it breaks every downstream
 `#[async_trait] impl`. The work is real and the dependency removal is a genuine
 good on its own; that is a deliberate decision about dependency hygiene and

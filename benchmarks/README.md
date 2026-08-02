@@ -73,6 +73,21 @@ actix-web and axum in Rust, Ktor because Churust's whole shape is borrowed from
 it, and Go's `net/http` because that is what "a Go backend" means to almost
 everyone writing one.
 
+## Build the image with its output visible
+
+`docker build -f benchmarks/Dockerfile -t churust-bench .` — not `-q`, and not
+with stderr redirected to `/dev/null`.
+
+This is not style. Docker's disk filled during one of these sessions, the image
+build failed on `No space left on device`, and a quiet build reported success
+anyway — so a measurement ran against a stale image and very nearly retired a
+change that had never been tested. Check `docker image inspect churust-bench
+--format '{{.Created}}'` if a result surprises you; the timestamp moves on a
+real rebuild. `docker builder prune -af` reclaims the space.
+
+A harness that can silently measure the wrong binary is worse than no harness,
+because its numbers still look like numbers.
+
 ## The sixth app: bare hyper, the floor
 
 `bench-hyper` is not a framework and is not in the default `APPS`. It is hyper
