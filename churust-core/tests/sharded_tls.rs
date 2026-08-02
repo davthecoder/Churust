@@ -36,8 +36,14 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
 }
 
 /// Start a TLS-configured app under the sharded engine on an ephemeral port.
-fn start_tls_sharded() -> (u16, tokio::sync::oneshot::Sender<()>) {
-    let dir = temp_dir("plaintext");
+///
+/// `tag` names this test's own directory. The two tests here run in parallel,
+/// and sharing one directory means both write `cert.pem` while the other may be
+/// reading it — a worker that loads a half-written certificate fails to build
+/// its acceptor, so nothing ever listens and the symptom is "the server never
+/// came up", several layers away from the cause.
+fn start_tls_sharded(tag: &str) -> (u16, tokio::sync::oneshot::Sender<()>, std::path::PathBuf) {
+    let dir = temp_dir(tag);
     let (cert, key) = self_signed(&dir);
 
     let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -63,7 +69,7 @@ fn start_tls_sharded() -> (u16, tokio::sync::oneshot::Sender<()>) {
 
     for _ in 0..200 {
         if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return (port, tx);
+            return (port, tx, dir);
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
@@ -72,7 +78,7 @@ fn start_tls_sharded() -> (u16, tokio::sync::oneshot::Sender<()>) {
 
 #[test]
 fn a_tls_port_never_answers_plaintext_http() {
-    let (port, _stop) = start_tls_sharded();
+    let (port, _stop, _dir) = start_tls_sharded("plaintext");
 
     let mut sock = TcpStream::connect(("127.0.0.1", port)).expect("connect");
     sock.set_read_timeout(Some(std::time::Duration::from_secs(3)))
@@ -100,7 +106,7 @@ fn a_tls_port_never_answers_plaintext_http() {
 fn a_tls_client_completes_its_handshake() {
     // The other half: refusing plaintext is not enough if the port also refuses
     // the traffic it is for.
-    let (port, _stop) = start_tls_sharded();
+    let (port, _stop, dir) = start_tls_sharded("handshake");
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -111,7 +117,6 @@ fn a_tls_client_completes_its_handshake() {
         // The certificate is self-signed and its own root; the test trusts it
         // explicitly rather than turning verification off, so this still
         // exercises a real chain check.
-        let dir = temp_dir("plaintext");
         let pem = std::fs::read(dir.join("cert.pem")).unwrap();
         for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
             roots.add(cert.unwrap()).unwrap();
