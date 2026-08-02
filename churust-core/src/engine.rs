@@ -2160,13 +2160,33 @@ async fn handle(
 ) -> Result<HyperResponse<EngineBody>, Infallible> {
     // `app` is moved, not cloned: the security set was taken from it once when
     // this connection was accepted, so nothing here needs it back afterwards.
-    let mut res = respond(app, req, max_body, timeout_ms, peer, conn_guard).await?;
+    let (mut res, pipeline_applied) =
+        respond(app, req, max_body, timeout_ms, peer, conn_guard).await?;
     // The `bool` is the builder's own certificate. This transport cannot tell
     // TLS from plaintext by itself — the stream arrives already decrypted, or
     // never was — so that is the only evidence available. HTTP/3 is the case
     // that can say `true` on its own.
-    if let Some((set, over_tls)) = &security {
-        set.apply_to(res.headers_mut(), *over_tls);
+    //
+    // Skipped when the pipeline already applied the set. `SecurityHeaders` is
+    // installed at `Phase::Setup`, which sorts outermost, so every response the
+    // pipeline produces has been through it — and applying it twice was not
+    // free. `apply_to` opens with `headers.reserve(n)`, and the second call met
+    // a map holding seven entries in a table sized for eight: one slot free,
+    // six wanted, so it grew to sixteen and rehashed every SipHash'd header
+    // name, then found all six headers already present and inserted nothing.
+    // One allocation, one free and seven rehashes per request, on every
+    // deployment running the default configuration — and invisible to
+    // `benchmarks/`, which turns security headers off so the apps do equal
+    // work.
+    //
+    // `respond` still reports `false` for the responses that never reached the
+    // pipeline — the two framing refusals, the oversized-body refusal, and a
+    // handler that ran out of time — because those genuinely have no headers
+    // yet. `security_headers_survive_the_engines_own_refusals` covers each one.
+    if !pipeline_applied {
+        if let Some((set, over_tls)) = &security {
+            set.apply_to(res.headers_mut(), *over_tls);
+        }
     }
     Ok(res)
 }
@@ -2176,6 +2196,12 @@ async fn handle(
 /// Everything below is about *whether* to dispatch: the two refusals return
 /// without ever reaching the pipeline. `handle` above is what makes the answer
 /// look the same either way.
+/// Returns the response and whether the pipeline produced it.
+///
+/// `false` means nothing has applied the security header set yet: the refusals
+/// below return before dispatch, and a timed-out request has its response
+/// replaced after the pipeline's own has been abandoned. `handle` uses the flag
+/// to avoid applying the set twice to the responses that already carry it.
 async fn respond(
     app: App,
     req: HyperRequest<Incoming>,
@@ -2183,7 +2209,7 @@ async fn respond(
     timeout_ms: u64,
     peer: std::net::SocketAddr,
     conn_guard: ConnGuard,
-) -> Result<HyperResponse<EngineBody>, Infallible> {
+) -> Result<(HyperResponse<EngineBody>, bool), Infallible> {
     // Refuse a body the client has already declared too large, before the
     // request is dispatched.
     //
@@ -2215,7 +2241,7 @@ async fn respond(
                 .header(http::header::CONTENT_TYPE, TEXT_PLAIN)
                 .body(EngineBody::from_static(b"Payload Too Large"))
                 .expect("response build is infallible");
-            return Ok(res);
+            return Ok((res, false));
         }
     }
 
@@ -2265,7 +2291,7 @@ async fn respond(
             .header(http::header::CONTENT_TYPE, TEXT_PLAIN)
             .body(EngineBody::from_static(b"Bad Request"))
             .expect("response build is infallible");
-        return Ok(res);
+        return Ok((res, false));
     }
 
     // RFC 9112 §3.2: an HTTP/1.1 request must carry exactly one `Host`, and a
@@ -2302,7 +2328,7 @@ async fn respond(
                 .header(http::header::CONTENT_TYPE, TEXT_PLAIN)
                 .body(EngineBody::from_static(b"Bad Request"))
                 .expect("response build is infallible");
-            return Ok(res);
+            return Ok((res, false));
         }
     }
 
@@ -2408,13 +2434,21 @@ async fn respond(
     // Pinning first fixed the copy into `Timeout`; building in place fixes the
     // copy into the pin. `Pin<&mut F>` is a `Future` when `F` is, so both the
     // timeout branch and the one below hand over sixteen bytes.
+    // Tracks whether the response below came out of the pipeline. A timeout
+    // discards whatever the pipeline was going to return, so the substitute has
+    // not been through the security middleware and `handle` has to apply the
+    // set itself.
+    let mut pipeline_applied = true;
     let res = if timeout_ms == 0 {
         process.await
     } else {
         match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), process).await {
             Ok(res) => res,
-            Err(_) => crate::response::Response::text("Request Timeout")
-                .with_status(StatusCode::REQUEST_TIMEOUT),
+            Err(_) => {
+                pipeline_applied = false;
+                crate::response::Response::text("Request Timeout")
+                    .with_status(StatusCode::REQUEST_TIMEOUT)
+            }
         }
     };
 
@@ -2422,7 +2456,10 @@ async fn respond(
     if let Some(headers) = builder.headers_mut() {
         *headers = res.headers;
     }
-    Ok(builder
-        .body(EngineBody::new(res.body))
-        .expect("response build is infallible"))
+    Ok((
+        builder
+            .body(EngineBody::new(res.body))
+            .expect("response build is infallible"),
+        pipeline_applied,
+    ))
 }

@@ -5,6 +5,19 @@
 # what it measures, and the numbers below are shares of samples rather than
 # times. The question it answers is "which functions", and the answer is only
 # ever a lead to confirm with run-linux.sh.
+#
+# What works in this image, and what does not — established by trying:
+#
+#   works:  `perf report -g none`, the flat self-time profile. Use EVENT=cycles:u
+#           for user-space symbols; with kernel samples included nearly every
+#           stack begins in a frame that frame-pointer unwinding cannot walk.
+#   works:  `perf report -g caller` under `cycles:u`, which is how the 2,616-byte
+#           future moved into `tokio::time::timeout` was found.
+#   empty:  `perf report -g caller` under the default event, `perf annotate -s
+#           <symbol>`, and `perf report --sort srcline`. All three return a
+#           report with no rows against the LinuxKit kernel Docker Desktop runs.
+#           Source-line attribution inside a function is therefore not available
+#           here; do not spend another afternoon on it without a different host.
 set -euo pipefail
 # Reporting pipelines below end in `head`, which closes the pipe as soon as it
 # has enough lines. That SIGPIPEs the producer, `pipefail` turns it into a

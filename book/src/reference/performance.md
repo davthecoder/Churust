@@ -3,6 +3,8 @@
 Churust is fast, and this page is about being precise rather than loud: what was
 measured, against what, on what, and what the number does not cover.
 
+![Requests per second under keep-alive HTTP/1.1 at four workers: actix-web 890k, bare hyper (the floor) 874k, Churust 798k, axum 455k, Go net/http 311k, Ktor 297k. actix-web leads; Churust is second of the frameworks.](https://raw.githubusercontent.com/davthecoder/Churust/main/docs/assets/benchmark-throughput.svg)
+
 | keep-alive, 4 workers, median of 9 | req/s | vs. Churust | server CPU µs/req | p99 |
 |---|---:|---:|---:|---:|
 | actix-web 4.14 | **916,364** | 1.12× | **4.20** | **105 µs** |
@@ -92,6 +94,8 @@ future stays where it was already built. Churust went from 5.10 to 4.87 µs per
 request and 781,872 to 814,690 req/s, with the confirming run's slowest round
 faster than the old best one.
 
+![Server CPU microseconds per request: bare hyper 4.17, actix-web 4.24, Churust 4.92, axum 8.83, Go net/http 13.12, Ktor 20.47. Lower is better; the 0.75 gap from Churust to the bare-hyper floor is what the framework layer costs.](https://raw.githubusercontent.com/davthecoder/Churust/main/docs/assets/benchmark-cpu-per-request.svg)
+
 **Where the 0.79 µs goes, and what it would take to close it.**
 
 Half of it is Churust's dispatch layer and half is the engine around it:
@@ -99,14 +103,14 @@ Half of it is Churust's dispatch layer and half is the engine around it:
 | | ns/req |
 |---|---:|
 | Churust's overhead above the floor | ~790 |
-| dispatch — routing, extraction, pipeline | ~400 |
-| the engine — `respond`, `Call` construction, timeout, `EngineBody`, guards | ~390 |
+| dispatch — routing, extraction, pipeline (`wire_200`) | 385 |
+| the engine — `respond`, `Call` construction, timeout, `EngineBody`, guards | ~405 |
 
 (Two figures have been published for dispatch, 393 ns and 672 ns, and both are
-right about different applications. `benches/dispatch.rs` builds the *default*
-server, which installs the security-headers middleware — a layer measuring
-268–301 ns that `bench-churust` turns off. Measured in the wire configuration,
-dispatch is ~400 ns.)
+right about different applications. `benches/dispatch.rs` now measures both:
+`bare_200` builds the *default* server, which installs the security-headers
+middleware, and reads 688 ns; `wire_200` builds the shape `bench-churust`
+serves and reads **385 ns**, which is what the original 393 ns described.)
 
 **First place is not reachable by making dispatch faster.** Matching actix-web
 means shedding 790 − 120 = 670 ns, and the entire dispatch layer is ~400. A
@@ -133,7 +137,7 @@ six header slots on a map that already holds them, forcing a grow and a rehash
 to discover there is nothing to do. Every real deployment pays that; no
 benchmark here measures it.
 
-![Pipelined throughput: actix-web 5.96M, Churust 4.45M, Ktor 1.23M, Go 352k, axum 24k](https://raw.githubusercontent.com/davthecoder/Churust/main/docs/assets/benchmark-pipelined.svg)
+![Pipelined throughput, from the superseded eight-worker run: actix-web 5.96M, Churust 4.45M, Ktor 1.23M, Go 352k, axum 24k](https://raw.githubusercontent.com/davthecoder/Churust/main/docs/assets/benchmark-pipelined.svg)
 
 axum's last place there is not about its routing — the keep-alive table shows
 that is fine. hyper answers each request in a pipelined batch with its own
@@ -208,7 +212,7 @@ coalescing without giving up the latency guarantee.
 
 ## Where the speed-up came from
 
-![Churust before and after: 391k to 758k requests per second](https://raw.githubusercontent.com/davthecoder/Churust/main/docs/assets/benchmark-before-after.svg)
+![Churust before and after, from the superseded eight-worker run: 391k to 758k requests per second](https://raw.githubusercontent.com/davthecoder/Churust/main/docs/assets/benchmark-before-after.svg)
 
 None of it was in routing or extraction, which is where a profiler points first:
 

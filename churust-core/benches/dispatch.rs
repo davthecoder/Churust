@@ -84,7 +84,7 @@ impl Middleware for Noop {
 /// it, because Criterion's own `--test` self-check mode still calls
 /// `bench_dispatch` in full — it only swaps each measured `iter()` closure to
 /// run once instead of thousands of times.
-async fn assert_dispatch_cases_do_real_work(bare: &App, with_middleware: &App) {
+async fn assert_dispatch_cases_do_real_work(bare: &App, wire: &App, with_middleware: &App) {
     let bare_ok = bare
         .process(
             Method::GET,
@@ -108,6 +108,41 @@ async fn assert_dispatch_cases_do_real_work(bare: &App, with_middleware: &App) {
         !bare_ok.headers.contains_key(NOOP_MARKER),
         "the bare app's response carries the middleware marker header; \
          bare_200 and three_middleware would be measuring the same pipeline"
+    );
+
+    // `wire_200` is 40% cheaper than `bare_200` by design, and a bench that is
+    // cheaper because it silently does less is exactly what
+    // check-bench-regression.py cannot catch — it only fires on regressions.
+    // So assert the difference is the intended one: no security headers, and a
+    // body that came from the zero-copy path.
+    let wire_ok = wire
+        .process(
+            Method::GET,
+            "/hello".parse().expect("a valid uri"),
+            HeaderMap::new(),
+            Bytes::new(),
+        )
+        .await;
+    assert_eq!(
+        wire_ok.status,
+        StatusCode::OK,
+        "GET /hello on the wire app did not return 200"
+    );
+    assert_eq!(
+        wire_ok.body.as_slice(),
+        Some(b"hello".as_slice()),
+        "GET /hello on the wire app returned an unexpected body"
+    );
+    assert!(
+        !wire_ok.headers.contains_key("x-content-type-options"),
+        "the wire app is sending security headers; wire_200 would be measuring \
+         the same shape as bare_200 and the two would not be telling us anything \
+         different"
+    );
+    assert!(
+        bare_ok.headers.contains_key("x-content-type-options"),
+        "the bare app is NOT sending security headers; bare_200 is supposed to \
+         be the default configuration, and without them it no longer is"
     );
 
     let miss = bare
@@ -156,9 +191,29 @@ fn bench_dispatch(c: &mut Criterion) {
     let rt = rt();
 
     // Built once, outside every measured closure.
+    //
+    // NOTE this is the *default* configuration: `Churust::server()` seeds
+    // `security: Some(..)`, so a `SecurityHeaders` middleware runs on every
+    // dispatch below. That is deliberate — it is what a deployment gets — but
+    // it is not what `benchmarks/bench-churust` runs, and quoting `bare_200`
+    // against a wire figure is a mistake this file has now caused twice. Use
+    // `wire_200` for that comparison.
     let bare = Churust::server()
         .routing(|r| {
             r.get("/hello", |_c: Call| async { "hello" });
+        })
+        .build();
+
+    // The shape `benchmarks/bench-churust` actually serves: security headers
+    // off so the comparison apps do equal work, and a `Response::bytes` from a
+    // `&'static` rather than a `&str` that goes through `Response::text` and
+    // allocates a `String`.
+    let wire = Churust::server()
+        .without_security_headers()
+        .routing(|r| {
+            r.get("/hello", |_c: Call| async {
+                churust_core::Response::bytes("text/plain; charset=utf-8", "hello")
+            });
         })
         .build();
 
@@ -176,9 +231,19 @@ fn bench_dispatch(c: &mut Criterion) {
 
     // Runs every time this function does, i.e. on every `cargo bench` and
     // every `cargo test --bench dispatch` — see the doc comment above.
-    rt.block_on(assert_dispatch_cases_do_real_work(&bare, &with_middleware));
+    rt.block_on(assert_dispatch_cases_do_real_work(
+        &bare,
+        &wire,
+        &with_middleware,
+    ));
 
     let mut group = c.benchmark_group("dispatch");
+
+    // Parsed once. `bare_200` parses inside its closure, which charges every
+    // iteration for a `PathAndQuery::from_shared` that the server never pays —
+    // hyper hands the engine a `Uri` already built. It measured ~1% of this
+    // benchmark's user cycles under `benchmarks/profile.sh`.
+    let uri: http::Uri = "/hello".parse().expect("a valid uri");
 
     group.bench_function("bare_200", |b| {
         b.to_async(&rt).iter(|| {
@@ -189,6 +254,13 @@ fn bench_dispatch(c: &mut Criterion) {
                 Bytes::new(),
             )
         })
+    });
+
+    // The number to quote against `benchmarks/results/`: the deployed
+    // configuration, with nothing in the loop the server does not do.
+    group.bench_function("wire_200", |b| {
+        b.to_async(&rt)
+            .iter(|| wire.process(Method::GET, uri.clone(), HeaderMap::new(), Bytes::new()))
     });
 
     group.bench_function("three_middleware", |b| {

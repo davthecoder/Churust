@@ -109,8 +109,8 @@ other way — Ktor spends 20.03 µs and Go 12.88.
 dispatch path — routing, extraction, the pipeline, response building, with the
 wire app's configuration — was published as **393 ns** when driven in isolation
 with no socket and no hyper underneath it, against a wire figure of 8.39 µs.
-(672 ns is the *default-configuration* bench; the wire shape this sentence
-describes is ~400 ns. See the correction below.) This
+(672/688 ns is the *default-configuration* bench, `bare_200`. The wire shape
+this sentence describes is `wire_200`, measured at 385 ns. See below.) This
 section used to conclude from that pair that Churust's layer was 4.6% of a
 request and "the other 95% is hyper and the kernel", and that the residue was
 userspace work inside the two HTTP/1 implementations.
@@ -182,7 +182,49 @@ the runtime's own I/O driver, not the request timeout, and the change was never
 written: it would have complicated the semantics of a security control, and
 helped only handlers that complete without awaiting anything.
 
-**Four of the six things tried in this round measured nothing.** They are all
+**Dropping `#[async_trait]` from the extractor traits measured nothing either,
+and it was the last item on the reachable list.**
+
+The prediction was 25–47 ns from a microbenchmark, on solid-looking reasoning:
+`impl FromCall for Call` is literally `Ok(call)` behind a `Pin<Box<dyn Future>>`,
+so every request heap-allocated to hand back a value it already held. The
+conversion was done properly — the three trait methods redeclared as
+`-> impl Future<Output = ..> + Send` (RPITIT, since `async fn` in a trait cannot
+promise `Send`), 22 attributes removed across `extract.rs` and implementors in
+six crates, `async-trait` dropped from the extractor path entirely. DX was
+checked first and is unchanged: an impl may satisfy an RPITIT method with a
+plain `async fn`, so implementors delete an attribute and an import and write
+the same code.
+
+Measured at four workers over nine rounds, normalised to the bare-hyper floor
+because the whole run drifted:
+
+| | Churust | above the floor |
+|---|---:|---:|
+| before | 816,986 req/s · 4.87 µs | +0.81 µs |
+| after  | 801,915 req/s · 4.95 µs | +0.85 µs |
+| after, re-measured on a verified-fresh image | 806,768 req/s · 4.93 µs | +0.83 µs |
+
+Unchanged. The third row exists because the second could not be trusted: the
+image was built with `docker build -q … >/dev/null 2>&1`, Docker's disk had
+filled, and the command still reported success — so that run may have measured
+the binary it was meant to be compared against. The re-measurement was taken
+after pruning, against an image whose build output was read rather than
+discarded, and it agrees. **Never build the benchmark image with its output
+suppressed; a benchmark that silently measures the wrong binary is worse than
+no benchmark, and this one nearly retired a change on a number that had not
+tested it.** **Reverted** — the change was justified by
+performance, the performance is not there, and it breaks every downstream
+`#[async_trait] impl`. The work is real and the dependency removal is a genuine
+good on its own; that is a deliberate decision about dependency hygiene and
+modern Rust, not something to ship as the residue of a failed optimisation.
+
+This matters for how the remaining estimates should be read. The reachable set
+was put at 60–110 ns, and its highest-confidence item — the one with a
+mechanism you could point at in the source — delivered zero at the wire. Treat
+the rest of that list as unproven until each is measured the same way.
+
+**Five of the seven things tried in this round measured nothing.** They are all
 written down — the `max_headers` skip, the `catch_unwind` pin, the in-place
 pin's absent throughput effect, and the timer ceiling above — because a page
 that records only what worked makes the next person repeat the rest.
@@ -191,7 +233,16 @@ that records only what worked makes the next person repeat the rest.
 configuration mismatch, and this is the fourth number in this file to go wrong
 the same way.**
 
-`dispatch/bare_200` was quoted against it and reads 672 ns. But the two measure
+There is now a benchmark case for each shape, so this can be read off instead
+of triangulated:
+
+| `cargo bench -p churust-core --bench dispatch`, Linux, `lto = true` | ns |
+|---|---:|
+| `bare_200` — the **default** configuration | 688 |
+| **`wire_200` — the shape `bench-churust` serves** | **385** |
+| originally published | 393 |
+
+`wire_200` and the published figure agree to within 2%. The two cases measure
 different applications:
 
 - `benches/dispatch.rs:158` builds `Churust::server()` — the *default* builder,
@@ -205,19 +256,23 @@ different applications:
   `String` allocation. The wire app returns `Response::bytes` from a
   `&'static`, which does not allocate.
 
-Four independent re-measurements — two machines, two harness families — put the
-ratio between the two shapes at 1.63–1.88×, and the wire-shaped figure at
-**388–438 ns**. The line above this section already said the 393 ns was measured
-"with the wire app's configuration". It was approximately right for the app it
-described, and comparing it to a default-configuration bench was the error.
+The line above this section already said the 393 ns was measured "with the wire
+app's configuration". It was right for the app it described, and comparing it to
+a default-configuration bench was the error.
+
+`wire_200`'s guard asserts the two cases differ the way they are meant to — it
+must carry no security headers, `bare_200` must carry them. `wire_200` is 44%
+cheaper *by design*, and a bench that is cheaper because it silently does less
+is exactly what `check-bench-regression.py` cannot catch: it only fires on
+regressions.
 
 **So the 85% attribution published here was wrong too.** Corrected:
 
 | | ns/req |
 |---|---:|
 | Churust's overhead above the bare-hyper floor | ~790 |
-| of which: dispatch, wire-shaped | ~400 (~50%) |
-| of which: the engine above `App::process` | ~390 (~50%) |
+| of which: dispatch, wire-shaped (`wire_200`) | **385 (49%)** |
+| of which: the engine above `App::process` | ~405 (51%) |
 
 The engine half — `respond`'s pre-dispatch header checks, `Call` construction
 from hyper's parts, the timeout wrapper, `EngineBody`, the connection guard —
@@ -252,6 +307,55 @@ pays 268–301 ns for the security-headers layer. On the plaintext TCP path
 the transport (`engine.rs:2169`), the second call reserving six slots on a map
 that already holds them and forcing a grow and rehash to find nothing to do.
 Fixing that helps every real user and moves no number in this file.
+
+## What first place would actually require
+
+The floor makes this computable rather than arguable, and the answer is worth
+writing down so the investigation is not repeated.
+
+**Bare hyper beats actix-web.** 4.17 µs against 4.24 in the six-app run. So a
+framework built on hyper *can* be the fastest thing here — it is not blocked by
+its HTTP implementation. It simply has to cost almost nothing:
+
+```
+actix-web                                  4.24 µs/req
+bare hyper, the floor                      4.17
+budget for an entire framework layer       ~0.07   (70 ns)
+
+Churust's layer today                       0.75   (750 ns)
+```
+
+**First place needs a 10x reduction in everything Churust does.** Not in one
+hot spot — in the total.
+
+Summing every Churust-attributable symbol from `profile.sh` with `cycles:u`:
+malloc/free 7.68%, the engine's service closure 4.78%, `Next::run` 2.17%, the
+connection loop 1.40%, the handler call 1.18%, the path scan 1.15%,
+`Response::bytes` 1.14%, `process_call` 1.08%, SipHash 0.70%, and Churust's
+share of memcpy ~5.9% — about **27% of user-space cycles**, which reconciles
+with the 750 ns measured against the floor. Getting to 70 ns means deleting
+roughly nine tenths of that.
+
+Nothing available does that. The structural candidate — monomorphised dispatch,
+replacing `Arc<dyn Handler>` and the per-layer boxed futures with static
+dispatch — was prototyped and measured at **20 ns**, because erasure is not
+where the cost is: actix-web pays more vtable dispatches and more allocations
+per request than Churust does and is still faster. The API-preserving set
+(dropping `#[async_trait]` from the extractor traits, FxHash, inline path
+segments, fusing the path scans) totals 60–110 ns. Both together are ~2%.
+
+So: **Churust is second of six on this workload and cannot be made first by
+optimisation.** It is 1.8x axum, 2.6x Go and 2.7x Ktor, within 11% of
+actix-web, and it spends 16% more CPU per request than actix does. Those are
+the honest claims.
+
+Two things this does *not* say. It does not say the remaining 750 ns is
+uninteresting — the largest single defect found in this whole effort was 1.10 µs
+on the default configuration, and it was found by profiling after the throughput
+work had been declared finished. And it does not say Churust is second on
+everything: it is the only server here that sends a security header set by
+default, which is precisely why its default configuration is slower than its
+benchmark configuration, and why `bench-churust` has a `SECURITY=1` toggle now.
 
 **A caveat on the throughput ranking itself.** CPU/req × req/s gives cores
 consumed: bare hyper 3.65, actix 3.85, Churust 3.98, all on four workers.

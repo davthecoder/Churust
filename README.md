@@ -185,6 +185,10 @@ Every Churust crate is released in lockstep on one version number, so
 
 ## Performance
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/davthecoder/Churust/main/docs/assets/benchmark-throughput.svg" alt="Requests per second under keep-alive HTTP/1.1 at four workers: actix-web 890k, bare hyper (the floor) 874k, Churust 798k, axum 455k, Go net/http 311k, Ktor 297k. actix-web leads; Churust is second of the frameworks." width="900" />
+</p>
+
 Six servers, three routes, byte-identical responses, on a Linux kernel. One
 server runs at a time, the order rotates each round, the server is pinned to
 eight CPUs and the load generator to four, and [the harness](benchmarks/)
