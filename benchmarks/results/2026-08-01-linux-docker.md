@@ -253,6 +253,55 @@ the transport (`engine.rs:2169`), the second call reserving six slots on a map
 that already holds them and forcing a grow and rehash to find nothing to do.
 Fixing that helps every real user and moves no number in this file.
 
+## What first place would actually require
+
+The floor makes this computable rather than arguable, and the answer is worth
+writing down so the investigation is not repeated.
+
+**Bare hyper beats actix-web.** 4.17 µs against 4.24 in the six-app run. So a
+framework built on hyper *can* be the fastest thing here — it is not blocked by
+its HTTP implementation. It simply has to cost almost nothing:
+
+```
+actix-web                                  4.24 µs/req
+bare hyper, the floor                      4.17
+budget for an entire framework layer       ~0.07   (70 ns)
+
+Churust's layer today                       0.75   (750 ns)
+```
+
+**First place needs a 10x reduction in everything Churust does.** Not in one
+hot spot — in the total.
+
+Summing every Churust-attributable symbol from `profile.sh` with `cycles:u`:
+malloc/free 7.68%, the engine's service closure 4.78%, `Next::run` 2.17%, the
+connection loop 1.40%, the handler call 1.18%, the path scan 1.15%,
+`Response::bytes` 1.14%, `process_call` 1.08%, SipHash 0.70%, and Churust's
+share of memcpy ~5.9% — about **27% of user-space cycles**, which reconciles
+with the 750 ns measured against the floor. Getting to 70 ns means deleting
+roughly nine tenths of that.
+
+Nothing available does that. The structural candidate — monomorphised dispatch,
+replacing `Arc<dyn Handler>` and the per-layer boxed futures with static
+dispatch — was prototyped and measured at **20 ns**, because erasure is not
+where the cost is: actix-web pays more vtable dispatches and more allocations
+per request than Churust does and is still faster. The API-preserving set
+(dropping `#[async_trait]` from the extractor traits, FxHash, inline path
+segments, fusing the path scans) totals 60–110 ns. Both together are ~2%.
+
+So: **Churust is second of six on this workload and cannot be made first by
+optimisation.** It is 1.8x axum, 2.6x Go and 2.7x Ktor, within 11% of
+actix-web, and it spends 16% more CPU per request than actix does. Those are
+the honest claims.
+
+Two things this does *not* say. It does not say the remaining 750 ns is
+uninteresting — the largest single defect found in this whole effort was 1.10 µs
+on the default configuration, and it was found by profiling after the throughput
+work had been declared finished. And it does not say Churust is second on
+everything: it is the only server here that sends a security header set by
+default, which is precisely why its default configuration is slower than its
+benchmark configuration, and why `bench-churust` has a `SECURITY=1` toggle now.
+
 **A caveat on the throughput ranking itself.** CPU/req × req/s gives cores
 consumed: bare hyper 3.65, actix 3.85, Churust 3.98, all on four workers.
 Churust's workers are pegged; the other two have 4–9% headroom, which means
