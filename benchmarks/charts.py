@@ -184,7 +184,7 @@ def chart_throughput() -> str:
             w,
             h,
             "Requests per second by framework, ordinary keep-alive HTTP/1.1",
-            "Churust 700k, actix-web 629k, axum 463k, Go net/http 303k, Ktor 299k "
+            "Churust 758k, actix-web 644k, axum 464k, Ktor 316k, Go net/http 315k "
             "requests per second. Higher is better.",
             "tp",
         ),
@@ -244,11 +244,11 @@ def chart_throughput() -> str:
 # -----------------------------------------------------------------------------
 
 PIPELINED = [
-    ("actix-web", 5_341_892, False),
-    ("Churust", 3_840_745, True),
-    ("Ktor (Netty)", 1_150_040, False),
-    ("Go net/http", 356_409, False),
-    ("axum", 24_547, False),
+    ("actix-web", 5_955_207, False),
+    ("Churust", 4_449_755, True),
+    ("Ktor (Netty)", 1_227_741, False),
+    ("Go net/http", 352_427, False),
+    ("axum", 24_379, False),
 ]
 
 
@@ -264,7 +264,7 @@ def chart_pipelined() -> str:
             w,
             h,
             "Requests per second with HTTP/1.1 pipelining at depth 16",
-            "actix-web 5.34M, Churust 3.84M, Ktor 1.15M, Go net/http 356k, axum 25k "
+            "actix-web 5.96M, Churust 4.45M, Ktor 1.23M, Go net/http 352k, axum 24k "
             "requests per second. actix-web leads this mode.",
             "pl",
         ),
@@ -326,11 +326,11 @@ def chart_pipelined() -> str:
 
 # Milliseconds at the 99th percentile, keep-alive.
 P99 = [
-    ("axum", 0.333, False),
-    ("Churust", 0.603, True),
-    ("actix-web", 1.10, False),
-    ("Ktor (Netty)", 1.88, False),
-    ("Go net/http", 2.46, False),
+    ("actix-web", 0.240, False),
+    ("Churust", 0.246, True),
+    ("axum", 0.292, False),
+    ("Ktor (Netty)", 1.72, False),
+    ("Go net/http", 2.49, False),
 ]
 
 
@@ -346,14 +346,13 @@ def chart_p99() -> str:
             w,
             h,
             "Tail latency at the 99th percentile, keep-alive",
-            "axum 0.33ms, Churust 0.60ms, actix-web 1.10ms, Ktor 1.88ms, Go net/http 2.46ms. "
-            "Lower is better; axum is best and Churust is second. This measure is the "
-            "noisiest one here and moves between runs.",
+            "actix-web 0.240ms, Churust 0.246ms, axum 0.292ms, Ktor 1.72ms, Go net/http 2.49ms. "
+            "Lower is better. Churust and actix-web are tied within run-to-run noise.",
             "p99",
         ),
         titles(
-            "Tail latency — the noisiest measure here",
-            "99th-percentile response time under keep-alive load · lower is better",
+            "Tail latency — Churust and actix-web are tied",
+            "99th-percentile response time, median of 9 rounds · lower is better",
         ),
     ]
 
@@ -393,14 +392,14 @@ def chart_p99() -> str:
         footnote(
             w,
             h - 36,
-            "Moves a lot between runs — actix-web measured 412us in one and 1.10ms in the next —",
+            "240us against 246us is a tie: the two overlap round for round. Both clear axum, and",
         )
     )
     out.append(
         footnote(
             w,
             h - 20,
-            "so read the ordering here as approximate. The shared-runtime default measures 444us.",
+            "both are an order of magnitude ahead of the JVM and Go on this workload.",
         )
     )
     out.append("</svg>")
@@ -412,11 +411,11 @@ def chart_p99() -> str:
 # -----------------------------------------------------------------------------
 
 CPU = [
-    ("actix-web", 7.44, False),
-    ("Churust", 8.37, True),
-    ("axum", 8.70, False),
-    ("Go net/http", 13.04, False),
-    ("Ktor (Netty)", 19.95, False),
+    ("actix-web", 7.91, False),
+    ("Churust", 8.39, True),
+    ("axum", 8.82, False),
+    ("Go net/http", 12.88, False),
+    ("Ktor (Netty)", 20.03, False),
 ]
 
 
@@ -432,7 +431,7 @@ def chart_cpu() -> str:
             w,
             h,
             "Server CPU microseconds per request by framework",
-            "actix-web 7.44, Churust 8.37, axum 8.70, Go net/http 13.04, Ktor 19.95 "
+            "actix-web 7.91, Churust 8.39, axum 8.82, Go net/http 12.88, Ktor 20.03 "
             "microseconds of CPU per request. Lower is better; actix-web is best.",
             "cpu",
         ),
@@ -495,8 +494,8 @@ def chart_before_after() -> str:
     w, h = 900, 392
     x0, x1 = 168, 700
     row, gap, top = 28, 22, 96
-    data = [("Before", 390_772, False), ("After", 699_786, True)]
-    peak = 699_786
+    data = [("Before", 390_772, False), ("After", 757_930, True)]
+    peak = 757_930
 
     out = [
         header(
@@ -504,12 +503,12 @@ def chart_before_after() -> str:
             h,
             "Churust throughput before and after this work",
             "Churust went from 391 thousand to 699 thousand requests per second on "
-            "keep-alive load, a 1.79 times change, while its 99th-percentile latency "
-            "went from 444 microseconds to 603 microseconds.",
+            "keep-alive load, a 1.94 times change, with 99th-percentile latency improving "
+            "from 444 microseconds to 246 microseconds as well.",
             "ba",
         ),
         titles(
-            "Churust, before and after this work — 1.79× on keep-alive",
+            "Churust, before and after this work — 1.94× on keep-alive",
             "Same kernel, same harness, same pinned cores · only the binary differs",
         ),
     ]
@@ -531,12 +530,12 @@ def chart_before_after() -> str:
 
     notes = [
         "Removing per-request atomics from shared cache lines",
-        "One runtime per core, connections pinned (App::run_sharded)",
-        "Dropping the per-request extension-map allocation, and several others",
+        "One runtime per core (App::run_sharded), SO_REUSEPORT on Linux",
+        "Dropping per-request allocations, and the connection loop's bookkeeping",
         "TCP_NODELAY on by default",
         "",
-        "Bought with tail latency: p99 444us before, 603us after — the affinity",
-        "trade, and why run_sharded is opt-in rather than the default.",
+        "Tail latency improved too: p99 444us before, 246us after, once the",
+        "per-connection handoff and the loop bookkeeping were removed.",
     ]
     ny = y + 18
     out.append(

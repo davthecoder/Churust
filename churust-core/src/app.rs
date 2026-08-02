@@ -1118,17 +1118,20 @@ impl App {
     ///
     /// | | requests/second | p99 latency |
     /// |---|---:|---:|
-    /// | [`start`](App::start) (shared runtime) | 390,772 | **444 µs** |
-    /// | `run_sharded` | **699,786** | 603 µs |
+    /// | [`start`](App::start) (shared runtime) | 390,772 | 444 µs |
+    /// | `run_sharded` | **757,930** | **246 µs** |
     ///
-    /// **1.79× the throughput, for some tail latency.** With per-connection
-    /// affinity, a request that lands on a busy worker waits for that worker
-    /// instead of being picked up by an idle one, and the slowest percentile is
-    /// where that shows up.
+    /// **1.94× the throughput, and better tail latency with it.** An earlier
+    /// version of this engine did trade tail for throughput — it accepted
+    /// centrally and handed each socket to a worker — and the per-connection
+    /// handoff was what cost the latency, not the affinity. On Linux the
+    /// workers now take their own connections via `SO_REUSEPORT`.
     ///
-    /// Reach for it when throughput is the constraint and requests are many,
-    /// short and uniform. Keep [`start`](App::start) when the 99th percentile is
-    /// a number anyone looks at. See
+    /// The affinity trade is still real in principle: a request that lands on a
+    /// busy worker waits for that worker rather than being picked up by an idle
+    /// one, so uneven or long-running handlers are the case where
+    /// [`start`](App::start) still wins. Reach for `run_sharded` when requests
+    /// are many, short and uniform. See
     /// [`engine::serve_sharded`](crate::engine::serve_sharded) for why the
     /// acceptor is centralised rather than using `SO_REUSEPORT`.
     ///

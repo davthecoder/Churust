@@ -137,6 +137,28 @@ changes is a chart nobody can date.
 python3 charts.py
 ```
 
+## How many rounds is enough
+
+Nine, by default, and the reason is worth stating because fewer looked like
+plenty.
+
+The between-run spread on this class of machine is wider than most of the
+differences being measured. Three consecutive five-round runs of *identical
+code* put Churust 3.6% ahead of actix-web, then 11% ahead, then 5.9% behind.
+Any one of those, published on its own, would have been a result. Together they
+are a coin flip.
+
+Nine rounds separated the same pair cleanly: every Churust round beat every
+actix-web round, ranges not overlapping. That is what a real difference looks
+like, and it is the bar a claim in `results/` has to clear.
+
+So: **compare the spreads before believing a median.** If the ranges overlap,
+the harness has not answered the question yet — run more rounds rather than
+reporting the ordering. `ROUNDS=15 docker run …` costs minutes and is cheaper
+than publishing a number that reverses on the next run. Tail latency needs this
+most; it is the noisiest column here by a wide margin and moves with the state
+of the machine as much as with the code.
+
 ## Server CPU per request
 
 Both modes record how much CPU each server process spent, divided by the

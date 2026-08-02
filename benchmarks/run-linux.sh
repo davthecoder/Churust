@@ -27,7 +27,13 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 APPS=${APPS:-"churust actix axum ktor go"}
-ROUNDS=${ROUNDS:-3}
+# Nine, not three or five. The between-run spread on this class of machine is
+# wider than the differences being measured: the same code produced a 3.6%
+# Churust lead, then 11%, then a 5.9% deficit, across three consecutive
+# five-round runs. Nine rounds separated the same pair cleanly, with the
+# ranges not overlapping at all. If a result matters, it has to survive more
+# rounds than it takes to make it appear once.
+ROUNDS=${ROUNDS:-9}
 DURATION=${DURATION:-10s}
 # 64, not 256. At 256 the servers queue deeply enough that a request can wait
 # seconds, and on a laptop VM — whose vCPUs the host is itself timesharing with
