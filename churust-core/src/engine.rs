@@ -1090,13 +1090,16 @@ where
             let per_worker = if cap == 0 { 0 } else { cap / workers };
             let limits =
                 std::sync::Arc::new(AcceptLimits::with_connections(app.config(), per_worker));
-            return serve_sharded_reuseport(app, addrs, workers, backlog, limits, shutdown);
+            serve_sharded_reuseport(app, addrs, workers, backlog, limits, shutdown)
+        } else {
+            serve_sharded_central(app, addrs, workers, backlog, limits, shutdown)
         }
-        return serve_sharded_central(app, addrs, workers, backlog, limits, shutdown);
     }
     #[cfg(not(target_os = "linux"))]
     #[cfg(not(target_os = "linux"))]
-    serve_sharded_central(app, addrs, workers, backlog, limits, shutdown)
+    {
+        serve_sharded_central(app, addrs, workers, backlog, limits, shutdown)
+    }
 }
 
 /// The Linux implementation: one `SO_REUSEPORT` listener per worker, each
@@ -1162,7 +1165,7 @@ where
     for h in handles {
         let _ = h.join();
     }
-    return Ok(());
+    Ok(())
 }
 
 /// Accept centrally and hand each socket to a worker.
