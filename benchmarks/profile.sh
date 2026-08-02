@@ -5,6 +5,19 @@
 # what it measures, and the numbers below are shares of samples rather than
 # times. The question it answers is "which functions", and the answer is only
 # ever a lead to confirm with run-linux.sh.
+#
+# What works in this image, and what does not — established by trying:
+#
+#   works:  `perf report -g none`, the flat self-time profile. Use EVENT=cycles:u
+#           for user-space symbols; with kernel samples included nearly every
+#           stack begins in a frame that frame-pointer unwinding cannot walk.
+#   works:  `perf report -g caller` under `cycles:u`, which is how the 2,616-byte
+#           future moved into `tokio::time::timeout` was found.
+#   empty:  `perf report -g caller` under the default event, `perf annotate -s
+#           <symbol>`, and `perf report --sort srcline`. All three return a
+#           report with no rows against the LinuxKit kernel Docker Desktop runs.
+#           Source-line attribution inside a function is therefore not available
+#           here; do not spend another afternoon on it without a different host.
 set -euo pipefail
 # Reporting pipelines below end in `head`, which closes the pipe as soon as it
 # has enough lines. That SIGPIPEs the producer, `pipefail` turns it into a
@@ -81,18 +94,6 @@ perf report -i /tmp/perf.data --stdio --no-children -g none --percent-limit 0.3 
 # A flat profile names the cost but not the reason. `SYMBOL=__memcpy_generic`
 # asks who called it — which is the difference between "Churust memcpys more
 # than hyper" and knowing which line to change.
-# `ANNOTATE=<symbol>` shows which *source lines* inside one function cost, not
-# just which function does. The flat profile can say the engine's service
-# closure is 4.8% of user cycles; only this can say which of the header checks,
-# the `Call` construction or the response building that 4.8% actually is.
-# Needs the `-g` build this image already does.
-if [ -n "${ANNOTATE:-}" ]; then
-  echo
-  echo "=== $APP · source lines inside $ANNOTATE ==="
-  perf annotate -i /tmp/perf.data --stdio -l -s "$ANNOTATE" --percent-limit 0.8 \
-    2>/dev/null | grep -vE "^\s*$" | head -70 || true
-fi
-
 if [ -n "${SYMBOL:-}" ]; then
   echo
   echo "=== $APP · callers of $SYMBOL ==="
